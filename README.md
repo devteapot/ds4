@@ -43,7 +43,7 @@ That said, a few important things about this project:
 
 ## Acknowledgements to llama.cpp and GGML
 
-`ds4.c` does not link against GGML, but it **exists thanks to the path opened by the
+`models/deepseek-v4-flash/engine/ds4.c` does not link against GGML, but it **exists thanks to the path opened by the
 llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and hard-won
 engineering knowledge developed there**.
 We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
@@ -63,6 +63,31 @@ However, we try to keep the project in a usable state, and we are making
 progresses. If you have issues, make sure to use `--trace` to log the
 sessions, and open issues including the full trace.
 
+## Repository Direction
+
+The codebase is being shaped as a collection of **model-specific optimized
+runtimes**, not as a generic model runner. The current production runtime lives
+under `models/deepseek-v4-flash/`: it owns the fixed DeepSeek V4 Flash tensor
+layout, graph schedule, Metal kernels, CUDA backend, quant assumptions, and
+validation path.
+
+The intended framework boundary is:
+
+- `models/<model-family>/`: one narrow runtime per model family, with its own
+  tensor binder, graph schedule, backend kernels, quantization choices, and
+  official-vector tests.
+- shared entrypoints and tooling: CLI, server, benchmark, eval, GGUF tooling,
+  sampling, session orchestration, and disk-KV policy are still DS4-shaped in
+  this repository, but are the pieces that can gradually become `runtime-core`.
+- `backends/<kernel-family>` inside each model runtime: backend code is allowed
+  to specialize aggressively for that model while presenting the same narrow
+  tensor API to the graph driver.
+
+This is the path that should make a future Qwen runtime realistic: copy the
+pattern, not the DeepSeek V4 mechanics. A Qwen model directory should provide
+its own shape constants, tensor names, RoPE/KV rules, MoE or dense FFN schedule,
+and CUDA/MLX/Metal/ROCm kernels where they matter.
+
 ## More Documentation
 
 If you are looking for very specific things, we have other
@@ -71,6 +96,12 @@ next sections.
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
   guide for contributors. **Read this before sending a pull request**.
+- [models/README.md](models/README.md): model-specific runtime layout and
+  expectations.
+- [models/deepseek-v4-flash/README.md](models/deepseek-v4-flash/README.md):
+  current DS4 runtime layout.
+- [runtime-core/README.md](runtime-core/README.md): intended shared layer for
+  future multi-model runtime entrypoints and tooling.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
   imatrix collection, quantization tooling, and quality checks.
 - [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
@@ -294,7 +325,9 @@ Start a local OpenAI/Anthropic-compatible server:
 ```
 
 Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
-so relative runtime files such as `metal/*.metal` resolve from the project tree.
+so relative runtime files such as
+`models/deepseek-v4-flash/backends/metal/kernels/*.metal` resolve from the
+project tree.
 
 The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
@@ -713,8 +746,8 @@ loading a disk checkpoint the draft state is invalidated and rebuilt by normal
 generation.
 
 The tensor payload is DS4-specific KV/session state, not a generic inference
-graph dump. It is expected to be portable only across compatible `ds4.c`
-builds for this model layout.
+graph dump. It is expected to be portable only across compatible
+`models/deepseek-v4-flash/engine/ds4.c` builds for this model layout.
 
 The cache stores checkpoints at four moments:
 

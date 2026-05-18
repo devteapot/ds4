@@ -11,7 +11,15 @@ CFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 
 LDLIBS ?= -lm -pthread
-METAL_SRCS := $(wildcard metal/*.metal)
+DS4_MODEL_DIR := models/deepseek-v4-flash
+DS4_ENGINE_SRC := $(DS4_MODEL_DIR)/engine/ds4.c
+DS4_PUBLIC_HDR := $(DS4_MODEL_DIR)/include/ds4.h
+DS4_GPU_HDR := $(DS4_MODEL_DIR)/backends/ds4_gpu.h
+DS4_METAL_SRC := $(DS4_MODEL_DIR)/backends/metal/ds4_metal.m
+DS4_CUDA_SRC := $(DS4_MODEL_DIR)/backends/cuda/ds4_cuda.cu
+DS4_CUDA_TABLES := $(DS4_MODEL_DIR)/backends/cuda/ds4_iq2_tables_cuda.inc
+DS4_CPPFLAGS := -I$(DS4_MODEL_DIR)/include -I$(DS4_MODEL_DIR)/backends -I.
+METAL_SRCS := $(wildcard $(DS4_MODEL_DIR)/backends/metal/kernels/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -112,26 +120,26 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_gpu.h
-	$(CC) $(CFLAGS) -c -o $@ ds4.c
+ds4.o: $(DS4_ENGINE_SRC) $(DS4_PUBLIC_HDR) $(DS4_GPU_HDR)
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -c -o $@ $(DS4_ENGINE_SRC)
 
-ds4_cli.o: ds4_cli.c ds4.h linenoise.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
+ds4_cli.o: ds4_cli.c $(DS4_PUBLIC_HDR) linenoise.h
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -c -o $@ ds4_cli.c
 
-ds4_server.o: ds4_server.c ds4.h rax.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
+ds4_server.o: ds4_server.c $(DS4_PUBLIC_HDR) rax.h
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -c -o $@ ds4_server.c
 
-ds4_bench.o: ds4_bench.c ds4.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
+ds4_bench.o: ds4_bench.c $(DS4_PUBLIC_HDR)
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -c -o $@ ds4_bench.c
 
-ds4_eval.o: ds4_eval.c ds4.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
+ds4_eval.o: ds4_eval.c $(DS4_PUBLIC_HDR)
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -c -o $@ ds4_eval.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h rax.h
-	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
+ds4_test.o: tests/ds4_test.c ds4_server.c $(DS4_PUBLIC_HDR) $(DS4_GPU_HDR) rax.h
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
-tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
+tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c $(DS4_GPU_HDR)
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -c -o $@ tests/cuda_long_context_smoke.c
 
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
@@ -139,26 +147,26 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_gpu.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
+ds4_cpu.o: $(DS4_ENGINE_SRC) $(DS4_PUBLIC_HDR) $(DS4_GPU_HDR)
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -DDS4_NO_GPU -c -o $@ $(DS4_ENGINE_SRC)
 
-ds4_cli_cpu.o: ds4_cli.c ds4.h linenoise.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
+ds4_cli_cpu.o: ds4_cli.c $(DS4_PUBLIC_HDR) linenoise.h
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
 
-ds4_server_cpu.o: ds4_server.c ds4.h rax.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
+ds4_server_cpu.o: ds4_server.c $(DS4_PUBLIC_HDR) rax.h
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
-ds4_bench_cpu.o: ds4_bench.c ds4.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
+ds4_bench_cpu.o: ds4_bench.c $(DS4_PUBLIC_HDR)
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
-ds4_eval_cpu.o: ds4_eval.c ds4.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_eval.c
+ds4_eval_cpu.o: ds4_eval.c $(DS4_PUBLIC_HDR)
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -DDS4_NO_GPU -c -o $@ ds4_eval.c
 
-ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
-	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
+ds4_metal.o: $(DS4_METAL_SRC) $(DS4_GPU_HDR) $(DS4_PUBLIC_HDR) $(METAL_SRCS)
+	$(CC) $(OBJCFLAGS) $(DS4_CPPFLAGS) -c -o $@ $(DS4_METAL_SRC)
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
-	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
+ds4_cuda.o: $(DS4_CUDA_SRC) $(DS4_GPU_HDR) $(DS4_CUDA_TABLES)
+	$(NVCC) $(NVCCFLAGS) $(DS4_CPPFLAGS) -c -o $@ $(DS4_CUDA_SRC)
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

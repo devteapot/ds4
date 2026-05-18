@@ -20,9 +20,9 @@
  * The C code owns model semantics and graph scheduling.  This file owns only
  * Metal objects: device/queue/library setup, mmap-backed weight views, command
  * batching, persistent tensors, scratch buffers, and thin wrappers around the
- * kernel files in the metal directory.  Keeping this boundary narrow makes the
- * inference path readable from C while still using Objective-C where Metal
- * requires it.
+ * model kernel files under backends/metal/kernels.  Keeping this boundary
+ * narrow makes the inference path readable from C while still using
+ * Objective-C where Metal requires it.
  */
 
 enum {
@@ -1204,26 +1204,27 @@ static NSString *ds4_gpu_full_source(void) {
      * Metal library.  Environment overrides are still honored so a diagnostic
      * run can swap one source file without changing the executable.
      */
+    NSString *kernel_dir = @"models/deepseek-v4-flash/backends/metal/kernels";
     NSArray<NSArray<NSString *> *> *required_sources = @[
-        @[@"DS4_METAL_FLASH_ATTN_SOURCE", @"metal/flash_attn.metal"],
-        @[@"DS4_METAL_DENSE_SOURCE",      @"metal/dense.metal"],
-        @[@"DS4_METAL_MOE_SOURCE",        @"metal/moe.metal"],
-        @[@"DS4_METAL_DSV4_HC_SOURCE",    @"metal/dsv4_hc.metal"],
-        @[@"DS4_METAL_UNARY_SOURCE",      @"metal/unary.metal"],
-        @[@"DS4_METAL_DSV4_KV_SOURCE",    @"metal/dsv4_kv.metal"],
-        @[@"DS4_METAL_DSV4_ROPE_SOURCE",  @"metal/dsv4_rope.metal"],
-        @[@"DS4_METAL_DSV4_MISC_SOURCE",  @"metal/dsv4_misc.metal"],
-        @[@"DS4_METAL_ARGSORT_SOURCE",    @"metal/argsort.metal"],
-        @[@"DS4_METAL_CPY_SOURCE",        @"metal/cpy.metal"],
-        @[@"DS4_METAL_CONCAT_SOURCE",     @"metal/concat.metal"],
-        @[@"DS4_METAL_GET_ROWS_SOURCE",   @"metal/get_rows.metal"],
-        @[@"DS4_METAL_SUM_ROWS_SOURCE",   @"metal/sum_rows.metal"],
-        @[@"DS4_METAL_SOFTMAX_SOURCE",    @"metal/softmax.metal"],
-        @[@"DS4_METAL_REPEAT_SOURCE",     @"metal/repeat.metal"],
-        @[@"DS4_METAL_GLU_SOURCE",        @"metal/glu.metal"],
-        @[@"DS4_METAL_NORM_SOURCE",       @"metal/norm.metal"],
-        @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
-        @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
+        @[@"DS4_METAL_FLASH_ATTN_SOURCE", @"flash_attn.metal"],
+        @[@"DS4_METAL_DENSE_SOURCE",      @"dense.metal"],
+        @[@"DS4_METAL_MOE_SOURCE",        @"moe.metal"],
+        @[@"DS4_METAL_DSV4_HC_SOURCE",    @"dsv4_hc.metal"],
+        @[@"DS4_METAL_UNARY_SOURCE",      @"unary.metal"],
+        @[@"DS4_METAL_DSV4_KV_SOURCE",    @"dsv4_kv.metal"],
+        @[@"DS4_METAL_DSV4_ROPE_SOURCE",  @"dsv4_rope.metal"],
+        @[@"DS4_METAL_DSV4_MISC_SOURCE",  @"dsv4_misc.metal"],
+        @[@"DS4_METAL_ARGSORT_SOURCE",    @"argsort.metal"],
+        @[@"DS4_METAL_CPY_SOURCE",        @"cpy.metal"],
+        @[@"DS4_METAL_CONCAT_SOURCE",     @"concat.metal"],
+        @[@"DS4_METAL_GET_ROWS_SOURCE",   @"get_rows.metal"],
+        @[@"DS4_METAL_SUM_ROWS_SOURCE",   @"sum_rows.metal"],
+        @[@"DS4_METAL_SOFTMAX_SOURCE",    @"softmax.metal"],
+        @[@"DS4_METAL_REPEAT_SOURCE",     @"repeat.metal"],
+        @[@"DS4_METAL_GLU_SOURCE",        @"glu.metal"],
+        @[@"DS4_METAL_NORM_SOURCE",       @"norm.metal"],
+        @[@"DS4_METAL_BIN_SOURCE",        @"bin.metal"],
+        @[@"DS4_METAL_SET_ROWS_SOURCE",   @"set_rows.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -1233,8 +1234,12 @@ static NSString *ds4_gpu_full_source(void) {
         if (override_path && override_path[0]) {
             [paths addObject:[NSString stringWithUTF8String:override_path]];
         }
-        [paths addObject:spec[1]];
-        [paths addObject:[@"./" stringByAppendingString:spec[1]]];
+        NSString *kernel_path = [kernel_dir stringByAppendingPathComponent:spec[1]];
+        NSString *legacy_path = [@"metal" stringByAppendingPathComponent:spec[1]];
+        [paths addObject:kernel_path];
+        [paths addObject:[@"./" stringByAppendingString:kernel_path]];
+        [paths addObject:legacy_path];
+        [paths addObject:[@"./" stringByAppendingString:legacy_path]];
 
         NSString *loaded = nil;
         NSString *loaded_path = nil;
@@ -1257,7 +1262,7 @@ static NSString *ds4_gpu_full_source(void) {
         if (!loaded) {
             fprintf(stderr,
                     "ds4: Metal source %s not found (set %s to override)\n",
-                    [spec[1] UTF8String], [spec[0] UTF8String]);
+                    [kernel_path UTF8String], [spec[0] UTF8String]);
             return nil;
         }
         [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];

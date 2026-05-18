@@ -37,6 +37,12 @@ DEFAULT_SYSTEM = (
     "technical details, and use tools only when the prompt asks for tool use."
 )
 
+DS4_ENGINE = "models/deepseek-v4-flash/engine/ds4.c"
+DS4_HEADER = "models/deepseek-v4-flash/include/ds4.h"
+DS4_GPU_HEADER = "models/deepseek-v4-flash/backends/ds4_gpu.h"
+DS4_METAL = "models/deepseek-v4-flash/backends/metal/ds4_metal.m"
+DS4_METAL_KERNELS = "models/deepseek-v4-flash/backends/metal/kernels"
+
 TOOLS_PROMPT_INTRO = (
     "## Tools\n\n"
     "You have access to a set of tools to help answer the user question. "
@@ -304,12 +310,12 @@ def doc_prompt(path: str, chunk: str, task: str) -> list[dict]:
 
 def make_source_records(root: Path, records: list[Record]) -> None:
     files = [
-        "ds4.c", "ds4_server.c", "ds4_cli.c", "ds4_metal.m", "ds4.h", "ds4_gpu.h",
+        DS4_ENGINE, "ds4_server.c", "ds4_cli.c", DS4_METAL, DS4_HEADER, DS4_GPU_HEADER,
         "README.md", "AGENT.md", "gguf-tools/README.md",
         "gguf-tools/imatrix/README.md", "gguf-tools/imatrix/dataset/README.md",
         "gguf-tools/quality-testing/README.md",
     ]
-    files += [str(p.relative_to(root)) for p in sorted((root / "metal").glob("*.metal"))]
+    files += [str(p.relative_to(root)) for p in sorted((root / DS4_METAL_KERNELS).glob("*.metal"))]
     tasks = [
         "Review this excerpt for correctness risks, memory lifetime issues, and performance bottlenecks.",
         "Explain what this code does and identify the inference stage it belongs to.",
@@ -1040,10 +1046,10 @@ def make_long_context_records(root: Path, records: list[Record]) -> None:
         ("gguf-tools/imatrix/dataset/README.md", read_text(root / "gguf-tools/imatrix/dataset/README.md")),
         ("gguf-tools/quality-testing/README.md", read_text(root / "gguf-tools/quality-testing/README.md")),
         ("ds4_server.c", read_text(root / "ds4_server.c")),
-        ("ds4_metal.m", read_text(root / "ds4_metal.m")),
-        ("metal/dsv4_hc.metal", read_text(root / "metal/dsv4_hc.metal")),
-        ("metal/moe.metal", read_text(root / "metal/moe.metal")),
-        ("metal/dense.metal", read_text(root / "metal/dense.metal")),
+        (DS4_METAL, read_text(root / DS4_METAL)),
+        (f"{DS4_METAL_KERNELS}/dsv4_hc.metal", read_text(root / DS4_METAL_KERNELS / "dsv4_hc.metal")),
+        (f"{DS4_METAL_KERNELS}/moe.metal", read_text(root / DS4_METAL_KERNELS / "moe.metal")),
+        (f"{DS4_METAL_KERNELS}/dense.metal", read_text(root / DS4_METAL_KERNELS / "dense.metal")),
     ]
     by_name: dict[str, list[str]] = {}
     for name, text in sources:
@@ -1073,7 +1079,7 @@ def make_long_context_records(root: Path, records: list[Record]) -> None:
     ), [
         block("ds4_server.c", 1),
         block("ds4_server.c", 4),
-        block("ds4.c", 2),
+        block(DS4_ENGINE, 2),
         block("README.md", 1),
     ])
     add_long("codebase:metal-moe", (
@@ -1081,10 +1087,10 @@ def make_long_context_records(root: Path, records: list[Record]) -> None:
         "expert selection through MoE execution. Name the tensors whose value "
         "distribution matters for imatrix collection."
     ), [
-        block("ds4.c", 5),
-        block("ds4_metal.m", 3),
-        block("metal/moe.metal", 0),
-        block("metal/dsv4_hc.metal", 1),
+        block(DS4_ENGINE, 5),
+        block(DS4_METAL, 3),
+        block(f"{DS4_METAL_KERNELS}/moe.metal", 0),
+        block(f"{DS4_METAL_KERNELS}/dsv4_hc.metal", 1),
     ])
     add_long("codebase:server-protocols", (
         "Compare the protocol and server excerpts. What state must survive across "
@@ -1103,7 +1109,7 @@ def make_long_context_records(root: Path, records: list[Record]) -> None:
     ), [
         block("gguf-tools/imatrix/README.md", 0),
         block("gguf-tools/imatrix/dataset/README.md", 0),
-        block("ds4.c", 6),
+        block(DS4_ENGINE, 6),
         block("README.md", 2),
     ])
 
@@ -1144,7 +1150,7 @@ def make_long_context_records(root: Path, records: list[Record]) -> None:
         "Read the long tool transcript. Produce a conclusion that distinguishes "
         "confirmed facts from inferences, and name the regression test that would "
         "make the issue findable in the future."
-    ), [transcript_b, block("ds4_metal.m", 2), block("metal/dense.metal", 0)])
+    ), [transcript_b, block(DS4_METAL, 2), block(f"{DS4_METAL_KERNELS}/dense.metal", 0)])
 
     transcript_c = "\n".join([
         "USER: The benchmark TUI flickers after I press arrows.",
@@ -1161,7 +1167,7 @@ def make_long_context_records(root: Path, records: list[Record]) -> None:
         "Given this transcript and the code excerpts, explain the rendering state "
         "model that avoids flicker and why input handling must be consumed only "
         "at safe points."
-    ), [transcript_c, block("ds4.c", 0), block("ds4_server.c", 6)])
+    ), [transcript_c, block(DS4_ENGINE, 0), block("ds4_server.c", 6)])
 
     # Log/trace diagnosis: repeated operational logs with relevant details
     # buried among normal progress lines.
@@ -1269,7 +1275,7 @@ def make_long_context_records(root: Path, records: list[Record]) -> None:
         block("ds4_server.c", 1),
         block("ds4_server.c", 5),
         block("README.md", 4),
-        block("metal/moe.metal", 1),
+        block(f"{DS4_METAL_KERNELS}/moe.metal", 1),
     ])
 
     # Keep the older shuffled source-excerpt shape as a small background slice.
@@ -2054,18 +2060,18 @@ def make_agent_records(records: list[Record]) -> None:
             ("command", "git rev-parse --abbrev-ref HEAD", True),
             ("description", "current git branch", True),
         ], "main\n"),
-        ("count lines in ds4.c", "bash", [
-            ("command", "wc -l ds4.c", True),
-            ("description", "line count of ds4.c", True),
-        ], " 23456 ds4.c\n"),
+        ("count lines in DS4 engine", "bash", [
+            ("command", f"wc -l {DS4_ENGINE}", True),
+            ("description", "line count of DS4 engine", True),
+        ], f" 23456 {DS4_ENGINE}\n"),
         ("find TODO comments", "grep", [
             ("pattern", "TODO", True),
             ("path", ".", True),
         ], "ds4_server.c:842:    // TODO: revisit when streaming usage is finalized\n"),
         ("list .metal kernels", "list_files", [
-            ("pattern", "metal/*.metal", True),
-            ("max_depth", "2", False),
-        ], "metal/dsv4_hc.metal\nmetal/moe.metal\nmetal/sampling.metal\n"),
+            ("pattern", f"{DS4_METAL_KERNELS}/*.metal", True),
+            ("max_depth", "6", False),
+        ], f"{DS4_METAL_KERNELS}/dsv4_hc.metal\n{DS4_METAL_KERNELS}/moe.metal\n"),
         ("open Makefile", "read_file", [
             ("path", "Makefile", True),
             ("start", "1", False),
@@ -2221,9 +2227,9 @@ def main() -> None:
 
 def find_repo_root(start: Path) -> Path:
     for path in [start, *start.parents]:
-        if (path / "ds4.c").exists() and (path / "metal").is_dir():
+        if (path / DS4_ENGINE).exists() and (path / DS4_METAL_KERNELS).is_dir():
             return path
-    raise RuntimeError(f"could not find ds4.c repository root from {start}")
+    raise RuntimeError(f"could not find DS4 repository root from {start}")
 
 
 if __name__ == "__main__":

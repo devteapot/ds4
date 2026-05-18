@@ -1,8 +1,9 @@
 # Agent Notes
 
-`ds4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
+`models/deepseek-v4-flash/engine/ds4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
 GGUF runner. The goal is a small, readable, high-performance C codebase with
-Objective-C only where Metal requires it and Metal kernels under `metal/`.
+Objective-C only where Metal requires it and Metal kernels under
+`models/deepseek-v4-flash/backends/metal/kernels/`.
 
 ## Goals
 
@@ -36,13 +37,22 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 
 ## Layout
 
-- `ds4.c`: model loading, tokenizer, CPU reference code, Metal graph scheduling,
-  sessions, disk-cache payload serialization.
+- `models/deepseek-v4-flash/engine/ds4.c`: model loading, tokenizer, CPU
+  reference code, graph scheduling, sessions, disk-cache payload serialization.
+- `models/deepseek-v4-flash/include/ds4.h`: public DS4 engine/session boundary
+  used by the CLI, server, eval, and bench tools.
+- `models/deepseek-v4-flash/backends/ds4_gpu.h`: narrow tensor API shared by
+  the DS4 graph driver and accelerator backends.
+- `models/deepseek-v4-flash/backends/metal/ds4_metal.m`: Objective-C Metal
+  runtime and kernel wrappers.
+- `models/deepseek-v4-flash/backends/metal/kernels/*.metal`: DS4 Metal compute
+  kernels.
+- `models/deepseek-v4-flash/backends/cuda/ds4_cuda.cu`: DS4 CUDA runtime and
+  kernels.
 - `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.
 - `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
   tool-call mapping, disk KV cache policy.
-- `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
-- `metal/*.metal`: compute kernels.
+- `models/`: future home for one optimized runtime per model family.
 - `tests/`: unit and live integration tests.
 - `misc/`: ignored notes, experiments, and old planning material.
 

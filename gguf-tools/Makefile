@@ -1,12 +1,14 @@
 CC ?= cc
 UNAME_S := $(shell uname -s)
+DS4_MODEL_DIR := ../models/deepseek-v4-flash
+DS4_CPPFLAGS := -I.. -I$(DS4_MODEL_DIR)/include -I$(DS4_MODEL_DIR)/backends
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
 QUALITY_LDLIBS := -lm -pthread -framework Foundation -framework Metal
 QUALITY_TARGETS := ds4.o ds4_metal.o
 QUALITY_OBJS := ../ds4.o ../ds4_metal.o
-QUALITY_LINK := $(CC) $(CFLAGS) -I.. -o
+QUALITY_LINK = $(CC) $(CFLAGS) $(DS4_CPPFLAGS) -o
 else
 NATIVE_CPU_FLAG ?= -march=native
 CUDA_HOME ?= /usr/local/cuda
@@ -19,7 +21,7 @@ NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG
 QUALITY_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 QUALITY_TARGETS := ds4.o ds4_cuda.o
 QUALITY_OBJS := ../ds4.o ../ds4_cuda.o
-QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I.. -o
+QUALITY_LINK = $(NVCC) $(NVCCFLAGS) $(DS4_CPPFLAGS) -o
 endif
 
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 $(NATIVE_CPU_FLAG)
