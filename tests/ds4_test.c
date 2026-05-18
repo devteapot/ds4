@@ -1,6 +1,7 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
+#include "ds4_runtime.h"
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #include <math.h>
@@ -636,6 +637,30 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static void test_runtime_core_group(void) {
+    TEST_ASSERT(ds4_runtime_register() == 0);
+    TEST_ASSERT(ds4_runtime_register() == 0);
+
+    const rt_model_ops *ops = rt_model_by_family("deepseek-v4-flash");
+    TEST_ASSERT(ops == ds4_runtime_ops());
+    TEST_ASSERT(rt_model_by_family("qwen3") == NULL);
+    TEST_ASSERT(rt_probe_model_path("ds4flash.gguf") == ops);
+    TEST_ASSERT(rt_probe_model_path("Qwen3.gguf") == NULL);
+    TEST_ASSERT(!strcmp(rt_backend_name(RT_BACKEND_CUDA), "cuda"));
+
+    rt_tokens a = {0};
+    rt_tokens b = {0};
+    rt_tokens_push(&a, 10);
+    rt_tokens_push(&a, 20);
+    rt_tokens_copy(&b, &a);
+    TEST_ASSERT(rt_tokens_starts_with(&a, &b));
+    rt_tokens_push(&a, 30);
+    TEST_ASSERT(rt_tokens_starts_with(&a, &b));
+    TEST_ASSERT(!rt_tokens_starts_with(&b, &a));
+    rt_tokens_free(&a);
+    rt_tokens_free(&b);
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -652,6 +677,7 @@ static const ds4_test_entry test_entries[] = {
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
 #endif
+    {"--runtime-core", "runtime-core", "model-agnostic runtime registry and token helpers", test_runtime_core_group},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

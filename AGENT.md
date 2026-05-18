@@ -26,6 +26,10 @@ Objective-C only where Metal requires it and Metal kernels under
 - Do not add permanent semantic variants behind flags. Diagnostic switches are
   fine when they validate the one release path.
 - Do not introduce C++.
+- Keep docs in the same patch as framework, layout, public API, build, or test
+  expectation changes. Update `README.md`, `runtime-core/README.md`,
+  `models/README.md`, the affected model README, `CONTRIBUTING.md`, and this
+  file when their contracts move.
 
 ## Safety
 
@@ -41,6 +45,9 @@ Objective-C only where Metal requires it and Metal kernels under
   reference code, graph scheduling, sessions, disk-cache payload serialization.
 - `models/deepseek-v4-flash/include/ds4.h`: public DS4 engine/session boundary
   used by the CLI, server, eval, and bench tools.
+- `models/deepseek-v4-flash/include/ds4_runtime.h` and
+  `models/deepseek-v4-flash/runtime/ds4_runtime.c`: adapter exposing DS4
+  through the model-agnostic `rt_model_ops` boundary.
 - `models/deepseek-v4-flash/backends/ds4_gpu.h`: narrow tensor API shared by
   the DS4 graph driver and accelerator backends.
 - `models/deepseek-v4-flash/backends/metal/ds4_metal.m`: Objective-C Metal
@@ -52,6 +59,8 @@ Objective-C only where Metal requires it and Metal kernels under
 - `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.
 - `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
   tool-call mapping, disk KV cache policy.
+- `runtime-core/`: model-agnostic registry, token helpers, and engine/session
+  vtable wrappers. It must not include model-specific architecture assumptions.
 - `models/`: future home for one optimized runtime per model family.
 - `tests/`: unit and live integration tests.
 - `misc/`: ignored notes, experiments, and old planning material.

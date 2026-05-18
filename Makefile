@@ -11,20 +11,26 @@ CFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 
 LDLIBS ?= -lm -pthread
+RT_CORE_DIR := runtime-core
+RT_CORE_SRC := $(RT_CORE_DIR)/src/runtime.c
+RT_CORE_HDR := $(RT_CORE_DIR)/include/rt_runtime.h
+RT_CPPFLAGS := -I$(RT_CORE_DIR)/include
 DS4_MODEL_DIR := models/deepseek-v4-flash
 DS4_ENGINE_SRC := $(DS4_MODEL_DIR)/engine/ds4.c
 DS4_PUBLIC_HDR := $(DS4_MODEL_DIR)/include/ds4.h
+DS4_RUNTIME_SRC := $(DS4_MODEL_DIR)/runtime/ds4_runtime.c
+DS4_RUNTIME_HDR := $(DS4_MODEL_DIR)/include/ds4_runtime.h
 DS4_GPU_HDR := $(DS4_MODEL_DIR)/backends/ds4_gpu.h
 DS4_METAL_SRC := $(DS4_MODEL_DIR)/backends/metal/ds4_metal.m
 DS4_CUDA_SRC := $(DS4_MODEL_DIR)/backends/cuda/ds4_cuda.cu
 DS4_CUDA_TABLES := $(DS4_MODEL_DIR)/backends/cuda/ds4_iq2_tables_cuda.inc
-DS4_CPPFLAGS := -I$(DS4_MODEL_DIR)/include -I$(DS4_MODEL_DIR)/backends -I.
+DS4_CPPFLAGS := $(RT_CPPFLAGS) -I$(DS4_MODEL_DIR)/include -I$(DS4_MODEL_DIR)/backends -I.
 METAL_SRCS := $(wildcard $(DS4_MODEL_DIR)/backends/metal/kernels/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = rt_runtime.o ds4_runtime.o ds4.o ds4_metal.o
+CPU_CORE_OBJS = rt_runtime.o ds4_runtime_cpu.o ds4_cpu.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -35,8 +41,8 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = rt_runtime.o ds4_runtime.o ds4.o ds4_cuda.o
+CPU_CORE_OBJS = rt_runtime.o ds4_runtime_cpu.o ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -120,6 +126,15 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
+rt_runtime.o: $(RT_CORE_SRC) $(RT_CORE_HDR)
+	$(CC) $(CFLAGS) $(RT_CPPFLAGS) -c -o $@ $(RT_CORE_SRC)
+
+ds4_runtime.o: $(DS4_RUNTIME_SRC) $(DS4_RUNTIME_HDR) $(DS4_PUBLIC_HDR) $(RT_CORE_HDR)
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -c -o $@ $(DS4_RUNTIME_SRC)
+
+ds4_runtime_cpu.o: $(DS4_RUNTIME_SRC) $(DS4_RUNTIME_HDR) $(DS4_PUBLIC_HDR) $(RT_CORE_HDR)
+	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -DDS4_NO_GPU -c -o $@ $(DS4_RUNTIME_SRC)
+
 ds4.o: $(DS4_ENGINE_SRC) $(DS4_PUBLIC_HDR) $(DS4_GPU_HDR)
 	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -c -o $@ $(DS4_ENGINE_SRC)
 
@@ -135,7 +150,7 @@ ds4_bench.o: ds4_bench.c $(DS4_PUBLIC_HDR)
 ds4_eval.o: ds4_eval.c $(DS4_PUBLIC_HDR)
 	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -c -o $@ ds4_eval.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c $(DS4_PUBLIC_HDR) $(DS4_GPU_HDR) rax.h
+ds4_test.o: tests/ds4_test.c ds4_server.c $(DS4_PUBLIC_HDR) $(DS4_RUNTIME_HDR) $(DS4_GPU_HDR) $(RT_CORE_HDR) rax.h
 	$(CC) $(CFLAGS) $(DS4_CPPFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c $(DS4_GPU_HDR)

@@ -73,9 +73,14 @@ validation path.
 
 The intended framework boundary is:
 
+- `runtime-core/`: model-agnostic registry and vtable wrappers.  It knows about
+  opaque engines, sessions, tokens, chat rendering, sampling/logprobs, and
+  payload save/load, but not about any specific model architecture. The current
+  ABI is declared in `runtime-core/include/rt_runtime.h`.
 - `models/<model-family>/`: one narrow runtime per model family, with its own
   tensor binder, graph schedule, backend kernels, quantization choices, and
-  official-vector tests.
+  official-vector tests. Each runtime exposes a `rt_model_ops` adapter to the
+  core from `models/<model-family>/runtime/`.
 - shared entrypoints and tooling: CLI, server, benchmark, eval, GGUF tooling,
   sampling, session orchestration, and disk-KV policy are still DS4-shaped in
   this repository, but are the pieces that can gradually become `runtime-core`.
@@ -87,6 +92,11 @@ This is the path that should make a future Qwen runtime realistic: copy the
 pattern, not the DeepSeek V4 mechanics. A Qwen model directory should provide
 its own shape constants, tensor names, RoPE/KV rules, MoE or dense FFN schedule,
 and CUDA/MLX/Metal/ROCm kernels where they matter.
+
+When this framework boundary changes, keep the docs in sync in the same patch:
+`runtime-core/README.md` for the shared ABI, `models/README.md` for the model
+runtime contract, and each affected `models/<model-family>/README.md` for
+model-specific options and validation.
 
 ## More Documentation
 
@@ -100,8 +110,8 @@ next sections.
   expectations.
 - [models/deepseek-v4-flash/README.md](models/deepseek-v4-flash/README.md):
   current DS4 runtime layout.
-- [runtime-core/README.md](runtime-core/README.md): intended shared layer for
-  future multi-model runtime entrypoints and tooling.
+- [runtime-core/README.md](runtime-core/README.md): model-agnostic runtime
+  registry, vtable boundary, and future shared entrypoint layer.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
   imatrix collection, quantization tooling, and quality checks.
 - [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the

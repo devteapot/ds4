@@ -15631,6 +15631,11 @@ const char *ds4_backend_name(ds4_backend backend) {
     return "unknown";
 }
 
+uint32_t ds4_engine_vocab_size(ds4_engine *e) {
+    (void)e;
+    return DS4_N_VOCAB;
+}
+
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
     return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX;
 }
@@ -17696,6 +17701,12 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
     out->logit = s->logits[token];
     out->logprob = isfinite(out->logit) ? (float)((double)out->logit - logsum) : DS4_NEG_INF;
     return 1;
+}
+
+int ds4_session_read_logits(ds4_session *s, float *out, uint32_t cap) {
+    if (!s || !s->logits || !out || cap < DS4_N_VOCAB) return 0;
+    memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
+    return (int)DS4_N_VOCAB;
 }
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,

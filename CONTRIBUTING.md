@@ -33,6 +33,7 @@ Useful narrower checks:
 ./ds4_test --long-context
 ./ds4_test --tool-call-quality
 ./ds4_test --metal-kernels
+./ds4_test --runtime-core
 ```
 
 What they cover:
@@ -50,6 +51,9 @@ What they cover:
 - `--tool-call-quality`: exercises actual model behavior for DSML tool-call
   emission in both fast and exact paths.
 - `--metal-kernels`: isolated Metal kernel numeric checks.
+- `--runtime-core`: model-agnostic runtime registry, token helpers, and the
+  current DS4 `rt_model_ops` adapter boundary. Run this for changes under
+  `runtime-core/`, `models/*/runtime/`, or public runtime headers.
 
 The runner defaults to `ds4flash.gguf`. Override paths when needed:
 
@@ -75,6 +79,25 @@ make cpu
 The CPU backend is a reference/debug path, not the production performance
 target. Remember that executing the CPU path on Metal can crash the system
 because of a kernel bug in macOS.
+
+## Documentation Updates
+
+Keep documentation in the same patch as framework, layout, public API, or build
+changes. At minimum:
+
+- Update `README.md` when the user-facing architecture, build commands, paths,
+  or supported runtime direction changes.
+- Update `runtime-core/README.md` when the model-agnostic `rt_model_ops`
+  boundary, registry behavior, or shared-core responsibilities change.
+- Update `models/README.md` when the expected model-runtime directory layout or
+  adapter contract changes.
+- Update `models/<model-family>/README.md` when a model-specific runtime moves
+  files, adds backend support, changes options, or changes its validation path.
+- Update `AGENT.md` when repo layout, testing expectations, or contributor
+  guardrails change.
+
+For docs-only changes, run `git diff --check`. For runtime-core or model-adapter
+changes, also run `./ds4_test --runtime-core`.
 
 ## Quality Checks For Quantization Changes
 
