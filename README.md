@@ -143,9 +143,25 @@ make cuda-generic     # Linux CUDA, other local CUDA GPUs
 make cpu              # CPU-only diagnostics build
 ```
 
-`./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
-select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
-`./ds4-server --help` for the full flag list.
+`./ds4flash.gguf` is the default model path used by the runtime binaries. Pass
+`-m` to select another supported GGUF from `./gguf/`. Run `./ds4 --help`,
+`./ds4-server --help`, or `./ds4-engine --help` for the full flag list.
+
+The build also produces `./ds4-engine`, a native Sloppy engine endpoint. It
+listens on a Unix socket and speaks the v1 NDJSON engine envelope:
+
+```sh
+./ds4-engine --socket /tmp/ds4-engine.sock -m ds4flash.gguf --ctx 100000 \
+  --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+```
+
+`ds4-engine` expects the client runtime to send fully rendered DS4 chat text
+with the model markers already present, then tokenizes it with the native DS4
+rendered-chat tokenizer. The first protocol milestone supports
+`engine.describe`, `session.create`, `session.sync`, `session.generate`,
+`session.interrupt`, and `session.destroy`. When `--kv-disk-dir` is set,
+`session.sync` also uses the shared rendered-text disk KV cache for cold,
+continued, shutdown, and restart prefix reuse.
 
 ## Speed
 
@@ -845,6 +861,7 @@ first answer:
 ./ds4 --dump-tokens -p "..."
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
 ./ds4-server --trace /tmp/ds4-trace.txt ...
+./ds4-engine --trace /tmp/ds4-engine-trace.txt --socket /tmp/ds4-engine.sock ...
 ```
 
 - `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
@@ -854,5 +871,5 @@ first answer:
 - `--dump-logprobs` stores a greedy continuation with the top local
   alternatives at each step, which helps separate sampling choices from
   logit/model issues.
-- `ds4-server --trace` writes the rendered prompts, cache decisions, generated
-  text, and tool-parser events for a whole agent session.
+- `ds4-server --trace` and `ds4-engine --trace` write rendered prompts, cache
+  decisions, generated text, and tool/DSML boundary events for agent sessions.
