@@ -143,9 +143,22 @@ make cuda-generic     # Linux CUDA, other local CUDA GPUs
 make cpu              # CPU-only diagnostics build
 ```
 
-`./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
-select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
-`./ds4-server --help` for the full flag list.
+`./ds4flash.gguf` is the default model path used by the runtime binaries. Pass
+`-m` to select another supported GGUF from `./gguf/`. Run `./ds4 --help`,
+`./ds4-server --help`, or `./ds4-engine --help` for the full flag list.
+
+The build also produces `./ds4-engine`, a native Sloppy engine endpoint. It
+listens on a Unix socket and speaks the v1 NDJSON engine envelope:
+
+```sh
+./ds4-engine --socket /tmp/ds4-engine.sock -m ds4flash.gguf --ctx 100000
+```
+
+`ds4-engine` expects the client runtime to send fully rendered DS4 chat text
+with the model markers already present, then tokenizes it with the native DS4
+rendered-chat tokenizer. The first protocol milestone supports
+`engine.describe`, `session.create`, `session.sync`, `session.generate`,
+`session.interrupt`, and `session.destroy`.
 
 ## Speed
 
