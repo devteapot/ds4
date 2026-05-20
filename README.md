@@ -861,6 +861,7 @@ first answer:
 ./ds4 --dump-tokens -p "..."
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
 ./ds4-server --trace /tmp/ds4-trace.txt ...
+./ds4-engine --trace /tmp/ds4-engine-trace.txt --socket /tmp/ds4-engine.sock ...
 ```
 
 - `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
@@ -870,5 +871,5 @@ first answer:
 - `--dump-logprobs` stores a greedy continuation with the top local
   alternatives at each step, which helps separate sampling choices from
   logit/model issues.
-- `ds4-server --trace` writes the rendered prompts, cache decisions, generated
-  text, and tool-parser events for a whole agent session.
+- `ds4-server --trace` and `ds4-engine --trace` write rendered prompts, cache
+  decisions, generated text, and tool/DSML boundary events for agent sessions.

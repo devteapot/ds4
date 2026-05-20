@@ -87,6 +87,7 @@ typedef struct engine_job {
     engine_job_kind kind;
     client_conn *client;
     char *request_id;
+    char *params_json;
     char *session_id;
     char *requested_session_id;
     char *prefix_text;
@@ -112,6 +113,7 @@ typedef struct {
     engine_job *job_tail;
     bool stop;
     FILE *trace;
+    uint64_t trace_seq;
 } engine_server;
 
 typedef struct {
@@ -151,6 +153,11 @@ typedef struct {
     int cached_tokens;
     int total_eval_tokens;
     int last_current;
+    char ctx[48];
+    const char *phase;
+    double t0;
+    double last_t;
+    bool seen;
 } sync_progress;
 
 static void stop_signal_handler(int sig) {
@@ -473,6 +480,84 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+static void engine_log(ds4_log_type type, const char *fmt, ...) {
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char ts[16];
+    strftime(ts, sizeof(ts), "%m%d %H:%M:%S", &tm);
+
+    va_list ap;
+    va_start(ap, fmt);
+    va_list copy;
+    va_copy(copy, ap);
+    int n = vsnprintf(NULL, 0, fmt, copy);
+    va_end(copy);
+
+    fprintf(stderr, "%s ", ts);
+    if (n < 0) {
+        ds4_log(stderr, type, "%s", fmt);
+    } else {
+        char *line = xmalloc((size_t)n + 1);
+        vsnprintf(line, (size_t)n + 1, fmt, ap);
+        ds4_log(stderr, type, "%s", line);
+        free(line);
+    }
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
+    int suffix = prompt - cached;
+    if (suffix < 0) suffix = 0;
+    snprintf(buf, len, "%d..%d:%d", cached, prompt, suffix);
+}
+
+static void log_flags(char *buf, size_t len, bool dsml_start, bool dsml_end) {
+    size_t used = 0;
+    buf[0] = '\0';
+#define ADD_FLAG(name) do { \
+    int n = snprintf(buf + used, used < len ? len - used : 0, "%s%s", used ? " " : "", name); \
+    if (n > 0) used += (size_t)n; \
+} while (0)
+    if (dsml_start) ADD_FLAG("DSML_START");
+    if (dsml_end) ADD_FLAG("DSML_END");
+#undef ADD_FLAG
+}
+
+static void log_generate_progress(const char *session_id,
+                                  int start_pos,
+                                  int generated,
+                                  bool dsml_start,
+                                  bool dsml_end,
+                                  double decode_t0,
+                                  double *last_t,
+                                  int *last_generated) {
+    const double now = now_sec();
+    const double elapsed = now - decode_t0;
+    const double interval_s = now - *last_t;
+    const int interval_tokens = generated - *last_generated;
+    const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
+    const double avg_tps = elapsed > 0.0 ? (double)generated / elapsed : 0.0;
+    char ctx[48];
+    request_ctx_span(ctx, sizeof(ctx), start_pos + *last_generated,
+                     start_pos + generated);
+    char flags[64];
+    log_flags(flags, sizeof(flags), dsml_start, dsml_end);
+    engine_log(DS4_LOG_GENERATION,
+               "ds4-engine: generate session=%s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
+               session_id ? session_id : "?",
+               ctx,
+               generated,
+               flags[0] ? " " : "",
+               flags,
+               chunk_tps,
+               avg_tps,
+               elapsed);
+    *last_t = now;
+    *last_generated = generated;
+}
+
 static bool send_all_fd(int fd, const void *p, size_t n) {
     const char *s = p;
     long long deadline = wall_ms() + DS4_ENGINE_SEND_STALL_TIMEOUT_MS;
@@ -601,12 +686,327 @@ static void trace_log(engine_server *s, const char *fmt, ...) {
     pthread_mutex_unlock(&s->trace_mu);
 }
 
+#define TRACE_CACHE_BEFORE 8
+#define TRACE_CACHE_AFTER  8
+#define TRACE_CACHE_WINDOW (TRACE_CACHE_BEFORE + 1 + TRACE_CACHE_AFTER)
+
+typedef struct {
+    bool valid;
+    int old_pos;
+    int prompt_len;
+    int common;
+    int start;
+    int count;
+    int live_id[TRACE_CACHE_WINDOW];
+    int prompt_id[TRACE_CACHE_WINDOW];
+} trace_cache_diag;
+
+static void trace_cache_capture(trace_cache_diag *d,
+                                const ds4_tokens *live,
+                                const ds4_tokens *prompt,
+                                int old_pos,
+                                int common) {
+    memset(d, 0, sizeof(*d));
+    d->valid = true;
+    d->old_pos = old_pos;
+    d->prompt_len = prompt ? prompt->len : 0;
+    d->common = common;
+
+    const int live_len = live ? live->len : 0;
+    const int prompt_len = prompt ? prompt->len : 0;
+    int max_len = live_len > prompt_len ? live_len : prompt_len;
+    int start = common - TRACE_CACHE_BEFORE;
+    if (start < 0) start = 0;
+    int end = common + TRACE_CACHE_AFTER + 1;
+    if (end > max_len) end = max_len;
+    if (end < start) end = start;
+
+    d->start = start;
+    d->count = end - start;
+    if (d->count > TRACE_CACHE_WINDOW) d->count = TRACE_CACHE_WINDOW;
+    for (int i = 0; i < d->count; i++) {
+        int pos = start + i;
+        d->live_id[i] = live && pos < live->len ? live->v[pos] : -1;
+        d->prompt_id[i] = prompt && pos < prompt->len ? prompt->v[pos] : -1;
+    }
+}
+
+static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
+    if (!d || !d->valid) return "unknown";
+    if (d->old_pos == 0) return "no-live-checkpoint";
+    if (d->common != d->old_pos) return "token-mismatch";
+    if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
+    return "live-prefix-match";
+}
+
+static void trace_write_escaped_bytes(FILE *fp, const char *p, size_t len) {
+    static const char hex[] = "0123456789abcdef";
+    fputc('"', fp);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (c == '"' || c == '\\') {
+            fputc('\\', fp);
+            fputc((char)c, fp);
+        } else if (c == '\n') {
+            fputs("\\n", fp);
+        } else if (c == '\r') {
+            fputs("\\r", fp);
+        } else if (c == '\t') {
+            fputs("\\t", fp);
+        } else if (c < 0x20 || c == 0x7f) {
+            fputs("\\x", fp);
+            fputc(hex[c >> 4], fp);
+            fputc(hex[c & 15], fp);
+        } else {
+            fputc((char)c, fp);
+        }
+    }
+    fputc('"', fp);
+}
+
+static void trace_write_token(FILE *fp, ds4_engine *engine, int token) {
+    if (token < 0) {
+        fputs("- <none>", fp);
+        return;
+    }
+    size_t len = 0;
+    char *piece = ds4_token_text(engine, token, &len);
+    fprintf(fp, "%d ", token);
+    trace_write_escaped_bytes(fp, piece, len);
+    free(piece);
+}
+
+static void trace_write_cache_diag(engine_server *s,
+                                   const trace_cache_diag *d,
+                                   int cached,
+                                   const char *cache_source,
+                                   int disk_cached,
+                                   const char *disk_path) {
+    fprintf(s->trace,
+            "\n--- cache decision ---\n"
+            "live_tokens_before: %d\n"
+            "prompt_tokens: %d\n"
+            "live_prompt_common: %d\n"
+            "memory_token_reusable: %d\n"
+            "memory_miss_reason: %s\n"
+            "cache_source: %s\n"
+            "cached_tokens: %d\n"
+            "disk_cached_tokens: %d\n",
+            d && d->valid ? d->old_pos : 0,
+            d && d->valid ? d->prompt_len : 0,
+            d && d->valid ? d->common : 0,
+            d && d->valid && d->old_pos > 0 &&
+                d->common == d->old_pos && d->prompt_len >= d->old_pos ? 1 : 0,
+            trace_cache_miss_reason(d),
+            cache_source ? cache_source : "none",
+            cached,
+            disk_cached);
+    if (disk_path && disk_path[0]) fprintf(s->trace, "disk_cache_file: %s\n", disk_path);
+
+    if (!d || !d->valid || d->old_pos == 0 ||
+        (d->common == d->old_pos && d->prompt_len >= d->old_pos))
+    {
+        return;
+    }
+
+    fprintf(s->trace,
+            "\nfirst_mismatch_token: %d\n"
+            "token_window: [%d..%d)\n",
+            d->common,
+            d->start,
+            d->start + d->count);
+    for (int i = 0; i < d->count; i++) {
+        int pos = d->start + i;
+        int live = d->live_id[i];
+        int prompt = d->prompt_id[i];
+        const char *mark;
+        if (live < 0) mark = "prompt-only";
+        else if (prompt < 0) mark = "live-only";
+        else mark = live == prompt ? "==" : "!=";
+
+        fprintf(s->trace, "%7d %-11s live ", pos, mark);
+        trace_write_token(s->trace, s->engine, live);
+        fputs(" | prompt ", s->trace);
+        trace_write_token(s->trace, s->engine, prompt);
+        fputc('\n', s->trace);
+    }
+}
+
+static void trace_time(FILE *fp) {
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char b[32];
+    strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &tm);
+    fputs(b, fp);
+}
+
+static uint64_t trace_sync_begin(engine_server *s,
+                                 const engine_job *j,
+                                 const ds4_tokens *prompt,
+                                 const ds4_tokens *effective_prompt,
+                                 int cached,
+                                 int evaluated,
+                                 const trace_cache_diag *cache_diag,
+                                 const char *cache_source,
+                                 int disk_cached,
+                                 const char *disk_path) {
+    if (!s || !s->trace) return 0;
+
+    pthread_mutex_lock(&s->trace_mu);
+    uint64_t id = ++s->trace_seq;
+    fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
+    trace_time(s->trace);
+    fprintf(s->trace,
+            " =====\nmethod: session.sync\nrequest_id: %s\nsession: %s\nmodel: %s\nbackend: %s\nctx: %d\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nevaluated_tokens: %d\n",
+            j->request_id ? j->request_id : "",
+            j->session_id ? j->session_id : "",
+            s->cfg.engine.model_path ? s->cfg.engine.model_path : "",
+            ds4_backend_name(s->cfg.engine.backend),
+            s->cfg.ctx_size,
+            prompt ? prompt->len : 0,
+            effective_prompt ? effective_prompt->len : 0,
+            cached,
+            evaluated);
+    trace_write_cache_diag(s, cache_diag, cached, cache_source, disk_cached, disk_path);
+    if (j->params_json) {
+        fputs("\n--- params json ---\n", s->trace);
+        fputs(j->params_json, s->trace);
+        if (!j->params_json[0] || j->params_json[strlen(j->params_json) - 1] != '\n') {
+            fputc('\n', s->trace);
+        }
+    }
+    if (j->prefix_text) {
+        fputs("\n--- rendered prompt ---\n", s->trace);
+        fputs(j->prefix_text, s->trace);
+        if (!j->prefix_text[0] || j->prefix_text[strlen(j->prefix_text) - 1] != '\n') {
+            fputc('\n', s->trace);
+        }
+    }
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+    return id;
+}
+
+static uint64_t trace_generate_begin(engine_server *s,
+                                     const engine_job *j,
+                                     int start_pos,
+                                     int max_tokens,
+                                     uint64_t seed) {
+    if (!s || !s->trace) return 0;
+
+    pthread_mutex_lock(&s->trace_mu);
+    uint64_t id = ++s->trace_seq;
+    fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
+    trace_time(s->trace);
+    fprintf(s->trace,
+            " =====\nmethod: session.generate\nrequest_id: %s\nsession: %s\nmodel: %s\nbackend: %s\nctx: %d\nstart_position: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %s%llu\n",
+            j->request_id ? j->request_id : "",
+            j->session_id ? j->session_id : "",
+            s->cfg.engine.model_path ? s->cfg.engine.model_path : "",
+            ds4_backend_name(s->cfg.engine.backend),
+            s->cfg.ctx_size,
+            start_pos,
+            max_tokens,
+            j->temperature,
+            j->top_k,
+            j->top_p,
+            j->min_p,
+            j->has_seed ? "" : "auto:",
+            (unsigned long long)seed);
+    if (j->params_json) {
+        fputs("\n--- params json ---\n", s->trace);
+        fputs(j->params_json, s->trace);
+        if (!j->params_json[0] || j->params_json[strlen(j->params_json) - 1] != '\n') {
+            fputc('\n', s->trace);
+        }
+    }
+    fputs("\n--- generated text ---\n", s->trace);
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+    return id;
+}
+
+static void trace_piece(engine_server *s, uint64_t id, const char *piece, size_t len) {
+    if (!s || !s->trace || !id || !piece || !len) return;
+    pthread_mutex_lock(&s->trace_mu);
+    fwrite(piece, 1, len, s->trace);
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+}
+
+static void trace_event(engine_server *s, uint64_t id, const char *fmt, ...) {
+    if (!s || !s->trace || !id) return;
+    pthread_mutex_lock(&s->trace_mu);
+    fputs("\n\n--- trace: ", s->trace);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(s->trace, fmt, ap);
+    va_end(ap);
+    fputs(" ---\n\n", s->trace);
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+}
+
+static void trace_sync_finish(engine_server *s,
+                              uint64_t id,
+                              int position,
+                              int cached,
+                              int evaluated,
+                              bool rebuilt,
+                              const char *status,
+                              const char *err,
+                              double elapsed) {
+    if (!s || !s->trace || !id) return;
+    pthread_mutex_lock(&s->trace_mu);
+    fprintf(s->trace,
+            "\n--- sync summary ---\nstatus: %s\nposition: %d\ncached_tokens: %d\nevaluated_tokens: %d\nrebuilt: %d\nelapsed_sec: %.3f\n",
+            status ? status : "ok",
+            position,
+            cached,
+            evaluated,
+            rebuilt ? 1 : 0,
+            elapsed);
+    if (err && err[0]) fprintf(s->trace, "error: %s\n", err);
+    fprintf(s->trace, "\n===== end request %llu =====\n", (unsigned long long)id);
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+}
+
+static void trace_generate_finish(engine_server *s,
+                                  uint64_t id,
+                                  const char *reason,
+                                  int generated,
+                                  int position,
+                                  bool dsml_start,
+                                  bool dsml_end,
+                                  bool invalidated,
+                                  double elapsed) {
+    if (!s || !s->trace || !id) return;
+    pthread_mutex_lock(&s->trace_mu);
+    fprintf(s->trace,
+            "\n\n--- generation summary ---\nfinish: %s\ngenerated_tokens: %d\nposition: %d\ndsml_start: %d\ndsml_end: %d\ninvalidated: %d\nelapsed_sec: %.3f\n",
+            reason ? reason : "",
+            generated,
+            position,
+            dsml_start ? 1 : 0,
+            dsml_end ? 1 : 0,
+            invalidated ? 1 : 0,
+            elapsed);
+    fprintf(s->trace, "\n===== end request %llu =====\n", (unsigned long long)id);
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+}
+
 static void kv_log_cb(void *ud, ds4_kvstore_log_type type, const char *msg) {
     engine_server *s = ud;
     const char *level = "kvcache";
     if (type == DS4_KVSTORE_LOG_DEFAULT) level = "info";
     else if (type == DS4_KVSTORE_LOG_WARNING) level = "warning";
-    fprintf(stderr, "ds4-engine: %s\n", msg ? msg : "");
+    ds4_log_type log_type = DS4_LOG_KVCACHE;
+    if (type == DS4_KVSTORE_LOG_DEFAULT) log_type = DS4_LOG_DEFAULT;
+    else if (type == DS4_KVSTORE_LOG_WARNING) log_type = DS4_LOG_WARNING;
+    engine_log(log_type, "%s", msg ? msg : "");
     trace_log(s, "%s %s", level, msg ? msg : "");
 }
 
@@ -1127,6 +1527,7 @@ static void job_free(engine_job *j) {
     if (!j) return;
     client_unref(j->client);
     free(j->request_id);
+    free(j->params_json);
     free(j->session_id);
     free(j->requested_session_id);
     free(j->prefix_text);
@@ -1185,6 +1586,27 @@ static void sync_progress_cb(void *ud, const char *event, int current, int total
     if (relative < 0) relative = 0;
     if (relative > p->total_eval_tokens) relative = p->total_eval_tokens;
     if (relative == p->last_current) return;
+    const double now = now_sec();
+    const double elapsed = now - p->t0;
+    const int interval_tokens = p->seen ? relative - p->last_current : relative;
+    const double interval_s = p->seen ? now - p->last_t : elapsed;
+    const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
+    const double avg_tps = elapsed > 0.0 ? (double)relative / elapsed : 0.0;
+    const double pct = p->total_eval_tokens > 0 ?
+        100.0 * (double)relative / (double)p->total_eval_tokens : 100.0;
+    engine_log(DS4_LOG_PREFILL,
+               "ds4-engine: sync session=%s ctx=%s %s chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
+               p->slot && p->slot->id ? p->slot->id : "?",
+               p->ctx,
+               p->phase ? p->phase : "prefill",
+               relative,
+               p->total_eval_tokens,
+               pct,
+               chunk_tps,
+               avg_tps,
+               elapsed);
+    p->last_t = now;
+    p->seen = true;
     p->last_current = relative;
     buf e = {0};
     buf_printf(&e, "{\"type\":\"prefill_progress\",\"current\":%d,\"total\":%d}",
@@ -1381,6 +1803,9 @@ static void worker_create_session(engine_server *s, engine_job *j) {
     slot->last_sync_seconds = 0.0;
     pthread_mutex_unlock(&s->mu);
 
+    engine_log(DS4_LOG_DEFAULT,
+               "ds4-engine: session.create id=%s ctx=%d",
+               session_id, s->cfg.ctx_size);
     trace_log(s, "request=%s method=session.create session=%s ctx=%d",
               j->request_id, session_id, s->cfg.ctx_size);
 
@@ -1409,6 +1834,9 @@ static void worker_sync_session(engine_server *s, engine_job *j) {
     const ds4_tokens *prompt_for_sync = &tokens;
     const int old_pos = ds4_session_pos(session);
     const int common = ds4_session_common_prefix(session, &tokens);
+    trace_cache_diag cache_diag = {0};
+    trace_cache_capture(&cache_diag, ds4_session_tokens(session), &tokens,
+                        old_pos, common);
     int cached = common == old_pos && tokens.len >= old_pos ? common : 0;
     const char *cache_source = cached > 0 ? "memory-token" : "none";
 
@@ -1445,6 +1873,8 @@ static void worker_sync_session(engine_server *s, engine_job *j) {
     int evaluated = prompt_for_sync->len - cached;
     if (evaluated < 0) evaluated = prompt_for_sync->len;
 
+    char err[160];
+    const double t0 = now_sec();
     sync_progress progress = {
         .server = s,
         .slot = slot,
@@ -1454,10 +1884,20 @@ static void worker_sync_session(engine_server *s, engine_job *j) {
         .cached_tokens = cached,
         .total_eval_tokens = evaluated,
         .last_current = -1,
+        .phase = "prefill",
+        .t0 = t0,
+        .last_t = t0,
     };
+    request_ctx_span(progress.ctx, sizeof(progress.ctx), cached, prompt_for_sync->len);
 
-    char err[160];
-    const double t0 = now_sec();
+    engine_log(DS4_LOG_PREFILL,
+               "ds4-engine: sync session=%s ctx=%s source=%s disk=%d prompt start",
+               j->session_id, progress.ctx, cache_source, disk_cached);
+    uint64_t trace_id = trace_sync_begin(s, j, &tokens, prompt_for_sync,
+                                         cached, evaluated, &cache_diag,
+                                         cache_source, disk_cached,
+                                         load_result.path);
+
     ds4_session_set_progress(session, sync_progress_cb, &progress);
 
     int cold_store_len = 0;
@@ -1541,6 +1981,12 @@ static void worker_sync_session(engine_server *s, engine_job *j) {
               j->request_id, j->session_id, position, cached, evaluated,
               rebuilt ? 1 : 0, cache_source, disk_cached,
               load_result.path ? load_result.path : "", t1 - t0);
+    engine_log(DS4_LOG_PREFILL,
+               "ds4-engine: sync session=%s ctx=%s source=%s cached=%d evaluated=%d rebuilt=%d prompt done %.3fs",
+               j->session_id, progress.ctx, cache_source, cached, evaluated,
+               rebuilt ? 1 : 0, t1 - t0);
+    trace_sync_finish(s, trace_id, position, cached, evaluated, rebuilt,
+                      "ok", NULL, t1 - t0);
 
     buf result = {0};
     buf_puts(&result, "{\"sessionId\":");
@@ -1558,6 +2004,14 @@ static void worker_sync_session(engine_server *s, engine_job *j) {
     return;
 
 sync_error:
+    {
+        const double t_err = now_sec();
+        engine_log(DS4_LOG_ERROR,
+                   "ds4-engine: sync session=%s ctx=%s source=%s error=\"%s\" %.3fs",
+                   j->session_id, progress.ctx, cache_source, err, t_err - t0);
+        trace_sync_finish(s, trace_id, ds4_session_pos(session), cached, evaluated,
+                          old_pos > 0 && cached == 0, "error", err, t_err - t0);
+    }
     ds4_session_set_progress(session, NULL, NULL);
     ds4_kvstore_restore_suppressed_continued(&slot->kv, suppressed_continued_last,
                                              cold_store_len);
@@ -1595,7 +2049,8 @@ static void worker_generate_session(engine_server *s, engine_job *j) {
     send_response_ok(j->client, j->request_id, "{\"accepted\":true}");
 
     int max_tokens = j->max_tokens;
-    int room = ds4_session_ctx(session) - ds4_session_pos(session);
+    const int start_pos = ds4_session_pos(session);
+    int room = ds4_session_ctx(session) - start_pos;
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
     if (max_tokens < 0) max_tokens = 0;
@@ -1605,8 +2060,17 @@ static void worker_generate_session(engine_server *s, engine_job *j) {
     int generated = 0;
     const double t0 = now_sec();
     const char *reason = "max_tokens";
-    char err[160];
+    char err[160] = {0};
     generate_stop_detector stop_detector = {0};
+    bool dsml_done = false;
+    bool invalidated = false;
+    double last_decode_log_t = t0;
+    int last_decode_log_generated = 0;
+    int next_decode_log = 50;
+    uint64_t trace_id = trace_generate_begin(s, j, start_pos, max_tokens, rng);
+    engine_log(DS4_LOG_GENERATION,
+               "ds4-engine: generate session=%s ctx=%d..%d:%d max=%d start",
+               j->session_id, start_pos, start_pos, 0, max_tokens);
 
     while (generated < max_tokens &&
            ds4_session_pos(session) < ds4_session_ctx(session) &&
@@ -1661,7 +2125,13 @@ static void worker_generate_session(engine_server *s, engine_job *j) {
         for (int i = 0; i < ntok && generated < max_tokens; i++) {
             token = toks[i];
             if (token == ds4_token_eos(s->engine)) {
-                if (i + 1 < ntok) ds4_session_invalidate(session);
+                if (i + 1 < ntok) {
+                    ds4_session_invalidate(session);
+                    invalidated = true;
+                    trace_event(s, trace_id,
+                                "invalidated speculative suffix after EOS at generated token %d",
+                                generated);
+                }
                 reason = "eos";
                 goto done;
             }
@@ -1681,11 +2151,35 @@ static void worker_generate_session(engine_server *s, engine_job *j) {
                 send_event(j->client, j->request_id, txt.ptr);
                 buf_free(&txt);
             }
+            if (piece_len > 0) trace_piece(s, trace_id, piece, piece_len);
+            bool had_dsml = stop_detector.dsml_seen;
             generate_stop_detector_update(&stop_detector, piece, piece_len);
+            if (!had_dsml && stop_detector.dsml_seen) {
+                trace_event(s, trace_id,
+                            "entered DSML tool-call block after %d generated tokens",
+                            generated + 1);
+            }
             free(piece);
             generated++;
+            if (generated >= next_decode_log) {
+                log_generate_progress(j->session_id, start_pos, generated,
+                                      stop_detector.dsml_seen, dsml_done,
+                                      t0, &last_decode_log_t,
+                                      &last_decode_log_generated);
+                next_decode_log += 50;
+            }
             if (generate_stop_detector_done(&stop_detector)) {
-                if (i + 1 < ntok) ds4_session_invalidate(session);
+                dsml_done = true;
+                trace_event(s, trace_id,
+                            "closed DSML tool-call block after %d generated tokens",
+                            generated);
+                if (i + 1 < ntok) {
+                    ds4_session_invalidate(session);
+                    invalidated = true;
+                    trace_event(s, trace_id,
+                                "invalidated speculative suffix after DSML stop at generated token %d",
+                                generated);
+                }
                 reason = "stop";
                 goto done;
             }
@@ -1698,6 +2192,36 @@ static void worker_generate_session(engine_server *s, engine_job *j) {
     if (session_interrupted(s, j->session_id)) reason = "interrupted";
 
 done:
+    {
+        const double t_done = now_sec();
+        if (generated > last_decode_log_generated) {
+            log_generate_progress(j->session_id, start_pos, generated,
+                                  stop_detector.dsml_seen, dsml_done,
+                                  t0, &last_decode_log_t,
+                                  &last_decode_log_generated);
+        }
+        char flags[64];
+        log_flags(flags, sizeof(flags), stop_detector.dsml_seen, dsml_done);
+        int final_pos = ds4_session_pos(session);
+        int visible_pos = invalidated ? start_pos + generated : final_pos;
+        char final_ctx[48];
+        request_ctx_span(final_ctx, sizeof(final_ctx), start_pos, visible_pos);
+        if (!strcmp(reason, "error") && err[0]) {
+            engine_log(DS4_LOG_ERROR,
+                       "ds4-engine: generate session=%s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                       j->session_id, final_ctx, generated,
+                       flags[0] ? " " : "", flags, reason, err, t_done - t0);
+            trace_event(s, trace_id, "engine error: %s", err);
+        } else {
+            engine_log(DS4_LOG_GENERATION,
+                       "ds4-engine: generate session=%s ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       j->session_id, final_ctx, generated,
+                       flags[0] ? " " : "", flags, reason, t_done - t0);
+        }
+        trace_generate_finish(s, trace_id, reason, generated,
+                              final_pos, stop_detector.dsml_seen,
+                              dsml_done, invalidated, t_done - t0);
+    }
     if (strcmp(reason, "error") != 0) {
         const double t1 = now_sec();
         double gen_s = t1 - t0;
@@ -1760,6 +2284,9 @@ static void worker_destroy_session(engine_server *s, engine_job *j) {
                             "session not found", false);
         return;
     }
+    engine_log(DS4_LOG_DEFAULT,
+               "ds4-engine: session.destroy id=%s",
+               id ? id : j->session_id);
     trace_log(s, "request=%s method=session.destroy session=%s",
               j->request_id, id ? id : j->session_id);
     ds4_session_free(session);
@@ -1913,6 +2440,9 @@ static void handle_request_line(engine_server *s, client_conn *c, const char *li
         if (!slot) {
             send_response_error(c, req.id, "session_not_found", "session not found", false);
         } else {
+            engine_log(DS4_LOG_WARNING,
+                       "ds4-engine: session.interrupt id=%s",
+                       session_id);
             trace_log(s, "request=%s method=session.interrupt session=%s", req.id, session_id);
             send_response_ok(c, req.id, "{}");
         }
@@ -1933,6 +2463,7 @@ static void handle_request_line(engine_server *s, client_conn *c, const char *li
         memset(j, 0, sizeof(*j));
         j->kind = JOB_SESSION_CREATE;
         j->request_id = xstrdup(req.id);
+        j->params_json = xstrdup(req.params_json ? req.params_json : "{}");
         j->requested_session_id = requested_id;
         queue_job_for_client(s, c, j);
         engine_request_free(&req);
@@ -1958,6 +2489,7 @@ static void handle_request_line(engine_server *s, client_conn *c, const char *li
         memset(j, 0, sizeof(*j));
         j->kind = JOB_SESSION_SYNC;
         j->request_id = xstrdup(req.id);
+        j->params_json = xstrdup(req.params_json ? req.params_json : "{}");
         j->session_id = p.session_id;
         j->prefix_text = p.prefix_text;
         p.session_id = NULL;
@@ -1994,6 +2526,7 @@ static void handle_request_line(engine_server *s, client_conn *c, const char *li
         memset(j, 0, sizeof(*j));
         j->kind = JOB_SESSION_GENERATE;
         j->request_id = xstrdup(req.id);
+        j->params_json = xstrdup(req.params_json ? req.params_json : "{}");
         j->session_id = p.session_id;
         j->max_tokens = p.max_tokens;
         j->temperature = p.temperature;
@@ -2028,6 +2561,7 @@ static void handle_request_line(engine_server *s, client_conn *c, const char *li
         memset(j, 0, sizeof(*j));
         j->kind = JOB_SESSION_DESTROY;
         j->request_id = xstrdup(req.id);
+        j->params_json = xstrdup(req.params_json ? req.params_json : "{}");
         j->session_id = session_id;
         queue_job_for_client(s, c, j);
         engine_request_free(&req);
@@ -2331,7 +2865,8 @@ int main(int argc, char **argv) {
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-        fprintf(stderr, "ds4-engine: failed to load model: %s\n", cfg.engine.model_path);
+        engine_log(DS4_LOG_ERROR, "ds4-engine: failed to load model: %s",
+                   cfg.engine.model_path);
         return 1;
     }
 
@@ -2347,17 +2882,19 @@ int main(int argc, char **argv) {
     if (cfg.trace_path) {
         server.trace = fopen(cfg.trace_path, "a");
         if (!server.trace) {
-            fprintf(stderr, "ds4-engine: failed to open trace %s: %s\n",
-                    cfg.trace_path, strerror(errno));
+            engine_log(DS4_LOG_ERROR, "ds4-engine: failed to open trace %s: %s",
+                       cfg.trace_path, strerror(errno));
             engine_server_free(&server);
             return 1;
         }
+        engine_log(DS4_LOG_DEFAULT, "ds4-engine: tracing session to %s",
+                   cfg.trace_path);
     }
 
     int lfd = listen_unix_socket(cfg.socket_path);
     if (lfd < 0) {
-        fprintf(stderr, "ds4-engine: failed to listen on %s: %s\n",
-                cfg.socket_path, strerror(errno));
+        engine_log(DS4_LOG_ERROR, "ds4-engine: failed to listen on %s: %s",
+                   cfg.socket_path, strerror(errno));
         engine_server_free(&server);
         return 1;
     }
@@ -2365,13 +2902,13 @@ int main(int argc, char **argv) {
 
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, &server) != 0) {
-        fprintf(stderr, "ds4-engine: failed to start worker thread\n");
+        engine_log(DS4_LOG_ERROR, "ds4-engine: failed to start worker thread");
         close(lfd);
         engine_server_free(&server);
         return 1;
     }
 
-    fprintf(stderr, "ds4-engine: listening on unix://%s\n", cfg.socket_path);
+    engine_log(DS4_LOG_DEFAULT, "ds4-engine: listening on unix://%s", cfg.socket_path);
     trace_log(&server, "listening socket=%s model=%s backend=%s ctx=%d max_sessions=%d",
               cfg.socket_path, cfg.engine.model_path,
               ds4_backend_name(cfg.engine.backend), cfg.ctx_size, cfg.max_sessions);
