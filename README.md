@@ -151,14 +151,17 @@ The build also produces `./ds4-engine`, a native Sloppy engine endpoint. It
 listens on a Unix socket and speaks the v1 NDJSON engine envelope:
 
 ```sh
-./ds4-engine --socket /tmp/ds4-engine.sock -m ds4flash.gguf --ctx 100000
+./ds4-engine --socket /tmp/ds4-engine.sock -m ds4flash.gguf --ctx 100000 \
+  --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
 `ds4-engine` expects the client runtime to send fully rendered DS4 chat text
 with the model markers already present, then tokenizes it with the native DS4
 rendered-chat tokenizer. The first protocol milestone supports
 `engine.describe`, `session.create`, `session.sync`, `session.generate`,
-`session.interrupt`, and `session.destroy`.
+`session.interrupt`, and `session.destroy`. When `--kv-disk-dir` is set,
+`session.sync` also uses the shared rendered-text disk KV cache for cold,
+continued, shutdown, and restart prefix reuse.
 
 ## Speed
 

@@ -60,8 +60,8 @@ ds4-eval: ds4_eval.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-engine: ds4_engine.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_engine.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-engine: ds4_engine.o ds4_kvstore.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_engine.o ds4_kvstore.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_engine_cpu.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -69,7 +69,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-engine ds4_engine_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-engine ds4_engine_cpu.o ds4_kvstore.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression:
 	@echo "cuda-regression requires a CUDA build"
@@ -114,7 +114,7 @@ ds4-eval: ds4_eval.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-engine: ds4_engine.o $(CORE_OBJS)
+ds4-engine: ds4_engine.o ds4_kvstore.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_engine_cpu.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
@@ -123,7 +123,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-engine ds4_engine_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-engine ds4_engine_cpu.o ds4_kvstore.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
@@ -147,7 +147,7 @@ ds4_eval.o: ds4_eval.c ds4.h
 ds4_agent.o: ds4_agent.c ds4.h ds4_kvstore.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_agent.c
 
-ds4_engine.o: ds4_engine.c ds4.h
+ds4_engine.o: ds4_engine.c ds4.h ds4_kvstore.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_engine.c
 
 ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h
@@ -156,7 +156,7 @@ ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
-ds4_engine_test.o: tests/ds4_engine_test.c ds4_engine.c ds4.h
+ds4_engine_test.o: tests/ds4_engine_test.c ds4_engine.c ds4.h ds4_kvstore.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_engine_test.c
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
@@ -186,7 +186,7 @@ ds4_eval_cpu.o: ds4_eval.c ds4.h
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_kvstore.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
-ds4_engine_cpu.o: ds4_engine.c ds4.h
+ds4_engine_cpu.o: ds4_engine.c ds4.h ds4_kvstore.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_engine.c
 
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
@@ -205,11 +205,11 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-ds4_engine_test: ds4_engine_test.o $(CORE_OBJS)
+ds4_engine_test: ds4_engine_test.o ds4_kvstore.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
-	$(CC) $(CFLAGS) -o $@ ds4_engine_test.o $(CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(CFLAGS) -o $@ ds4_engine_test.o ds4_kvstore.o $(CORE_OBJS) $(METAL_LDLIBS)
 else
-	$(NVCC) $(NVCCFLAGS) -o $@ ds4_engine_test.o $(CORE_OBJS) $(CUDA_LDLIBS)
+	$(NVCC) $(NVCCFLAGS) -o $@ ds4_engine_test.o ds4_kvstore.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
 test: ds4_engine_test ds4_test

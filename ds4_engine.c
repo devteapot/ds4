@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_kvstore.h"
 
 /* Native Sloppy engine protocol endpoint.
  *
@@ -49,6 +50,10 @@ typedef struct {
     ds4_engine_options engine;
     const char *socket_path;
     const char *trace_path;
+    const char *kv_disk_dir;
+    uint64_t kv_disk_space_mb;
+    ds4_kvstore_options kv_cache;
+    bool kv_cache_reject_different_quant;
     int ctx_size;
     int max_sessions;
 } engine_config;
@@ -63,6 +68,7 @@ typedef struct client_conn {
 typedef struct {
     char *id;
     ds4_session *session;
+    ds4_kvstore kv;
     bool busy;
     bool interrupt;
     int last_sync_evaluated;
@@ -131,6 +137,9 @@ typedef struct {
 } generate_params;
 
 typedef struct {
+    engine_server *server;
+    engine_session_slot *slot;
+    ds4_session *session;
     client_conn *client;
     const char *request_id;
     int cached_tokens;
@@ -584,6 +593,15 @@ static void trace_log(engine_server *s, const char *fmt, ...) {
     fputc('\n', s->trace);
     fflush(s->trace);
     pthread_mutex_unlock(&s->trace_mu);
+}
+
+static void kv_log_cb(void *ud, ds4_kvstore_log_type type, const char *msg) {
+    engine_server *s = ud;
+    const char *level = "kvcache";
+    if (type == DS4_KVSTORE_LOG_DEFAULT) level = "info";
+    else if (type == DS4_KVSTORE_LOG_WARNING) level = "warning";
+    fprintf(stderr, "ds4-engine: %s\n", msg ? msg : "");
+    trace_log(s, "%s %s", level, msg ? msg : "");
 }
 
 static void engine_request_free(engine_request *r) {
@@ -1150,6 +1168,13 @@ static void sync_progress_cb(void *ud, const char *event, int current, int total
     sync_progress *p = ud;
     (void)total;
     if (!p || !event || strcmp(event, "prefill_chunk")) return;
+    if (p->slot && p->slot->kv.enabled && p->session &&
+        current > p->cached_tokens)
+    {
+        char err[160] = {0};
+        ds4_kvstore_maybe_store_continued(&p->slot->kv, p->server->engine,
+                                          p->session, NULL, err, sizeof(err));
+    }
     int relative = current - p->cached_tokens;
     if (relative < 0) relative = 0;
     if (relative > p->total_eval_tokens) relative = p->total_eval_tokens;
@@ -1170,6 +1195,63 @@ static void send_final_prefill_progress(sync_progress *p) {
     send_event(p->client, p->request_id, e.ptr);
     buf_free(&e);
     p->last_current = p->total_eval_tokens;
+}
+
+static bool session_kv_open(engine_server *s, engine_session_slot *slot) {
+    memset(&slot->kv, 0, sizeof(slot->kv));
+    if (!s->cfg.kv_disk_dir) return true;
+    return ds4_kvstore_open(&slot->kv, s->cfg.kv_disk_dir,
+                            s->cfg.kv_disk_space_mb,
+                            s->cfg.kv_cache_reject_different_quant,
+                            s->cfg.kv_cache,
+                            "ds4-engine", kv_log_cb, s);
+}
+
+static void session_kv_close(engine_session_slot *slot) {
+    if (!slot) return;
+    ds4_kvstore_close(&slot->kv);
+}
+
+static bool session_kv_store_live(engine_server *s, engine_session_slot *slot,
+                                  const ds4_tokens *tokens, int store_len,
+                                  const char *reason) {
+    if (!slot || !slot->kv.enabled || !slot->session) return false;
+    char err[160] = {0};
+    return ds4_kvstore_store_live_prefix(&slot->kv, s->engine, slot->session,
+                                         tokens, store_len, reason, NULL,
+                                         err, sizeof(err));
+}
+
+static void session_kv_store_current(engine_server *s, engine_session_slot *slot,
+                                     const char *reason) {
+    if (!slot || !slot->kv.enabled || !slot->session) return;
+    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    if (!tokens || tokens->len < slot->kv.opt.min_tokens) return;
+    session_kv_store_live(s, slot, tokens, tokens->len, reason);
+}
+
+static int live_text_prefix_prompt(engine_server *s, ds4_session *session,
+                                   const char *prefix_text,
+                                   ds4_tokens *effective_prompt) {
+    if (!s || !session || !prefix_text || !effective_prompt) return 0;
+    const ds4_tokens *live_tokens = ds4_session_tokens(session);
+    if (!live_tokens || live_tokens->len <= 0) return 0;
+
+    size_t live_text_len = 0;
+    char *live_text = ds4_kvstore_render_tokens_text(s->engine, live_tokens,
+                                                     &live_text_len);
+    const size_t prefix_text_len = strlen(prefix_text);
+    if (!ds4_kvstore_byte_prefix_match(prefix_text, prefix_text_len,
+                                       live_text, live_text_len))
+    {
+        free(live_text);
+        return 0;
+    }
+
+    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, prefix_text + live_text_len, effective_prompt);
+    free(live_text);
+    return live_tokens->len;
 }
 
 static void worker_create_session(engine_server *s, engine_job *j) {
@@ -1197,6 +1279,14 @@ static void worker_create_session(engine_server *s, engine_job *j) {
         return;
     }
 
+    engine_session_slot new_slot;
+    memset(&new_slot, 0, sizeof(new_slot));
+    new_slot.session = session;
+    if (!session_kv_open(s, &new_slot) && s->cfg.kv_disk_dir) {
+        trace_log(s, "request=%s method=session.create kv_cache_disabled dir=%s",
+                  j->request_id, s->cfg.kv_disk_dir);
+    }
+
     char idbuf[64];
     const char *session_id = j->requested_session_id;
     if (!session_id || !session_id[0]) {
@@ -1209,6 +1299,7 @@ static void worker_create_session(engine_server *s, engine_job *j) {
     engine_session_slot *slot = free_session_slot_locked(s);
     if (!slot || find_session_locked(s, session_id)) {
         pthread_mutex_unlock(&s->mu);
+        session_kv_close(&new_slot);
         ds4_session_free(session);
         send_response_error(j->client, j->request_id, "busy",
                             "maximum session count reached", false);
@@ -1216,6 +1307,7 @@ static void worker_create_session(engine_server *s, engine_job *j) {
     }
     slot->id = xstrdup(session_id);
     slot->session = session;
+    slot->kv = new_slot.kv;
     slot->busy = false;
     slot->interrupt = false;
     slot->last_sync_evaluated = 0;
@@ -1246,13 +1338,50 @@ static void worker_sync_session(engine_server *s, engine_job *j) {
 
     ds4_tokens tokens = {0};
     ds4_tokenize_rendered_chat(s->engine, j->prefix_text, &tokens);
+    ds4_tokens effective_prompt = {0};
+    const ds4_tokens *prompt_for_sync = &tokens;
     const int old_pos = ds4_session_pos(session);
     const int common = ds4_session_common_prefix(session, &tokens);
-    const int cached = common == old_pos && tokens.len >= old_pos ? common : 0;
-    int evaluated = tokens.len - cached;
-    if (evaluated < 0) evaluated = tokens.len;
+    int cached = common == old_pos && tokens.len >= old_pos ? common : 0;
+    const char *cache_source = cached > 0 ? "memory-token" : "none";
+
+    if (cached == 0 && old_pos > 0) {
+        int text_cached = live_text_prefix_prompt(s, session, j->prefix_text,
+                                                  &effective_prompt);
+        if (text_cached > 0) {
+            cached = text_cached;
+            cache_source = "memory-text";
+            prompt_for_sync = &effective_prompt;
+        }
+    }
+
+    if (cached == 0 && slot->kv.enabled) {
+        slot->kv.continued_last_store_tokens = 0;
+    }
+    if (slot->kv.enabled && cached == 0 && old_pos >= slot->kv.opt.min_tokens) {
+        session_kv_store_current(s, slot, "evict");
+    }
+
+    int disk_cached = 0;
+    ds4_kvstore_load_result load_result = {0};
+    if (cached == 0 && slot->kv.enabled) {
+        disk_cached = ds4_kvstore_try_load_text(&slot->kv, s->engine, session,
+                                                j->prefix_text, &effective_prompt,
+                                                &load_result, NULL, false);
+        if (disk_cached > 0) {
+            cached = disk_cached;
+            cache_source = "disk-text";
+            prompt_for_sync = &effective_prompt;
+        }
+    }
+
+    int evaluated = prompt_for_sync->len - cached;
+    if (evaluated < 0) evaluated = prompt_for_sync->len;
 
     sync_progress progress = {
+        .server = s,
+        .slot = slot,
+        .session = session,
         .client = j->client,
         .request_id = j->request_id,
         .cached_tokens = cached,
@@ -1263,17 +1392,70 @@ static void worker_sync_session(engine_server *s, engine_job *j) {
     char err[160];
     const double t0 = now_sec();
     ds4_session_set_progress(session, sync_progress_cb, &progress);
-    int rc = ds4_session_sync(session, &tokens, err, sizeof(err));
+
+    int cold_store_len = 0;
+    if (cached == 0 &&
+        slot->kv.enabled &&
+        prompt_for_sync->len >= slot->kv.opt.min_tokens &&
+        slot->kv.opt.cold_max_tokens > 0 &&
+        prompt_for_sync->len <= slot->kv.opt.cold_max_tokens)
+    {
+        const int anchor = ds4_kvstore_chat_anchor_pos(&slot->kv, prompt_for_sync,
+                                                       ds4_token_user(s->engine),
+                                                       ds4_token_assistant(s->engine));
+        cold_store_len = anchor >= slot->kv.opt.min_tokens ?
+                         anchor : ds4_kvstore_store_len(&slot->kv,
+                                                        prompt_for_sync->len);
+    }
+
+    int suppressed_continued_last = -1;
+    if (slot->kv.enabled && cold_store_len >= slot->kv.opt.min_tokens) {
+        suppressed_continued_last =
+            ds4_kvstore_suppress_continued_store(&slot->kv, cold_store_len);
+    }
+
+    int rc = 0;
+    if (slot->kv.enabled &&
+        cold_store_len >= slot->kv.opt.min_tokens &&
+        cold_store_len < prompt_for_sync->len)
+    {
+        ds4_tokens prefix = {0};
+        ds4_kvstore_tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
+        rc = ds4_session_sync(session, &prefix, err, sizeof(err));
+        ds4_tokens_free(&prefix);
+        if (rc != 0) goto sync_error;
+
+        if (session_kv_store_live(s, slot, prompt_for_sync, cold_store_len, "cold")) {
+            ds4_kvstore_note_store(&slot->kv, cold_store_len);
+            suppressed_continued_last = -1;
+        } else {
+            ds4_kvstore_restore_suppressed_continued(&slot->kv,
+                                                     suppressed_continued_last,
+                                                     cold_store_len);
+            suppressed_continued_last = -1;
+        }
+    }
+
+    rc = ds4_session_sync(session, prompt_for_sync, err, sizeof(err));
+    if (rc != 0) goto sync_error;
     ds4_session_set_progress(session, NULL, NULL);
+    if (slot->kv.enabled) {
+        char store_err[160] = {0};
+        ds4_kvstore_maybe_store_continued(&slot->kv, s->engine, session, NULL,
+                                          store_err, sizeof(store_err));
+    }
     const double t1 = now_sec();
 
-    if (rc != 0) {
-        ds4_tokens_free(&tokens);
-        job_clear_busy(s, j->session_id);
-        send_response_error(j->client, j->request_id, "engine_error", err, false);
-        trace_log(s, "request=%s method=session.sync session=%s error=%s",
-                  j->request_id, j->session_id, err);
-        return;
+    if (slot->kv.enabled && cold_store_len == prompt_for_sync->len) {
+        if (session_kv_store_live(s, slot, prompt_for_sync, cold_store_len, "cold")) {
+            ds4_kvstore_note_store(&slot->kv, cold_store_len);
+            suppressed_continued_last = -1;
+        } else {
+            ds4_kvstore_restore_suppressed_continued(&slot->kv,
+                                                     suppressed_continued_last,
+                                                     cold_store_len);
+            suppressed_continued_last = -1;
+        }
     }
     send_final_prefill_progress(&progress);
 
@@ -1288,9 +1470,10 @@ static void worker_sync_session(engine_server *s, engine_job *j) {
     }
     pthread_mutex_unlock(&s->mu);
 
-    trace_log(s, "request=%s method=session.sync session=%s position=%d cached=%d evaluated=%d rebuilt=%d seconds=%.3f",
+    trace_log(s, "request=%s method=session.sync session=%s position=%d cached=%d evaluated=%d rebuilt=%d source=%s disk_cached=%d disk_path=%s seconds=%.3f",
               j->request_id, j->session_id, position, cached, evaluated,
-              rebuilt ? 1 : 0, t1 - t0);
+              rebuilt ? 1 : 0, cache_source, disk_cached,
+              load_result.path ? load_result.path : "", t1 - t0);
 
     buf result = {0};
     buf_puts(&result, "{\"sessionId\":");
@@ -1302,7 +1485,22 @@ static void worker_sync_session(engine_server *s, engine_job *j) {
                rebuilt ? "true" : "false");
     send_response_ok(j->client, j->request_id, result.ptr);
     buf_free(&result);
+    ds4_kvstore_load_result_free(&load_result);
+    ds4_tokens_free(&effective_prompt);
     ds4_tokens_free(&tokens);
+    return;
+
+sync_error:
+    ds4_session_set_progress(session, NULL, NULL);
+    ds4_kvstore_restore_suppressed_continued(&slot->kv, suppressed_continued_last,
+                                             cold_store_len);
+    ds4_kvstore_load_result_free(&load_result);
+    ds4_tokens_free(&effective_prompt);
+    ds4_tokens_free(&tokens);
+    job_clear_busy(s, j->session_id);
+    send_response_error(j->client, j->request_id, "engine_error", err, false);
+    trace_log(s, "request=%s method=session.sync session=%s error=%s",
+              j->request_id, j->session_id, err);
 }
 
 static bool session_interrupted(engine_server *s, const char *session_id) {
@@ -1465,7 +1663,15 @@ static void worker_destroy_session(engine_server *s, engine_job *j) {
     char *id = NULL;
     pthread_mutex_lock(&s->mu);
     engine_session_slot *slot = find_session_locked(s, j->session_id);
+    pthread_mutex_unlock(&s->mu);
     if (slot) {
+        session_kv_store_current(s, slot, "shutdown");
+    }
+
+    pthread_mutex_lock(&s->mu);
+    slot = find_session_locked(s, j->session_id);
+    if (slot) {
+        session_kv_close(slot);
         session = slot->session;
         id = slot->id;
         memset(slot, 0, sizeof(*slot));
@@ -1545,8 +1751,10 @@ static void handle_describe(engine_server *s, client_conn *c, const char *id) {
              "\"logprobs\":false,"
              "\"rewind\":false,"
              "\"snapshots\":false,"
-             "\"persistentKv\":false,"
-             "\"batching\":false,");
+             "\"persistentKv\":");
+    buf_puts(&result, s->cfg.kv_disk_dir ? "true" : "false");
+    buf_puts(&result,
+             ",\"batching\":false,");
     buf_puts(&result, "\"speculativeDecode\":");
     buf_puts(&result, spec ? "true" : "false");
     buf_puts(&result, "}}");
@@ -1816,6 +2024,27 @@ static int parse_int_arg(const char *s, const char *opt) {
     return (int)v;
 }
 
+static int parse_nonneg_int_arg(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (!s[0] || *end || v < 0 || v > INT_MAX) {
+        fprintf(stderr, "ds4-engine: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
+static uint64_t parse_uint64_arg(const char *s, const char *opt) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (!s[0] || *end || errno == ERANGE) {
+        fprintf(stderr, "ds4-engine: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (uint64_t)v;
+}
+
 static float parse_float_range(const char *s, const char *opt, float min, float max) {
     char *end = NULL;
     float v = strtof(s, &end);
@@ -1857,6 +2086,14 @@ static void usage(FILE *fp) {
         "  --dir-steering-file FILE\n"
         "  --dir-steering-ffn F\n"
         "  --dir-steering-attn F\n"
+        "  --kv-disk-dir DIR     Enable disk KV checkpoints in DIR.\n"
+        "  --kv-disk-space-mb N  Disk KV budget. Default: 4096\n"
+        "  --kv-cache-min-tokens N\n"
+        "  --kv-cache-cold-max-tokens N\n"
+        "  --kv-cache-continued-interval-tokens N\n"
+        "  --kv-cache-boundary-trim-tokens N\n"
+        "  --kv-cache-boundary-align-tokens N\n"
+        "  --kv-cache-reject-different-quant\n"
         "  -h, --help            Show this help.\n");
 }
 
@@ -1868,9 +2105,11 @@ static engine_config parse_options(int argc, char **argv) {
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
+        .kv_cache = {0},
         .ctx_size = 100000,
         .max_sessions = 1,
     };
+    c.kv_cache = ds4_kvstore_default_options();
     bool steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -1893,6 +2132,22 @@ static engine_config parse_options(int argc, char **argv) {
             c.max_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kv-disk-dir")) {
+            c.kv_disk_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kv-disk-space-mb")) {
+            c.kv_disk_space_mb = parse_uint64_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-min-tokens")) {
+            c.kv_cache.min_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-cold-max-tokens")) {
+            c.kv_cache.cold_max_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-continued-interval-tokens")) {
+            c.kv_cache.continued_interval_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-boundary-trim-tokens")) {
+            c.kv_cache.boundary_trim_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-boundary-align-tokens")) {
+            c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
+            c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--metal")) {
@@ -1923,6 +2178,12 @@ static engine_config parse_options(int argc, char **argv) {
     }
     if (!c.socket_path || !c.socket_path[0]) {
         fprintf(stderr, "ds4-engine: --socket is required\n");
+        exit(2);
+    }
+    if (c.kv_cache.cold_max_tokens > 0 &&
+        c.kv_cache.cold_max_tokens < c.kv_cache.min_tokens)
+    {
+        fprintf(stderr, "ds4-engine: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens\n");
         exit(2);
     }
     if (c.engine.directional_steering_file && !steering_scale_set)
@@ -1962,6 +2223,8 @@ static void engine_server_free(engine_server *s) {
     if (!s) return;
     if (s->sessions) {
         for (int i = 0; i < s->cfg.max_sessions; i++) {
+            session_kv_store_current(s, &s->sessions[i], "shutdown");
+            session_kv_close(&s->sessions[i]);
             ds4_session_free(s->sessions[i].session);
             free(s->sessions[i].id);
         }

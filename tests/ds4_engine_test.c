@@ -81,6 +81,34 @@ static void test_generate_requires_options(void) {
     TEST_ASSERT(strstr(err, "options") != NULL);
 }
 
+static void test_parse_kv_disk_options(void) {
+    char *argv[] = {
+        "ds4-engine",
+        "--socket", "/tmp/ds4-engine.sock",
+        "--ctx", "140000",
+        "--kv-disk-dir", "/tmp/ds4-kv",
+        "--kv-disk-space-mb", "8192",
+        "--kv-cache-min-tokens", "1024",
+        "--kv-cache-cold-max-tokens", "0",
+        "--kv-cache-continued-interval-tokens", "4096",
+        "--kv-cache-boundary-trim-tokens", "16",
+        "--kv-cache-boundary-align-tokens", "1024",
+        "--kv-cache-reject-different-quant",
+    };
+    int argc = (int)(sizeof(argv) / sizeof(argv[0]));
+    engine_config c = parse_options(argc, argv);
+    TEST_ASSERT(strcmp(c.socket_path, "/tmp/ds4-engine.sock") == 0);
+    TEST_ASSERT(c.ctx_size == 140000);
+    TEST_ASSERT(strcmp(c.kv_disk_dir, "/tmp/ds4-kv") == 0);
+    TEST_ASSERT(c.kv_disk_space_mb == 8192);
+    TEST_ASSERT(c.kv_cache.min_tokens == 1024);
+    TEST_ASSERT(c.kv_cache.cold_max_tokens == 0);
+    TEST_ASSERT(c.kv_cache.continued_interval_tokens == 4096);
+    TEST_ASSERT(c.kv_cache.boundary_trim_tokens == 16);
+    TEST_ASSERT(c.kv_cache.boundary_align_tokens == 1024);
+    TEST_ASSERT(c.kv_cache_reject_different_quant);
+}
+
 static void test_response_error_shape(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -109,6 +137,7 @@ int main(void) {
     test_parse_generate_options();
     test_detect_stop_sequences();
     test_generate_requires_options();
+    test_parse_kv_disk_options();
     test_response_error_shape();
     fprintf(stderr, "ds4-engine-test: ok\n");
     return 0;
