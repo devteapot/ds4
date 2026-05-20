@@ -73,6 +73,43 @@ static void test_detect_stop_sequences(void) {
     generate_params_free(&p);
 }
 
+static void test_generate_stop_detector_dsml(void) {
+    generate_stop_detector d = {0};
+    const char *p1 = "<" DS4_ENGINE_DSML_BAR "DSM";
+    const char *p2 =
+        "L" DS4_ENGINE_DSML_BAR "tool_calls>\n"
+        "<" DS4_ENGINE_DSML_BAR "invoke name=\"read\">";
+    const char *p3 =
+        "</" DS4_ENGINE_DSML_BAR "invoke>\n"
+        "</" DS4_ENGINE_DSML_BAR "DSML" DS4_ENGINE_DSML_BAR "tool";
+    const char *p4 = "_calls>";
+
+    generate_stop_detector_update(&d, p1, strlen(p1));
+    TEST_ASSERT(!d.dsml_seen);
+    TEST_ASSERT(!generate_stop_detector_done(&d));
+    generate_stop_detector_update(&d, p2, strlen(p2));
+    TEST_ASSERT(d.dsml_seen);
+    TEST_ASSERT(!generate_stop_detector_done(&d));
+    generate_stop_detector_update(&d, p3, strlen(p3));
+    TEST_ASSERT(!generate_stop_detector_done(&d));
+    generate_stop_detector_update(&d, p4, strlen(p4));
+    TEST_ASSERT(generate_stop_detector_done(&d));
+    generate_stop_detector_free(&d);
+}
+
+static void test_generate_stop_detector_plain_tool_calls(void) {
+    generate_stop_detector d = {0};
+    const char *p1 = "prefix <tool_calls>{}";
+    const char *p2 = "</tool_calls> suffix";
+
+    generate_stop_detector_update(&d, p1, strlen(p1));
+    TEST_ASSERT(d.dsml_seen);
+    TEST_ASSERT(!generate_stop_detector_done(&d));
+    generate_stop_detector_update(&d, p2, strlen(p2));
+    TEST_ASSERT(generate_stop_detector_done(&d));
+    generate_stop_detector_free(&d);
+}
+
 static void test_generate_requires_options(void) {
     const char *json = "{\"sessionId\":\"s1\"}";
     generate_params p = {0};
@@ -136,6 +173,8 @@ int main(void) {
     test_reject_token_sync();
     test_parse_generate_options();
     test_detect_stop_sequences();
+    test_generate_stop_detector_dsml();
+    test_generate_stop_detector_plain_tool_calls();
     test_generate_requires_options();
     test_parse_kv_disk_options();
     test_response_error_shape();

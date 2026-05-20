@@ -39,6 +39,7 @@ static const char *g_socket_path = NULL;
 static bool g_socket_created = false;
 
 #define DS4_ENGINE_SEND_STALL_TIMEOUT_MS 2000
+#define DS4_ENGINE_DSML_BAR "\xef\xbd\x9c"
 
 typedef struct {
     char *ptr;
@@ -135,6 +136,11 @@ typedef struct {
     bool has_seed;
     bool has_stop;
 } generate_params;
+
+typedef struct {
+    buf text;
+    bool dsml_seen;
+} generate_stop_detector;
 
 typedef struct {
     engine_server *server;
@@ -1197,6 +1203,67 @@ static void send_final_prefill_progress(sync_progress *p) {
     p->last_current = p->total_eval_tokens;
 }
 
+static bool buffer_contains_literal(const buf *b, const char *needle) {
+    size_t needle_len = strlen(needle);
+    if (!needle_len || b->len < needle_len) return false;
+    for (size_t i = 0; i <= b->len - needle_len; i++) {
+        if (memcmp(b->ptr + i, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
+static bool buffer_contains_any_literal(const buf *b,
+                                        const char *const *needles,
+                                        size_t needle_count) {
+    for (size_t i = 0; i < needle_count; i++) {
+        if (buffer_contains_literal(b, needles[i])) return true;
+    }
+    return false;
+}
+
+static void generate_stop_detector_update(generate_stop_detector *d,
+                                          const char *piece,
+                                          size_t piece_len) {
+    static const char canonical_start[] =
+        "<" DS4_ENGINE_DSML_BAR "DSML" DS4_ENGINE_DSML_BAR "tool_calls>";
+    static const char missing_bar_start[] =
+        "<DSML" DS4_ENGINE_DSML_BAR "tool_calls>";
+    static const char plain_start[] = "<tool_calls>";
+    static const char *const starts[] = {
+        canonical_start,
+        missing_bar_start,
+        plain_start,
+    };
+
+    if (!piece_len) return;
+    buf_append(&d->text, piece, piece_len);
+    if (!d->dsml_seen) {
+        d->dsml_seen = buffer_contains_any_literal(&d->text, starts,
+                                                   sizeof(starts) / sizeof(starts[0]));
+    }
+}
+
+static bool generate_stop_detector_done(const generate_stop_detector *d) {
+    static const char canonical_end[] =
+        "</" DS4_ENGINE_DSML_BAR "DSML" DS4_ENGINE_DSML_BAR "tool_calls>";
+    static const char missing_bar_end[] =
+        "</DSML" DS4_ENGINE_DSML_BAR "tool_calls>";
+    static const char plain_end[] = "</tool_calls>";
+    static const char *const ends[] = {
+        canonical_end,
+        missing_bar_end,
+        plain_end,
+    };
+
+    return d->dsml_seen &&
+           buffer_contains_any_literal(&d->text, ends, sizeof(ends) / sizeof(ends[0]));
+}
+
+static void generate_stop_detector_free(generate_stop_detector *d) {
+    buf_free(&d->text);
+    d->dsml_seen = false;
+}
+
 static bool session_kv_open(engine_server *s, engine_session_slot *slot) {
     memset(&slot->kv, 0, sizeof(slot->kv));
     if (!s->cfg.kv_disk_dir) return true;
@@ -1539,6 +1606,7 @@ static void worker_generate_session(engine_server *s, engine_job *j) {
     const double t0 = now_sec();
     const char *reason = "max_tokens";
     char err[160];
+    generate_stop_detector stop_detector = {0};
 
     while (generated < max_tokens &&
            ds4_session_pos(session) < ds4_session_ctx(session) &&
@@ -1554,6 +1622,7 @@ static void worker_generate_session(engine_server *s, engine_job *j) {
         int toks[17];
         int ntok = 0;
         if (j->temperature <= 0.0f &&
+            !stop_detector.dsml_seen &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -1592,6 +1661,7 @@ static void worker_generate_session(engine_server *s, engine_job *j) {
         for (int i = 0; i < ntok && generated < max_tokens; i++) {
             token = toks[i];
             if (token == ds4_token_eos(s->engine)) {
+                if (i + 1 < ntok) ds4_session_invalidate(session);
                 reason = "eos";
                 goto done;
             }
@@ -1611,8 +1681,14 @@ static void worker_generate_session(engine_server *s, engine_job *j) {
                 send_event(j->client, j->request_id, txt.ptr);
                 buf_free(&txt);
             }
+            generate_stop_detector_update(&stop_detector, piece, piece_len);
             free(piece);
             generated++;
+            if (generate_stop_detector_done(&stop_detector)) {
+                if (i + 1 < ntok) ds4_session_invalidate(session);
+                reason = "stop";
+                goto done;
+            }
             if (session_interrupted(s, j->session_id)) {
                 reason = "interrupted";
                 goto done;
@@ -1656,6 +1732,7 @@ done:
 
     trace_log(s, "request=%s method=session.generate session=%s generated=%d reason=%s",
               j->request_id, j->session_id, generated, reason);
+    generate_stop_detector_free(&stop_detector);
 }
 
 static void worker_destroy_session(engine_server *s, engine_job *j) {
