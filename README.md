@@ -71,12 +71,106 @@ under `models/deepseek-v4-flash/`: it owns the fixed DeepSeek V4 Flash tensor
 layout, graph schedule, Metal kernels, CUDA backend, quant assumptions, and
 validation path.
 
+Additional family scaffolds now live under `models/qwen3.6-27b/` for
+`Qwen/Qwen3.6-27B` and `models/mistral-medium-3.5-128b/` for
+`mistralai/Mistral-Medium-3.5-128B`. They register through `runtime-core`; Qwen
+now validates and opens readable GGUF files with shared metadata/tensor helpers,
+loads GGUF BPE token tables with a Qwen2-style pre-tokenizer for contractions,
+single digits, and punctuation/newline pieces, renders Qwen chat prompts with
+Qwen-style assistant thinking stripping/replay preservation, strictly binds the
+required Qwen text tensors, validates optional Qwen VL mmproj files, and owns a
+versioned Qwen session payload for prompt/checkpoint state. Qwen payload v3 now
+records state-layout byte counts and typed sections for tokens, logits, last
+target hidden state, full-attention KV, Gated DeltaNet state, and convolution
+state. Payload loading can preserve and re-save v1/v2/v3 state sections. Qwen
+now has a CPU reference eval path for plain `f32`, `f16`, and `bf16` GGUF
+tensors, with slow reference dequantization for `q4_0`, `q4_1`, `q5_0`,
+`q5_1`, `q8_0`, `q8_1`, `q2_K`, `q3_K`, `q4_K`, `q5_K`, `q6_K`, and `q8_K`,
+plus `iq1_s`, `iq1_m`, `iq2_xxs`, `iq2_xs`, `iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_nl`, and `iq4_xs`, including the hybrid Gated DeltaNet/full-attention stack and lazy state allocation. Official-vector parity, full graph scheduling for production
+backends, and CUDA kernels remain open, though a Qwen full-logit vector
+capture/runner now exists under `tests/qwen36-vectors/`. An early Qwen Metal
+backend now opens explicitly and offloads supported `f32`/`f16`/`bf16`,
+`q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q8_1`, `q2_K`, `q3_K`,
+`q4_K`, `q5_K`, `q6_K`, `q8_K`, `iq1_s`, `iq1_m`, `iq2_xxs`, `iq2_xs`, `iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_nl`, and `iq4_xs` 2D matvecs,
+RMSNorms, FFN SiLU-mul activations, Gated DeltaNet L2Norms, per-head Gated
+DeltaNet recurrent updates, and per-head full-attention reductions after a
+compile-time kernel self-test, with CPU fallback for unsupported tensor types.
+The Qwen text gate now runs a nonzero recurrent text fixture through an explicit
+Metal engine, compares the hidden-state probe with the CPU fixture, and asserts
+actual matvec/RMSNorm/SiLU/L2/Gated Delta/full-attention helper offload counters
+without fallbacks. Full production graph scheduling and CUDA kernels remain
+open.
+`ds4-server` can now serve Qwen text
+requests through the runtime-core session path for `/v1/chat/completions`, `/v1/completions`,
+`/v1/responses`, and `/v1/messages` when launched with a compatible Qwen GGUF,
+including text-prefix disk checkpoint reuse for Qwen prompt payloads and
+generated completion prefixes across fresh server/session reloads, plus a
+synthetic nonzero Qwen recurrent/convolution state disk-cache reload. The text
+gate now covers tokenizer pre-tokenization and chat-template replay regressions
+plus runtime-core SSE streaming for OpenAI completions/chat, Responses, and Anthropic messages
+against the synthetic Qwen text model. The Qwen
+runtime-core server path can render
+OpenAI, Responses, and Anthropic tool schemas into the Qwen XML tool prompt and
+map generated Qwen XML tool calls back to structured API tool calls.
+Runtime-core disk checkpoints can also key Qwen Responses-visible transcripts
+to hidden runtime payloads for restart recovery, and Qwen media prompts use an
+exact disk checkpoint key that includes rendered prompt, token, and media
+payload digests for same-media prompt and generated-continuation reuse. Durable
+local Responses objects now support `previous_response_id` and local
+`conversation` IDs by storing the visible transcript and tool-call IDs beside
+the KV checkpoint directory. The local `/v1/conversations` route can create,
+fetch, update metadata for, and delete conversation records, with text-only
+item create/list/retrieve/delete support; provider-hosted remote
+Responses/Conversations sync remains out of scope. Mistral remains a
+registry/probe scaffold. Qwen engine open
+supports `auto`/`cpu`, plus an early explicit
+`metal` path on macOS for supported dense, scalar-block quant, and K-quant
+matvec/RMSNorm/SiLU-mul/L2Norm/Gated DeltaNet/full-attention-head kernels;
+CUDA opens are still rejected until
+model-specific kernels land. Its context-memory estimator already
+accounts for full-attention KV, Gated DeltaNet recurrent state, convolution
+history, token state, and logits scratch. Qwen engines without `--mmproj`
+reject image/video content and explicit vision placeholders; mmproj-backed
+engines can translate OpenAI, Responses, and Anthropic image/video blocks into
+Qwen vision placeholder token IDs while preserving their media URLs or decoded
+base64/data-URL bytes on the request. File URLs and, on macOS, HTTP(S) media
+URLs are resolved to bytes before decode. The server can decode
+ImageIO-supported image bytes on macOS, plus PNG or Netpbm image bytes in
+portable builds, plus single or concatenated Netpbm video-frame payloads and
+bounded high-frame AVFoundation-decoded video containers on macOS,
+through Qwen-style smart pixel-budget resizing, bicubic sampling, CLIP normalization, and
+aspect-preserving patch grids. Per-media `min_pixels`/`max_pixels` controls are
+honored for smart resize, explicit `resized_height`/`resized_width` requests are
+aligned through Qwen's patch-factor resize path, and video `nframes`,
+`min_frames`, `max_frames`, `fps`, `video_start`, and `video_end` controls drive
+bounded frame-factor-aligned sampling up to 256 frames. The server can
+project those grids through the CPU mmproj path,
+expand image/video pad tokens to the projected token count, sync the resulting
+hidden vectors at those positions, and reload same-media prompt or
+generated-continuation checkpoints with exact media-aware keys; full upstream
+video metadata return and provider-level video sampling parity are still gated.
+Qwen can bind
+and validate MTP/nextn support layers from embedded or separate GGUF files,
+including consecutive external nextn layers up to the configured draft span, and
+runtime-core exposes a speculative argmax-span hook that Qwen services by
+building a bounded CPU nextn draft suffix and accepting only tokens that match
+the target model's greedy argmax. Low-confidence draft suffixes are gated by
+the Qwen MTP margin and fall back to exact greedy decode, with per-session
+proposed/accepted/rejected/skipped counters available for
+tests and diagnostics. Qwen checkpoints persist the last target hidden state
+needed by that verifier, reset non-persisted draft counters on payload restore,
+and include server decode regressions that prove deterministic MTP verifier
+rejection, acceptance, and margin skips plus a text gate that accepts a
+multi-token external MTP draft span. Batched target verification and production
+acceleration are still gated.
+
 The intended framework boundary is:
 
-- `runtime-core/`: model-agnostic registry and vtable wrappers.  It knows about
-  opaque engines, sessions, tokens, chat rendering, sampling/logprobs, and
-  payload save/load, but not about any specific model architecture. The current
-  ABI is declared in `runtime-core/include/rt_runtime.h`.
+- `runtime-core/`: model-agnostic registry, GGUF metadata/tensor helpers, and
+  vtable wrappers.  It knows about opaque engines, sessions, tokens, chat
+  rendering, sampling/logprobs, and payload save/load, but not about any
+  specific model architecture. The current ABI is declared in
+  `runtime-core/include/rt_runtime.h`.
 - `models/<model-family>/`: one narrow runtime per model family, with its own
   tensor binder, graph schedule, backend kernels, quantization choices, and
   official-vector tests. Each runtime exposes a `rt_model_ops` adapter to the
@@ -88,10 +182,10 @@ The intended framework boundary is:
   to specialize aggressively for that model while presenting the same narrow
   tensor API to the graph driver.
 
-This is the path that should make a future Qwen runtime realistic: copy the
-pattern, not the DeepSeek V4 mechanics. A Qwen model directory should provide
-its own shape constants, tensor names, RoPE/KV rules, MoE or dense FFN schedule,
-and CUDA/MLX/Metal/ROCm kernels where they matter.
+This is the path that should make future Qwen and Mistral runtimes realistic:
+copy the pattern, not the DeepSeek V4 mechanics. A model directory should
+provide its own shape constants, tensor names, RoPE/KV rules, MoE or dense FFN
+schedule, and CUDA/MLX/Metal/ROCm kernels where they matter.
 
 When this framework boundary changes, keep the docs in sync in the same patch:
 `runtime-core/README.md` for the shared ABI, `models/README.md` for the model
@@ -110,6 +204,11 @@ next sections.
   expectations.
 - [models/deepseek-v4-flash/README.md](models/deepseek-v4-flash/README.md):
   current DS4 runtime layout.
+- [models/qwen3.6-27b/README.md](models/qwen3.6-27b/README.md): Qwen3.6 27B
+  runtime scaffold, model constants, and implementation order.
+- [models/mistral-medium-3.5-128b/README.md](models/mistral-medium-3.5-128b/README.md):
+  Mistral Medium 3.5 128B runtime scaffold, model constants, and implementation
+  order.
 - [runtime-core/README.md](runtime-core/README.md): model-agnostic runtime
   registry, vtable boundary, and future shared entrypoint layer.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
@@ -351,13 +450,68 @@ live graph/session.
 Supported endpoints:
 
 - `GET /v1/models`
-- `GET /v1/models/deepseek-v4-flash`
+- `GET /v1/models/{served-model-id}`
+- `POST /v1/conversations`
+- `GET /v1/conversations/{id}`
+- `POST /v1/conversations/{id}`
+- `DELETE /v1/conversations/{id}`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
 
-`/v1/chat/completions` accepts the usual OpenAI-style `messages`,
+When `./ds4-server -m /path/to/qwen.gguf` probes as `qwen3.6-27b`, the server
+uses the runtime-core CPU reference path for text `/v1/chat/completions`,
+`/v1/completions`, `/v1/responses`, and `/v1/messages`. Use
+`--mmproj /path/to/mmproj.gguf` to allow Qwen image/video content blocks and
+vision placeholder tokens during chat rendering. `--kv-disk-dir` stores and
+reloads Qwen text-prefix checkpoints for prompt payloads and generated
+completion prefixes across fresh server/session reloads using the Qwen session
+payload, including a longer synthetic text-state regression that saves, reloads,
+and continues a full-attention KV payload and asserts the restored KV changes
+the next hidden state, plus in-memory and server disk-cache recurrent/conv-state
+checkpoint regressions for Qwen's Gated DeltaNet layers and the optional tool-id
+map for exact Qwen XML tool-call replay after a disk-cache restore. The
+runtime-core path keeps live Responses and Anthropic tool-result continuations
+for Qwen when the returned tool IDs still match the worker-owned session, and
+can persist Responses-visible runtime checkpoints to disk for restart recovery.
+Media requests preserve image/video URLs and decoded base64/data-URL bytes.
+File URLs and, on macOS, HTTP(S) media URLs are resolved to bytes before
+decoding and media-exact disk-key hashing. They bypass text-prefix KV reuse, but
+same-media prompt and
+generated-continuation states can be stored and reloaded with exact media-aware
+disk keys. ImageIO-supported image payloads on macOS, PNG and Netpbm image
+payloads in portable builds, plus single or concatenated Netpbm video-frame
+payloads and bounded high-frame AVFoundation-decoded video-container frames on
+macOS, can already be decoded,
+resized with Qwen-style patch-factor pixel budgets, bicubic-sampled and
+CLIP-normalized into aspect-preserving patch grids with request-level
+`min_pixels`/`max_pixels` and explicit `resized_height`/`resized_width` controls,
+plus `nframes`/`min_frames`/`max_frames` and `fps`/`video_start`/`video_end`
+controls for bounded frame-factor-aligned sampling up to 256 frames,
+projected through Qwen's
+loaded mmproj, expanded into the matching number of image/video pad tokens, and
+injected through the embedding-sync path.
+Local `previous_response_id` and `conversation`
+Responses state persists the visible response text and tool-call IDs beside the
+KV directory. The local `/v1/conversations` route supports conversation
+metadata create/get/update/delete plus text-only item
+create/list/retrieve/delete. Provider-hosted remote object/conversation sync is
+not implemented. It does not yet support full upstream video metadata return,
+provider-level video sampling parity, batched MTP
+acceleration, full Qwen Metal graph
+scheduling, or CUDA Qwen kernels.
+The Qwen model layer can project supplied image patch grids through the loaded
+mmproj as a CPU reference path and can sync prompts with caller-provided hidden
+embeddings replacing selected token embeddings. With
+MTP layers loaded, the runtime-core decode loop can use Qwen's CPU nextn draft
+suffix and exact target verification without changing sampled output semantics;
+external MTP GGUFs can supply consecutive nextn layers for multi-token draft
+spans up to `--mtp-draft`, and `--mtp-margin` skips low-confidence draft
+suffixes back to exact greedy decode.
+
+On the DeepSeek V4 Flash path, `/v1/chat/completions` accepts the usual
+OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
 `seed`, `stream`, `stream_options.include_usage`, `tools`, and `tool_choice`.
 Tool schemas are rendered into DeepSeek's DSML tool format, and generated DSML
@@ -365,9 +519,20 @@ tool calls are mapped back to OpenAI tool calls.
 
 `/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
 `tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
-and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
-Responses continuations bound to live state when possible, and can fall back to
-the same DSML rendering and KV prefix reuse used by chat completions.
+`reasoning`, `previous_response_id`, and local `conversation` IDs. It is the
+preferred endpoint for Codex CLI. The server keeps Responses continuations bound
+to live state when possible, and can fall back to the same DSML rendering and KV
+prefix reuse used by chat completions. `conversation` and `previous_response_id`
+are mutually exclusive on a single request.
+
+`/v1/conversations` provides a local metadata lifecycle for Responses
+continuations: `POST /v1/conversations` creates a conversation, `GET
+/v1/conversations/{id}` fetches it, `POST /v1/conversations/{id}` updates
+metadata, and `DELETE /v1/conversations/{id}` removes the conversation and its
+same-id local Responses state. `conversation.items` on create and
+`/v1/conversations/{id}/items` support completed text/tool items locally;
+media-bearing conversation items and provider-hosted synchronization remain
+gated.
 
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
@@ -751,9 +916,9 @@ Then it stores:
 The logits are raw IEEE-754 `float32` values from the host `ds4_session`
 buffer. They are saved immediately after the checkpoint tokens so a loaded
 snapshot can sample or continue from the exact next-token distribution without
-running one extra decode step. MTP draft logits/state are not persisted; after
-loading a disk checkpoint the draft state is invalidated and rebuilt by normal
-generation.
+running one extra decode step. MTP draft suffixes and verifier counters are not
+persisted; after loading a disk checkpoint the draft state is invalidated and
+rebuilt by normal generation.
 
 The tensor payload is DS4-specific KV/session state, not a generic inference
 graph dump. It is expected to be portable only across compatible
@@ -852,9 +1017,27 @@ All project tests are driven by the C runner:
 
 ```sh
 make test                  # ./ds4_test --all
+make qwen36-gates          # Qwen full local gates, including synthetic mmproj/media
+make qwen36-gates-strict   # full gates, but requires pinned Qwen vectors
+make qwen36-gates-cpu      # full local gates built with DS4_NO_GPU
+make qwen36-text-gates     # Qwen text-only gates, mmproj/media skipped
+make qwen36-text-gates-strict  # same text gates, but requires pinned Qwen vectors
+make qwen36-text-gates-cpu # same text gates built with DS4_NO_GPU
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
+
+Use `make qwen36-gates` for the broader local Qwen gate that exercises
+synthetic mmproj/media prompt expansion and media-exact disk checkpoints in
+addition to the text runtime path. Use `make qwen36-text-gates` when actively
+working on text-only changes and intentionally skipping mmproj/media coverage.
+Set `QWEN36_REQUIRE_OFFICIAL_VECTORS=1` with either gate family when a
+pinned `tests/qwen36-vectors/official.vec` fixture and `QWEN36_TEST_MODEL` are
+available; otherwise the official-vector step reports a skip. Use
+`make qwen36-gates-strict` or `make qwen36-text-gates-strict` for CI jobs where
+the pinned HF fixture must be present, must carry model/revision plus vocab/EOS
+provenance, and must include dense full-logit sections for vocabulary-wide
+comparison.
 
 ## Debugging Notes
 

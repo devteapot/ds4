@@ -52,8 +52,9 @@ What they cover:
   emission in both fast and exact paths.
 - `--metal-kernels`: isolated Metal kernel numeric checks.
 - `--runtime-core`: model-agnostic runtime registry, token helpers, and the
-  current DS4 `rt_model_ops` adapter boundary. Run this for changes under
-  `runtime-core/`, `models/*/runtime/`, or public runtime headers.
+  registered `rt_model_ops` adapter boundaries, including lightweight GGUF
+  metadata/tensor/tokenizer/binder probes. Run this for changes under `runtime-core/`,
+  `models/*/runtime/`, or public runtime headers.
 
 The runner defaults to `ds4flash.gguf`. Override paths when needed:
 

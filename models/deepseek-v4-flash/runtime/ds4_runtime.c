@@ -1,5 +1,6 @@
 #include "ds4_runtime.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,7 +28,26 @@ static ds4_backend ds4_backend_from_rt(rt_backend backend) {
 }
 
 static bool ds4_rt_probe_model_path(const char *model_path) {
+    rt_gguf_metadata meta = {0};
+    char err[256];
+
     if (!model_path) return false;
+    if (rt_gguf_metadata_read(model_path, &meta, err, sizeof(err)) == 0) {
+        const char *arch = NULL;
+        bool ok = rt_gguf_metadata_get_string(&meta, "general.architecture", &arch) &&
+                  arch &&
+                  !strcmp(arch, "deepseek4");
+        rt_gguf_metadata_free(&meta);
+        return ok;
+    }
+
+    if (model_path && model_path[0]) {
+        FILE *fp = fopen(model_path, "rb");
+        if (fp) {
+            fclose(fp);
+            return false;
+        }
+    }
     return strstr(model_path, "ds4flash") ||
            strstr(model_path, "DeepSeek-V4") ||
            strstr(model_path, "deepseek-v4");
@@ -170,6 +190,20 @@ static int ds4_rt_session_eval(void *session, int token, char *err, size_t errle
     return ds4_session_eval(session, token, err, errlen);
 }
 
+static int ds4_rt_session_eval_speculative_argmax(void *session,
+                                                  int first_token,
+                                                  int max_tokens,
+                                                  int eos_token,
+                                                  int *out_tokens,
+                                                  int out_cap,
+                                                  char *err,
+                                                  size_t errlen) {
+    return ds4_session_eval_speculative_argmax(session, first_token,
+                                              max_tokens, eos_token,
+                                              out_tokens, out_cap,
+                                              err, errlen);
+}
+
 static int ds4_rt_session_argmax(void *session) {
     return ds4_session_argmax(session);
 }
@@ -253,6 +287,7 @@ static const rt_model_ops DS4_RUNTIME_OPS = {
     .session_set_progress = ds4_rt_session_set_progress,
     .session_sync = ds4_rt_session_sync,
     .session_eval = ds4_rt_session_eval,
+    .session_eval_speculative_argmax = ds4_rt_session_eval_speculative_argmax,
     .session_argmax = ds4_rt_session_argmax,
     .session_sample = ds4_rt_session_sample,
     .session_top_logprobs = ds4_rt_session_top_logprobs,

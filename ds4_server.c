@@ -1,4 +1,7 @@
 #include "ds4.h"
+#include "ds4_runtime.h"
+#include "mistral35_runtime.h"
+#include "qwen36_runtime.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -35,6 +38,47 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
+
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
+#include <ImageIO/ImageIO.h>
+#endif
+
+#define DS4_QWEN_MAX_VIDEO_FRAMES 256u
+
+#ifdef __APPLE__
+bool ds4_av_decode_video_first_frame_rgb(const unsigned char *data,
+                                         size_t len,
+                                         unsigned char **rgb_out,
+                                         uint32_t *width_out,
+                                         uint32_t *height_out,
+                                         char *err,
+                                         size_t errlen);
+bool ds4_av_decode_video_frames_rgb(const unsigned char *data,
+                                    size_t len,
+                                    uint32_t nframes,
+                                    uint32_t min_frames,
+                                    uint32_t max_frames,
+                                    bool has_fps,
+                                    double fps,
+                                    bool has_video_start,
+                                    double video_start,
+                                    bool has_video_end,
+                                    double video_end,
+                                    unsigned char ***frames_out,
+                                    uint32_t **widths_out,
+                                    uint32_t **heights_out,
+                                    uint32_t *count_out,
+                                    char *err,
+                                    size_t errlen);
+bool ds4_av_fetch_url_bytes(const char *url,
+                            unsigned char **bytes_out,
+                            size_t *len_out,
+                            char *err,
+                            size_t errlen);
+#endif
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
@@ -271,6 +315,26 @@ static bool json_int(const char **p, int *out) {
     return true;
 }
 
+static bool json_u64_clamped(const char **p, uint64_t *out) {
+    double v = 0.0;
+    if (!json_number(p, &v) || !isfinite(v)) return false;
+    if (v < 0.0) v = 0.0;
+    if (v > (double)UINT64_MAX) {
+        *out = UINT64_MAX;
+    } else {
+        *out = (uint64_t)v;
+    }
+    return true;
+}
+
+static bool json_u32_clamped(const char **p, uint32_t *out) {
+    uint64_t v = 0;
+    if (!json_u64_clamped(p, &v)) return false;
+    if (v > UINT32_MAX) v = UINT32_MAX;
+    *out = (uint32_t)v;
+    return true;
+}
+
 static bool json_bool(const char **p, bool *out) {
     json_ws(p);
     if (json_lit(p, "true")) {
@@ -400,7 +464,573 @@ static char *json_minify_raw_value(const char *json) {
     return buf_take(&b);
 }
 
-static bool json_content(const char **p, char **out) {
+typedef struct {
+    bool video;
+    char *url;
+    char *media_type;
+    unsigned char *bytes;
+    size_t bytes_len;
+    uint64_t min_pixels;
+    uint64_t max_pixels;
+    uint32_t resized_width;
+    uint32_t resized_height;
+    uint32_t nframes;
+    uint32_t min_frames;
+    uint32_t max_frames;
+    bool has_fps;
+    bool has_video_start;
+    bool has_video_end;
+    double fps;
+    double video_start;
+    double video_end;
+} runtime_media_ref;
+
+typedef struct {
+    runtime_media_ref *v;
+    int len;
+    int cap;
+} runtime_media_refs;
+
+static void runtime_media_ref_free(runtime_media_ref *m) {
+    free(m->url);
+    free(m->media_type);
+    free(m->bytes);
+    memset(m, 0, sizeof(*m));
+}
+
+static void runtime_media_refs_clear(runtime_media_refs *m) {
+    for (int i = 0; i < m->len; i++) runtime_media_ref_free(&m->v[i]);
+    free(m->v);
+    memset(m, 0, sizeof(*m));
+}
+
+static void runtime_media_refs_push(runtime_media_refs *m, runtime_media_ref ref) {
+    if (!m) {
+        runtime_media_ref_free(&ref);
+        return;
+    }
+    if (m->len == m->cap) {
+        m->cap = m->cap ? m->cap * 2 : 4;
+        m->v = xrealloc(m->v, (size_t)m->cap * sizeof(m->v[0]));
+    }
+    m->v[m->len++] = ref;
+}
+
+static void runtime_media_ref_copy_options(runtime_media_ref *dst,
+                                           const runtime_media_ref *src) {
+    if (!dst || !src) return;
+    dst->min_pixels = src->min_pixels;
+    dst->max_pixels = src->max_pixels;
+    dst->resized_width = src->resized_width;
+    dst->resized_height = src->resized_height;
+    dst->nframes = src->nframes;
+    dst->min_frames = src->min_frames;
+    dst->max_frames = src->max_frames;
+    dst->has_fps = src->has_fps;
+    dst->has_video_start = src->has_video_start;
+    dst->has_video_end = src->has_video_end;
+    dst->fps = src->fps;
+    dst->video_start = src->video_start;
+    dst->video_end = src->video_end;
+}
+
+static bool json_double_finite(const char **p, double *out) {
+    double v = 0.0;
+    if (!json_number(p, &v) || !isfinite(v)) return false;
+    *out = v;
+    return true;
+}
+
+static bool parse_media_ref_option_value(const char *key,
+                                         const char **p,
+                                         runtime_media_ref *opts,
+                                         bool *handled) {
+    if (handled) *handled = false;
+    if (!key || !p) return false;
+    if (!strcmp(key, "min_pixels")) {
+        if (handled) *handled = true;
+        json_ws(p);
+        if (json_lit(p, "null")) {
+            if (opts) opts->min_pixels = 0;
+            return true;
+        }
+        uint64_t v = 0;
+        if (!json_u64_clamped(p, &v)) return false;
+        if (opts) opts->min_pixels = v;
+        return true;
+    }
+    if (!strcmp(key, "max_pixels")) {
+        if (handled) *handled = true;
+        json_ws(p);
+        if (json_lit(p, "null")) {
+            if (opts) opts->max_pixels = 0;
+            return true;
+        }
+        uint64_t v = 0;
+        if (!json_u64_clamped(p, &v)) return false;
+        if (opts) opts->max_pixels = v;
+        return true;
+    }
+    if (!strcmp(key, "resized_width") || !strcmp(key, "resize_width")) {
+        if (handled) *handled = true;
+        json_ws(p);
+        if (json_lit(p, "null")) {
+            if (opts) opts->resized_width = 0;
+            return true;
+        }
+        uint32_t v = 0;
+        if (!json_u32_clamped(p, &v)) return false;
+        if (opts) opts->resized_width = v;
+        return true;
+    }
+    if (!strcmp(key, "resized_height") || !strcmp(key, "resize_height")) {
+        if (handled) *handled = true;
+        json_ws(p);
+        if (json_lit(p, "null")) {
+            if (opts) opts->resized_height = 0;
+            return true;
+        }
+        uint32_t v = 0;
+        if (!json_u32_clamped(p, &v)) return false;
+        if (opts) opts->resized_height = v;
+        return true;
+    }
+    if (!strcmp(key, "nframes") || !strcmp(key, "num_frames")) {
+        if (handled) *handled = true;
+        json_ws(p);
+        if (json_lit(p, "null")) {
+            if (opts) opts->nframes = 0;
+            return true;
+        }
+        uint32_t v = 0;
+        if (!json_u32_clamped(p, &v)) return false;
+        if (opts) opts->nframes = v;
+        return true;
+    }
+    if (!strcmp(key, "min_frames")) {
+        if (handled) *handled = true;
+        json_ws(p);
+        if (json_lit(p, "null")) {
+            if (opts) opts->min_frames = 0;
+            return true;
+        }
+        uint32_t v = 0;
+        if (!json_u32_clamped(p, &v)) return false;
+        if (opts) opts->min_frames = v;
+        return true;
+    }
+    if (!strcmp(key, "max_frames")) {
+        if (handled) *handled = true;
+        json_ws(p);
+        if (json_lit(p, "null")) {
+            if (opts) opts->max_frames = 0;
+            return true;
+        }
+        uint32_t v = 0;
+        if (!json_u32_clamped(p, &v)) return false;
+        if (opts) opts->max_frames = v;
+        return true;
+    }
+    if (!strcmp(key, "fps") || !strcmp(key, "sample_fps")) {
+        if (handled) *handled = true;
+        json_ws(p);
+        if (json_lit(p, "null")) {
+            if (opts) {
+                opts->has_fps = false;
+                opts->fps = 0.0;
+            }
+            return true;
+        }
+        double v = 0.0;
+        if (!json_double_finite(p, &v)) return false;
+        if (v < 0.0) v = 0.0;
+        if (opts) {
+            opts->has_fps = v > 0.0;
+            opts->fps = v;
+        }
+        return true;
+    }
+    if (!strcmp(key, "video_start")) {
+        if (handled) *handled = true;
+        json_ws(p);
+        if (json_lit(p, "null")) {
+            if (opts) {
+                opts->has_video_start = false;
+                opts->video_start = 0.0;
+            }
+            return true;
+        }
+        double v = 0.0;
+        if (!json_double_finite(p, &v)) return false;
+        if (v < 0.0) v = 0.0;
+        if (opts) {
+            opts->has_video_start = true;
+            opts->video_start = v;
+        }
+        return true;
+    }
+    if (!strcmp(key, "video_end")) {
+        if (handled) *handled = true;
+        json_ws(p);
+        if (json_lit(p, "null")) {
+            if (opts) {
+                opts->has_video_end = false;
+                opts->video_end = 0.0;
+            }
+            return true;
+        }
+        double v = 0.0;
+        if (!json_double_finite(p, &v)) return false;
+        if (v < 0.0) v = 0.0;
+        if (opts) {
+            opts->has_video_end = true;
+            opts->video_end = v;
+        }
+        return true;
+    }
+    return true;
+}
+
+static int base64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return (int)(c - 'A');
+    if (c >= 'a' && c <= 'z') return (int)(26 + c - 'a');
+    if (c >= '0' && c <= '9') return (int)(52 + c - '0');
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static bool base64_decode_alloc(const char *s, unsigned char **out, size_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    if (!s) return false;
+    size_t n = strlen(s);
+    if (n > (SIZE_MAX / 3u) * 4u) return false;
+    unsigned char *buf = xmalloc((n / 4u + 2u) * 3u);
+    int quad[4] = {0, 0, 0, 0};
+    int q = 0;
+    bool saw_pad = false;
+    size_t len = 0;
+
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (isspace(*p)) continue;
+        int v = *p == '=' ? -2 : base64_value(*p);
+        if (v < -1) {
+            saw_pad = true;
+        } else if (v < 0 || saw_pad) {
+            free(buf);
+            return false;
+        }
+        quad[q++] = v;
+        if (q != 4) continue;
+        if (quad[0] < 0 || quad[1] < 0 ||
+            (quad[2] == -2 && quad[3] != -2)) {
+            free(buf);
+            return false;
+        }
+        buf[len++] = (unsigned char)((quad[0] << 2) | (quad[1] >> 4));
+        if (quad[2] >= 0) {
+            buf[len++] = (unsigned char)(((quad[1] & 15) << 4) | (quad[2] >> 2));
+            if (quad[3] >= 0) {
+                buf[len++] = (unsigned char)(((quad[2] & 3) << 6) | quad[3]);
+            } else {
+                saw_pad = true;
+            }
+        } else {
+            saw_pad = true;
+        }
+        q = 0;
+    }
+
+    if (q == 1) {
+        free(buf);
+        return false;
+    }
+    if (q == 2) {
+        if (quad[0] < 0 || quad[1] < 0) {
+            free(buf);
+            return false;
+        }
+        buf[len++] = (unsigned char)((quad[0] << 2) | (quad[1] >> 4));
+    } else if (q == 3) {
+        if (quad[0] < 0 || quad[1] < 0 || quad[2] < 0) {
+            free(buf);
+            return false;
+        }
+        buf[len++] = (unsigned char)((quad[0] << 2) | (quad[1] >> 4));
+        buf[len++] = (unsigned char)(((quad[1] & 15) << 4) | (quad[2] >> 2));
+    }
+
+    *out = buf;
+    *out_len = len;
+    return true;
+}
+
+static bool percent_decode_alloc(const char *s, unsigned char **out, size_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    if (!s) return false;
+    size_t n = strlen(s);
+    unsigned char *buf = xmalloc(n + 1u);
+    size_t len = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '%' && i + 2u < n) {
+            int hi = json_hex(s[i + 1u]);
+            int lo = json_hex(s[i + 2u]);
+            if (hi >= 0 && lo >= 0) {
+                buf[len++] = (unsigned char)((hi << 4) | lo);
+                i += 2u;
+                continue;
+            }
+        }
+        buf[len++] = (unsigned char)s[i];
+    }
+    *out = buf;
+    *out_len = len;
+    return true;
+}
+
+static bool parse_data_url(const char *url, char **media_type,
+                           unsigned char **bytes, size_t *bytes_len) {
+    *media_type = NULL;
+    *bytes = NULL;
+    *bytes_len = 0;
+    if (!url || strncasecmp(url, "data:", 5) != 0) return false;
+    const char *comma = strchr(url + 5, ',');
+    if (!comma) return false;
+
+    const char *meta = url + 5;
+    const char *semi = memchr(meta, ';', (size_t)(comma - meta));
+    const char *mt_end = semi ? semi : comma;
+    if (mt_end > meta) *media_type = xstrndup(meta, (size_t)(mt_end - meta));
+
+    bool is_base64 = false;
+    const char *seg = semi ? semi + 1 : comma;
+    while (seg < comma) {
+        const char *next = memchr(seg, ';', (size_t)(comma - seg));
+        const char *end = next ? next : comma;
+        if ((size_t)(end - seg) == 6u && strncasecmp(seg, "base64", 6) == 0) {
+            is_base64 = true;
+            break;
+        }
+        if (!next) break;
+        seg = next + 1;
+    }
+
+    bool ok = is_base64 ?
+        base64_decode_alloc(comma + 1, bytes, bytes_len) :
+        percent_decode_alloc(comma + 1, bytes, bytes_len);
+    if (!ok) {
+        free(*media_type);
+        *media_type = NULL;
+    }
+    return ok;
+}
+
+static bool runtime_media_ref_set_url(runtime_media_ref *ref,
+                                      const char *url,
+                                      const char *media_type_hint) {
+    if (media_type_hint && media_type_hint[0]) ref->media_type = xstrdup(media_type_hint);
+    if (!url || !url[0]) return true;
+    ref->url = xstrdup(url);
+    if (strncasecmp(url, "data:", 5) == 0) {
+        char *data_media_type = NULL;
+        unsigned char *bytes = NULL;
+        size_t bytes_len = 0;
+        if (!parse_data_url(url, &data_media_type, &bytes, &bytes_len)) return false;
+        if ((!ref->media_type || !ref->media_type[0]) && data_media_type) {
+            free(ref->media_type);
+            ref->media_type = data_media_type;
+            data_media_type = NULL;
+        }
+        ref->bytes = bytes;
+        ref->bytes_len = bytes_len;
+        free(data_media_type);
+    }
+    return true;
+}
+
+static bool runtime_media_ref_set_base64(runtime_media_ref *ref,
+                                         const char *data,
+                                         const char *media_type) {
+    if (media_type && media_type[0]) ref->media_type = xstrdup(media_type);
+    if (!data) return true;
+    if (!base64_decode_alloc(data, &ref->bytes, &ref->bytes_len)) return false;
+    buf url = {0};
+    buf_puts(&url, "data:");
+    buf_puts(&url, media_type && media_type[0] ? media_type : "application/octet-stream");
+    buf_puts(&url, ";base64,");
+    buf_puts(&url, data);
+    ref->url = buf_take(&url);
+    return true;
+}
+
+static bool runtime_media_ref_fill(runtime_media_ref *ref, bool video,
+                                   const char *url,
+                                   const char *media_type,
+                                   const char *base64_data) {
+    runtime_media_ref opts = {0};
+    runtime_media_ref_copy_options(&opts, ref);
+    memset(ref, 0, sizeof(*ref));
+    runtime_media_ref_copy_options(ref, &opts);
+    ref->video = video;
+    bool ok = url && url[0] ?
+        runtime_media_ref_set_url(ref, url, media_type) :
+        runtime_media_ref_set_base64(ref, base64_data, media_type);
+    if (!ok) runtime_media_ref_free(ref);
+    return ok;
+}
+
+static bool parse_media_url_value(const char **p, char **url_out,
+                                  char **media_type_out,
+                                  runtime_media_ref *opts) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p == '"') {
+        free(*url_out);
+        *url_out = NULL;
+        return json_string(p, url_out);
+    }
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "url")) {
+            free(*url_out);
+            *url_out = NULL;
+            json_ws(p);
+            if (json_lit(p, "null")) {
+                /* Keep a missing URL as a placeholder-only media block. */
+            } else if (!json_string(p, url_out)) {
+                free(key);
+                return false;
+            }
+        } else if (!strcmp(key, "media_type") || !strcmp(key, "mime_type")) {
+            free(*media_type_out);
+            *media_type_out = NULL;
+            json_ws(p);
+            if (json_lit(p, "null")) {
+                /* Optional hint. */
+            } else if (!json_string(p, media_type_out)) {
+                free(key);
+                return false;
+            }
+        } else {
+            bool handled = false;
+            if (!parse_media_ref_option_value(key, p, opts, &handled)) {
+                free(key);
+                return false;
+            }
+            if (!handled && !json_skip_value(p)) {
+                free(key);
+                return false;
+            }
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_media_source_value(const char **p, char **url_out,
+                                     char **media_type_out,
+                                     char **base64_out,
+                                     runtime_media_ref *opts) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p == '"') {
+        free(*url_out);
+        *url_out = NULL;
+        return json_string(p, url_out);
+    }
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "url")) {
+            free(*url_out);
+            *url_out = NULL;
+            if (!json_string(p, url_out)) {
+                free(key);
+                return false;
+            }
+        } else if (!strcmp(key, "media_type") || !strcmp(key, "mime_type")) {
+            free(*media_type_out);
+            *media_type_out = NULL;
+            if (!json_string(p, media_type_out)) {
+                free(key);
+                return false;
+            }
+        } else if (!strcmp(key, "data")) {
+            free(*base64_out);
+            *base64_out = NULL;
+            if (!json_string(p, base64_out)) {
+                free(key);
+                return false;
+            }
+        } else {
+            bool handled = false;
+            if (!parse_media_ref_option_value(key, p, opts, &handled)) {
+                free(key);
+                return false;
+            }
+            if (!handled && !json_skip_value(p)) {
+                free(key);
+                return false;
+            }
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool content_type_is_image(const char *type) {
+    return type &&
+           (!strcmp(type, "image") ||
+            !strcmp(type, "image_url") ||
+            !strcmp(type, "input_image"));
+}
+
+static bool content_type_is_video(const char *type) {
+    return type &&
+           (!strcmp(type, "video") ||
+            !strcmp(type, "video_url") ||
+            !strcmp(type, "input_video"));
+}
+
+static void append_runtime_media_placeholder(buf *b, bool video) {
+    buf_puts(b, "<|vision_start|>");
+    buf_puts(b, video ? "<|video_pad|>" : "<|image_pad|>");
+    buf_puts(b, "<|vision_end|>");
+}
+
+static bool json_content_ex(const char **p, char **out, bool media_placeholders,
+                            runtime_media_refs *media) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (json_lit(p, "null")) {
@@ -425,34 +1055,159 @@ static bool json_content(const char **p, char **out) {
         } else if (**p == '{') {
             (*p)++;
             json_ws(p);
+            char *type = NULL;
+            char *text = NULL;
+            char *media_url = NULL;
+            char *media_type = NULL;
+            char *media_data = NULL;
+            runtime_media_ref media_opts = {0};
             while (**p && **p != '}') {
                 char *key = NULL;
-                if (!json_string(p, &key)) goto fail;
+                if (!json_string(p, &key)) {
+                    free(type);
+                    free(text);
+                    free(media_url);
+                    free(media_type);
+                    free(media_data);
+                    goto fail;
+                }
                 json_ws(p);
                 if (**p != ':') {
                     free(key);
+                    free(type);
+                    free(text);
+                    free(media_url);
+                    free(media_type);
+                    free(media_data);
                     goto fail;
                 }
                 (*p)++;
-                if (!strcmp(key, "text")) {
-                    char *s = NULL;
-                    if (!json_string(p, &s)) {
+                if (!strcmp(key, "type")) {
+                    free(type);
+                    if (!json_string(p, &type)) {
                         free(key);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
                         goto fail;
                     }
-                    buf_puts(&b, s);
-                    free(s);
-                } else if (!json_skip_value(p)) {
-                    free(key);
-                    goto fail;
+                } else if (!strcmp(key, "text")) {
+                    free(text);
+                    if (!json_string(p, &text)) {
+                        free(key);
+                        free(type);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "image_url") ||
+                           !strcmp(key, "video_url") ||
+                           !strcmp(key, "url")) {
+                    if (!parse_media_url_value(p, &media_url, &media_type,
+                                               &media_opts)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "source")) {
+                    if (!parse_media_source_value(p, &media_url, &media_type,
+                                                  &media_data,
+                                                  &media_opts)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "media_type") || !strcmp(key, "mime_type")) {
+                    free(media_type);
+                    if (!json_string(p, &media_type)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_data);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "data")) {
+                    free(media_data);
+                    if (!json_string(p, &media_data)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        goto fail;
+                    }
+                } else {
+                    bool handled = false;
+                    if (!parse_media_ref_option_value(key, p, &media_opts,
+                                                      &handled)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
+                        goto fail;
+                    }
+                    if (!handled && !json_skip_value(p)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
+                        goto fail;
+                    }
                 }
                 free(key);
                 json_ws(p);
                 if (**p == ',') (*p)++;
                 json_ws(p);
             }
-            if (**p != '}') goto fail;
+            if (**p != '}') {
+                free(type);
+                free(text);
+                free(media_url);
+                free(media_type);
+                free(media_data);
+                goto fail;
+            }
             (*p)++;
+            if (media_placeholders &&
+                (content_type_is_image(type) || content_type_is_video(type))) {
+                bool video = content_type_is_video(type);
+                append_runtime_media_placeholder(&b, video);
+                if (media) {
+                    runtime_media_ref ref = media_opts;
+                    if (!runtime_media_ref_fill(&ref, video, media_url,
+                                                media_type, media_data)) {
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
+                        goto fail;
+                    }
+                    runtime_media_refs_push(media, ref);
+                }
+            } else if (text) {
+                buf_puts(&b, text);
+            }
+            free(type);
+            free(text);
+            free(media_url);
+            free(media_type);
+            free(media_data);
         } else if (!json_skip_value(p)) {
             goto fail;
         }
@@ -467,6 +1222,10 @@ static bool json_content(const char **p, char **out) {
 fail:
     buf_free(&b);
     return false;
+}
+
+static bool json_content(const char **p, char **out) {
+    return json_content_ex(p, out, false, NULL);
 }
 
 typedef enum {
@@ -577,6 +1336,20 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 static void id_list_free(stop_list *ids);
 static bool responses_live_has_call_id(server *s, const char *id);
 static bool anthropic_live_has_call_id(server *s, const char *id);
+static bool responses_object_store_lookup(server *s, const char *id,
+                                          char **visible_text_out,
+                                          stop_list *call_ids_out);
+static void responses_object_store_remember(server *s, const char *id,
+                                            const char *visible_text,
+                                            const tool_calls *calls);
+static void responses_object_store_set_dir(server *s, const char *dir);
+static void responses_object_store_free(server *s);
+static void conversation_store_set_dir(server *s, const char *dir);
+static bool conversation_store_touch(server *s, const char *id);
+static bool conversation_store_lookup_items(server *s, const char *id,
+                                            char **items_json_out);
+static void conversation_store_free(server *s);
+static bool conversation_items_empty(const char *items_json);
 
 typedef struct {
     req_kind kind;
@@ -586,6 +1359,7 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    runtime_media_refs media;
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -623,6 +1397,9 @@ typedef struct {
     bool responses_requires_live_reasoning;
     stop_list responses_live_call_ids;
     char *responses_live_suffix_text;
+    char *responses_previous_visible_text;
+    char *responses_conversation_id;
+    stop_list responses_previous_call_ids;
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
@@ -760,14 +1537,1426 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    runtime_media_refs_clear(&r->media);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
+    free(r->responses_previous_visible_text);
+    free(r->responses_conversation_id);
+    stop_list_clear(&r->responses_previous_call_ids);
+    free(r->responses_previous_call_ids.v);
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
+}
+
+static bool request_has_media(const request *r) {
+    return r && r->media.len > 0;
+}
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    unsigned char *rgb;
+} runtime_image_rgb;
+
+typedef struct {
+    runtime_image_rgb *v;
+    size_t len;
+} runtime_image_frames;
+
+typedef struct {
+    qwen36_runtime_embedding_span *spans;
+    qwen36_runtime_vision_embedding *embeddings;
+    size_t len;
+    rt_tokens prompt;
+    bool prompt_expanded;
+} qwen_runtime_media_spans;
+
+static void runtime_image_rgb_free(runtime_image_rgb *img) {
+    if (!img) return;
+    free(img->rgb);
+    memset(img, 0, sizeof(*img));
+}
+
+static void runtime_image_frames_free(runtime_image_frames *frames) {
+    if (!frames) return;
+    for (size_t i = 0; i < frames->len; i++) {
+        runtime_image_rgb_free(&frames->v[i]);
+    }
+    free(frames->v);
+    memset(frames, 0, sizeof(*frames));
+}
+
+static void qwen_runtime_media_spans_free(qwen_runtime_media_spans *m) {
+    if (!m) return;
+    for (size_t i = 0; i < m->len; i++) {
+        qwen36_runtime_vision_embedding_free(&m->embeddings[i]);
+    }
+    free(m->spans);
+    free(m->embeddings);
+    rt_tokens_free(&m->prompt);
+    memset(m, 0, sizeof(*m));
+}
+
+static void netpbm_skip_ws_comments(const unsigned char **p,
+                                    const unsigned char *end) {
+    for (;;) {
+        while (*p < end && isspace(**p)) (*p)++;
+        if (*p >= end || **p != '#') return;
+        while (*p < end && **p != '\n' && **p != '\r') (*p)++;
+    }
+}
+
+static bool netpbm_next_token(const unsigned char **p,
+                              const unsigned char *end,
+                              const char **tok,
+                              size_t *tok_len) {
+    netpbm_skip_ws_comments(p, end);
+    if (*p >= end) return false;
+    const unsigned char *start = *p;
+    while (*p < end && !isspace(**p) && **p != '#') (*p)++;
+    *tok = (const char *)start;
+    *tok_len = (size_t)(*p - start);
+    return *tok_len > 0;
+}
+
+static bool netpbm_token_u32(const char *tok, size_t tok_len, uint32_t *out) {
+    if (!tok || tok_len == 0 || tok_len > 10) return false;
+    uint64_t v = 0;
+    for (size_t i = 0; i < tok_len; i++) {
+        if (tok[i] < '0' || tok[i] > '9') return false;
+        v = v * 10u + (uint32_t)(tok[i] - '0');
+        if (v > UINT32_MAX) return false;
+    }
+    *out = (uint32_t)v;
+    return true;
+}
+
+static unsigned char netpbm_scale_sample(uint32_t v, uint32_t maxval) {
+    if (maxval == 0) return 0;
+    if (v > maxval) v = maxval;
+    return (unsigned char)((v * 255u + maxval / 2u) / maxval);
+}
+
+static bool runtime_image_decode_netpbm_one(const unsigned char *data,
+                                            size_t len,
+                                            runtime_image_rgb *out,
+                                            size_t *consumed,
+                                            char *err,
+                                            size_t errlen) {
+    memset(out, 0, sizeof(*out));
+    if (consumed) *consumed = 0;
+    if (!data || len < 2) {
+        snprintf(err, errlen, "empty image payload");
+        return false;
+    }
+    const unsigned char *p = data;
+    const unsigned char *end = data + len;
+    const char *tok = NULL;
+    size_t tok_len = 0;
+    if (!netpbm_next_token(&p, end, &tok, &tok_len) || tok_len != 2 || tok[0] != 'P' ||
+        (tok[1] != '2' && tok[1] != '3' && tok[1] != '5' && tok[1] != '6')) {
+        snprintf(err, errlen, "unsupported image format; Netpbm P2/P3/P5/P6 is supported in this build");
+        return false;
+    }
+    const char kind = tok[1];
+    uint32_t width = 0, height = 0, maxval = 0;
+    if (!netpbm_next_token(&p, end, &tok, &tok_len) ||
+        !netpbm_token_u32(tok, tok_len, &width) ||
+        !netpbm_next_token(&p, end, &tok, &tok_len) ||
+        !netpbm_token_u32(tok, tok_len, &height) ||
+        !netpbm_next_token(&p, end, &tok, &tok_len) ||
+        !netpbm_token_u32(tok, tok_len, &maxval) ||
+        width == 0 || height == 0 || maxval == 0 || maxval > 255) {
+        snprintf(err, errlen, "invalid Netpbm image header");
+        return false;
+    }
+    uint64_t pixels = (uint64_t)width * height;
+    if (pixels / width != height || pixels > SIZE_MAX / 3u) {
+        snprintf(err, errlen, "image dimensions are too large");
+        return false;
+    }
+    unsigned char *rgb = xmalloc((size_t)pixels * 3u);
+    if (kind == '5' || kind == '6') {
+        netpbm_skip_ws_comments(&p, end);
+        const uint32_t channels = kind == '6' ? 3u : 1u;
+        uint64_t need = pixels * channels;
+        if ((uint64_t)(end - p) < need) {
+            free(rgb);
+            snprintf(err, errlen, "truncated Netpbm pixel payload");
+            return false;
+        }
+        for (uint64_t i = 0; i < pixels; i++) {
+            if (channels == 3u) {
+                rgb[i * 3u + 0u] = netpbm_scale_sample(p[i * 3u + 0u], maxval);
+                rgb[i * 3u + 1u] = netpbm_scale_sample(p[i * 3u + 1u], maxval);
+                rgb[i * 3u + 2u] = netpbm_scale_sample(p[i * 3u + 2u], maxval);
+            } else {
+                unsigned char y = netpbm_scale_sample(p[i], maxval);
+                rgb[i * 3u + 0u] = y;
+                rgb[i * 3u + 1u] = y;
+                rgb[i * 3u + 2u] = y;
+            }
+        }
+        p += need;
+    } else {
+        const uint32_t channels = kind == '3' ? 3u : 1u;
+        for (uint64_t i = 0; i < pixels; i++) {
+            uint32_t sample[3] = {0, 0, 0};
+            for (uint32_t c = 0; c < channels; c++) {
+                if (!netpbm_next_token(&p, end, &tok, &tok_len) ||
+                    !netpbm_token_u32(tok, tok_len, &sample[c])) {
+                    free(rgb);
+                    snprintf(err, errlen, "truncated Netpbm pixel payload");
+                    return false;
+                }
+            }
+            if (channels == 1u) sample[1] = sample[2] = sample[0];
+            rgb[i * 3u + 0u] = netpbm_scale_sample(sample[0], maxval);
+            rgb[i * 3u + 1u] = netpbm_scale_sample(sample[1], maxval);
+            rgb[i * 3u + 2u] = netpbm_scale_sample(sample[2], maxval);
+        }
+    }
+    out->width = width;
+    out->height = height;
+    out->rgb = rgb;
+    if (consumed) *consumed = (size_t)(p - data);
+    return true;
+}
+
+static bool runtime_image_decode_netpbm(const unsigned char *data,
+                                        size_t len,
+                                        runtime_image_rgb *out,
+                                        char *err,
+                                        size_t errlen) {
+    return runtime_image_decode_netpbm_one(data, len, out, NULL,
+                                           err, errlen);
+}
+
+static uint32_t read_be32(const unsigned char *p) {
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+
+static unsigned char png_paeth(unsigned char a, unsigned char b, unsigned char c) {
+    int p = (int)a + (int)b - (int)c;
+    int pa = abs(p - (int)a);
+    int pb = abs(p - (int)b);
+    int pc = abs(p - (int)c);
+    if (pa <= pb && pa <= pc) return a;
+    if (pb <= pc) return b;
+    return c;
+}
+
+static bool runtime_image_decode_png(const unsigned char *data,
+                                     size_t len,
+                                     runtime_image_rgb *out,
+                                     char *err,
+                                     size_t errlen) {
+    static const unsigned char png_sig[8] =
+        {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    memset(out, 0, sizeof(*out));
+    if (!data || len < 8 || memcmp(data, png_sig, sizeof(png_sig)) != 0) {
+        snprintf(err, errlen, "unsupported image format; PNG signature not found");
+        return false;
+    }
+
+    uint32_t width = 0, height = 0;
+    int bit_depth = 0, color_type = -1, compression = -1, filter_method = -1, interlace = -1;
+    unsigned char *idat = NULL;
+    size_t idat_len = 0, idat_cap = 0;
+    bool saw_ihdr = false, saw_iend = false;
+    size_t pos = 8;
+    while (pos + 12 <= len) {
+        uint32_t chunk_len = read_be32(data + pos);
+        pos += 4;
+        const unsigned char *type = data + pos;
+        pos += 4;
+        if ((uint64_t)chunk_len > (uint64_t)len - pos - 4u) {
+            free(idat);
+            snprintf(err, errlen, "truncated PNG chunk");
+            return false;
+        }
+        const unsigned char *payload = data + pos;
+        pos += chunk_len;
+        pos += 4; /* CRC is not needed for local decode correctness. */
+
+        if (!memcmp(type, "IHDR", 4)) {
+            if (chunk_len != 13 || saw_ihdr) {
+                free(idat);
+                snprintf(err, errlen, "invalid PNG IHDR");
+                return false;
+            }
+            width = read_be32(payload);
+            height = read_be32(payload + 4);
+            bit_depth = payload[8];
+            color_type = payload[9];
+            compression = payload[10];
+            filter_method = payload[11];
+            interlace = payload[12];
+            saw_ihdr = true;
+        } else if (!memcmp(type, "IDAT", 4)) {
+            if (!saw_ihdr || chunk_len == 0) continue;
+            if (idat_len > SIZE_MAX - chunk_len) {
+                free(idat);
+                snprintf(err, errlen, "PNG IDAT payload is too large");
+                return false;
+            }
+            size_t need = idat_len + (size_t)chunk_len;
+            if (need > idat_cap) {
+                size_t new_cap = idat_cap ? idat_cap * 2u : 4096u;
+                while (new_cap < need) {
+                    if (new_cap > SIZE_MAX / 2u) {
+                        new_cap = need;
+                        break;
+                    }
+                    new_cap *= 2u;
+                }
+                idat = xrealloc(idat, new_cap);
+                idat_cap = new_cap;
+            }
+            memcpy(idat + idat_len, payload, (size_t)chunk_len);
+            idat_len += (size_t)chunk_len;
+        } else if (!memcmp(type, "IEND", 4)) {
+            saw_iend = true;
+            break;
+        }
+    }
+
+    if (!saw_ihdr || !saw_iend || !idat || idat_len == 0) {
+        free(idat);
+        snprintf(err, errlen, "invalid PNG image");
+        return false;
+    }
+    if (width == 0 || height == 0 || bit_depth != 8 ||
+        compression != 0 || filter_method != 0 || interlace != 0) {
+        free(idat);
+        snprintf(err, errlen,
+                 "unsupported PNG format; only 8-bit non-interlaced images are supported");
+        return false;
+    }
+
+    uint32_t channels = 0;
+    switch (color_type) {
+    case 0: channels = 1; break; /* grayscale */
+    case 2: channels = 3; break; /* RGB */
+    case 4: channels = 2; break; /* grayscale + alpha */
+    case 6: channels = 4; break; /* RGBA */
+    default:
+        free(idat);
+        snprintf(err, errlen,
+                 "unsupported PNG color type %d; grayscale/RGB/RGBA are supported",
+                 color_type);
+        return false;
+    }
+
+    uint64_t rowbytes64 = (uint64_t)width * channels;
+    uint64_t filtered64 = (rowbytes64 + 1u) * height;
+    uint64_t pixels64 = (uint64_t)width * height;
+    if (rowbytes64 > SIZE_MAX ||
+        filtered64 > SIZE_MAX ||
+        pixels64 > SIZE_MAX / 3u) {
+        free(idat);
+        snprintf(err, errlen, "PNG dimensions are too large");
+        return false;
+    }
+    size_t rowbytes = (size_t)rowbytes64;
+    size_t filtered_len = (size_t)filtered64;
+    unsigned char *filtered = xmalloc(filtered_len);
+    uLongf dest_len = (uLongf)filtered_len;
+    int zrc = uncompress(filtered, &dest_len, idat, (uLong)idat_len);
+    free(idat);
+    if (zrc != Z_OK || dest_len != (uLongf)filtered_len) {
+        free(filtered);
+        snprintf(err, errlen, "failed to inflate PNG IDAT");
+        return false;
+    }
+
+    unsigned char *rows = xmalloc(rowbytes * (size_t)height);
+    unsigned char *prev = calloc(rowbytes ? rowbytes : 1u, 1);
+    unsigned char *cur = xmalloc(rowbytes ? rowbytes : 1u);
+    if (!prev || !cur) die("out of memory");
+    size_t src = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        unsigned char f = filtered[src++];
+        if (f > 4) {
+            free(filtered); free(rows); free(prev); free(cur);
+            snprintf(err, errlen, "invalid PNG row filter");
+            return false;
+        }
+        for (size_t x = 0; x < rowbytes; x++) {
+            unsigned char raw = filtered[src++];
+            unsigned char left = x >= channels ? cur[x - channels] : 0;
+            unsigned char up = prev[x];
+            unsigned char up_left = x >= channels ? prev[x - channels] : 0;
+            switch (f) {
+            case 0: cur[x] = raw; break;
+            case 1: cur[x] = (unsigned char)(raw + left); break;
+            case 2: cur[x] = (unsigned char)(raw + up); break;
+            case 3: cur[x] = (unsigned char)(raw + ((unsigned int)left + up) / 2u); break;
+            case 4: cur[x] = (unsigned char)(raw + png_paeth(left, up, up_left)); break;
+            }
+        }
+        memcpy(rows + (size_t)y * rowbytes, cur, rowbytes);
+        memcpy(prev, cur, rowbytes);
+    }
+    free(filtered);
+    free(prev);
+    free(cur);
+
+    unsigned char *rgb = xmalloc((size_t)pixels64 * 3u);
+    for (uint64_t i = 0; i < pixels64; i++) {
+        const unsigned char *px = rows + i * channels;
+        if (color_type == 0 || color_type == 4) {
+            rgb[i * 3u + 0u] = px[0];
+            rgb[i * 3u + 1u] = px[0];
+            rgb[i * 3u + 2u] = px[0];
+        } else {
+            rgb[i * 3u + 0u] = px[0];
+            rgb[i * 3u + 1u] = px[1];
+            rgb[i * 3u + 2u] = px[2];
+        }
+    }
+    free(rows);
+    out->width = width;
+    out->height = height;
+    out->rgb = rgb;
+    return true;
+}
+
+static bool runtime_image_decode_imageio(const unsigned char *data,
+                                         size_t len,
+                                         runtime_image_rgb *out,
+                                         char *err,
+                                         size_t errlen) {
+    memset(out, 0, sizeof(*out));
+    if (!data || len == 0) {
+        snprintf(err, errlen, "empty image payload");
+        return false;
+    }
+#ifdef __APPLE__
+    if (len > (size_t)LONG_MAX) {
+        snprintf(err, errlen, "image payload is too large");
+        return false;
+    }
+    CFDataRef cfdata = CFDataCreate(kCFAllocatorDefault, data, (CFIndex)len);
+    if (!cfdata) {
+        snprintf(err, errlen, "failed to create image data provider");
+        return false;
+    }
+    CGImageSourceRef src = CGImageSourceCreateWithData(cfdata, NULL);
+    if (!src) {
+        CFRelease(cfdata);
+        snprintf(err, errlen, "failed to create ImageIO image source");
+        return false;
+    }
+    CGImageRef image = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    if (!image) {
+        CFRelease(src);
+        CFRelease(cfdata);
+        snprintf(err, errlen, "failed to decode image with ImageIO");
+        return false;
+    }
+
+    size_t width = CGImageGetWidth(image);
+    size_t height = CGImageGetHeight(image);
+    uint64_t pixels = (uint64_t)width * (uint64_t)height;
+    bool ok = width > 0 && height > 0 &&
+              width <= UINT32_MAX && height <= UINT32_MAX &&
+              pixels / width == height &&
+              pixels <= SIZE_MAX / 4u &&
+              pixels <= SIZE_MAX / 3u;
+    unsigned char *rgba = NULL;
+    unsigned char *rgb = NULL;
+    CGColorSpaceRef color_space = NULL;
+    CGContextRef ctx = NULL;
+    if (ok) {
+        rgba = xmalloc((size_t)pixels * 4u);
+        color_space = CGColorSpaceCreateDeviceRGB();
+        ok = color_space != NULL;
+    }
+    if (ok) {
+        CGBitmapInfo info = kCGBitmapByteOrder32Big |
+                            kCGImageAlphaPremultipliedLast;
+        ctx = CGBitmapContextCreate(rgba, width, height, 8,
+                                    width * 4u, color_space, info);
+        ok = ctx != NULL;
+    }
+    if (ok) {
+        CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)width,
+                                           (CGFloat)height), image);
+        rgb = xmalloc((size_t)pixels * 3u);
+        for (uint64_t i = 0; i < pixels; i++) {
+            rgb[i * 3u + 0u] = rgba[i * 4u + 0u];
+            rgb[i * 3u + 1u] = rgba[i * 4u + 1u];
+            rgb[i * 3u + 2u] = rgba[i * 4u + 2u];
+        }
+        out->width = (uint32_t)width;
+        out->height = (uint32_t)height;
+        out->rgb = rgb;
+        rgb = NULL;
+    } else if (width == 0 || height == 0) {
+        snprintf(err, errlen, "invalid image dimensions");
+    } else {
+        snprintf(err, errlen, "failed to render image into RGB pixels");
+    }
+    if (ctx) CGContextRelease(ctx);
+    if (color_space) CGColorSpaceRelease(color_space);
+    free(rgba);
+    free(rgb);
+    CGImageRelease(image);
+    CFRelease(src);
+    CFRelease(cfdata);
+    return ok;
+#else
+    snprintf(err, errlen, "ImageIO image decode is available on macOS builds only");
+    return false;
+#endif
+}
+
+static bool runtime_video_decode_first_frame(const unsigned char *data,
+                                             size_t len,
+                                             runtime_image_rgb *out,
+                                             char *err,
+                                             size_t errlen) {
+    memset(out, 0, sizeof(*out));
+    if (!data || len == 0) {
+        snprintf(err, errlen, "empty video payload");
+        return false;
+    }
+#ifdef __APPLE__
+    unsigned char *rgb = NULL;
+    uint32_t width = 0, height = 0;
+    if (!ds4_av_decode_video_first_frame_rgb(data, len, &rgb, &width, &height,
+                                             err, errlen)) {
+        return false;
+    }
+    out->width = width;
+    out->height = height;
+    out->rgb = rgb;
+    return true;
+#else
+    snprintf(err, errlen,
+             "video container frame extraction is available on macOS builds only");
+    return false;
+#endif
+}
+
+static uint32_t runtime_media_ref_video_max_frames(const runtime_media_ref *ref);
+
+static uint32_t runtime_video_round_by_factor_u32(uint32_t n,
+                                                  uint32_t factor) {
+    if (factor == 0) return n;
+    return ((n + factor / 2u) / factor) * factor;
+}
+
+static uint32_t runtime_video_ceil_by_factor_u32(uint32_t n,
+                                                 uint32_t factor) {
+    if (factor == 0) return n;
+    return ((n + factor - 1u) / factor) * factor;
+}
+
+static uint32_t runtime_video_floor_by_factor_u32(uint32_t n,
+                                                  uint32_t factor) {
+    if (factor == 0) return n;
+    return (n / factor) * factor;
+}
+
+static uint32_t runtime_qwen_video_frame_count(uint32_t range_frames,
+                                               uint32_t nframes,
+                                               uint32_t min_frames,
+                                               uint32_t max_frames,
+                                               bool has_fps,
+                                               double fps,
+                                               double source_fps) {
+    const uint32_t frame_factor = 2u;
+    if (range_frames == 0) return 0;
+    if (range_frames == 1) return 1;
+
+    uint32_t min_aligned = 0;
+    if (min_frames > 0) {
+        min_aligned = runtime_video_ceil_by_factor_u32(min_frames,
+                                                       frame_factor);
+    } else if (has_fps) {
+        min_aligned = 4;
+    }
+
+    uint32_t max_aligned = 0;
+    if (max_frames > 0) {
+        max_aligned = runtime_video_floor_by_factor_u32(max_frames,
+                                                        frame_factor);
+        if (max_aligned < frame_factor) max_aligned = frame_factor;
+    }
+
+    uint32_t target = 0;
+    if (nframes > 0) {
+        target = runtime_video_round_by_factor_u32(nframes, frame_factor);
+    } else if (has_fps && fps > 0.0 && source_fps > 0.0) {
+        double sampled = ((double)range_frames / source_fps) * fps;
+        if (!isfinite(sampled) || sampled < 1.0) sampled = 1.0;
+        if (sampled > (double)UINT32_MAX) sampled = (double)UINT32_MAX;
+        target = (uint32_t)floor(sampled);
+    } else {
+        target = range_frames;
+    }
+
+    if (min_aligned > 0 && target < min_aligned) target = min_aligned;
+    if (max_aligned > 0 && target > max_aligned) target = max_aligned;
+    if (target > range_frames) {
+        target = runtime_video_floor_by_factor_u32(range_frames,
+                                                   frame_factor);
+    }
+    if (target > DS4_QWEN_MAX_VIDEO_FRAMES) {
+        target = DS4_QWEN_MAX_VIDEO_FRAMES;
+    }
+    target = runtime_video_floor_by_factor_u32(target, frame_factor);
+    if (target < frame_factor) target = frame_factor;
+    if (target > range_frames) {
+        target = runtime_video_floor_by_factor_u32(range_frames,
+                                                   frame_factor);
+    }
+    if (target < frame_factor) target = frame_factor;
+    return target;
+}
+
+static bool runtime_image_rgb_clone(const runtime_image_rgb *src,
+                                    runtime_image_rgb *dst,
+                                    char *err,
+                                    size_t errlen) {
+    memset(dst, 0, sizeof(*dst));
+    if (!src || !src->rgb || src->width == 0 || src->height == 0) {
+        snprintf(err, errlen, "invalid decoded video frame");
+        return false;
+    }
+    uint64_t pixels = (uint64_t)src->width * src->height;
+    if (pixels / src->width != src->height ||
+        pixels > SIZE_MAX / 3u) {
+        snprintf(err, errlen, "decoded video frame is too large");
+        return false;
+    }
+    unsigned char *rgb = xmalloc((size_t)pixels * 3u);
+    memcpy(rgb, src->rgb, (size_t)pixels * 3u);
+    dst->width = src->width;
+    dst->height = src->height;
+    dst->rgb = rgb;
+    return true;
+}
+
+static void runtime_image_frames_push_move(runtime_image_frames *frames,
+                                           runtime_image_rgb *img) {
+    frames->v = xrealloc(frames->v,
+                         (frames->len + 1u) * sizeof(frames->v[0]));
+    frames->v[frames->len++] = *img;
+    memset(img, 0, sizeof(*img));
+}
+
+static bool runtime_video_sample_decoded_frames(const runtime_image_frames *all,
+                                                const runtime_media_ref *ref,
+                                                runtime_image_frames *out,
+                                                char *err,
+                                                size_t errlen) {
+    memset(out, 0, sizeof(*out));
+    if (!all || !all->v || all->len == 0 || all->len > UINT32_MAX) {
+        snprintf(err, errlen, "Qwen video media has no decoded frames");
+        return false;
+    }
+
+    const uint32_t total_frames = (uint32_t)all->len;
+    double source_fps = 30.0;
+    uint32_t start_frame = 0;
+    uint32_t end_frame = total_frames - 1u;
+    double duration_seconds = (double)total_frames / source_fps;
+    if (ref && ref->has_video_start) {
+        double s = ref->video_start;
+        if (!isfinite(s) || s < 0.0) s = 0.0;
+        if (s > duration_seconds) s = duration_seconds;
+        double idx = ceil(s * source_fps);
+        if (!isfinite(idx) || idx < 0.0) idx = 0.0;
+        if (idx > (double)(total_frames - 1u)) {
+            idx = (double)(total_frames - 1u);
+        }
+        start_frame = (uint32_t)idx;
+    }
+    if (ref && ref->has_video_end) {
+        double e = ref->video_end;
+        if (!isfinite(e) || e < 0.0) e = 0.0;
+        if (e > duration_seconds) e = duration_seconds;
+        double idx = floor(e * source_fps);
+        if (!isfinite(idx) || idx < 0.0) idx = 0.0;
+        if (idx > (double)(total_frames - 1u)) {
+            idx = (double)(total_frames - 1u);
+        }
+        end_frame = (uint32_t)idx;
+    }
+    if (start_frame > end_frame) {
+        snprintf(err, errlen, "invalid video_start/video_end frame range");
+        return false;
+    }
+    uint32_t range_frames = end_frame - start_frame + 1u;
+    uint32_t target_count = runtime_qwen_video_frame_count(
+        range_frames,
+        ref ? ref->nframes : 0,
+        ref ? ref->min_frames : 0,
+        runtime_media_ref_video_max_frames(ref),
+        ref ? ref->has_fps : false,
+        ref ? ref->fps : 0.0,
+        source_fps);
+    if (target_count == 0) target_count = 1;
+
+    out->v = xmalloc((size_t)target_count * sizeof(out->v[0]));
+    memset(out->v, 0, (size_t)target_count * sizeof(out->v[0]));
+    out->len = target_count;
+    for (uint32_t i = 0; i < target_count; i++) {
+        uint32_t idx = start_frame;
+        if (target_count > 1) {
+            double pos = (double)start_frame +
+                         (double)i * (double)(end_frame - start_frame) /
+                         (double)(target_count - 1u);
+            double rounded = round(pos);
+            if (!isfinite(rounded) || rounded < (double)start_frame) {
+                rounded = (double)start_frame;
+            }
+            if (rounded > (double)end_frame) {
+                rounded = (double)end_frame;
+            }
+            idx = (uint32_t)rounded;
+        }
+        if (!runtime_image_rgb_clone(&all->v[idx], &out->v[i],
+                                     err, errlen)) {
+            runtime_image_frames_free(out);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool runtime_video_decode_netpbm_frames(const unsigned char *data,
+                                               size_t len,
+                                               const runtime_media_ref *ref,
+                                               runtime_image_frames *out,
+                                               char *err,
+                                               size_t errlen) {
+    memset(out, 0, sizeof(*out));
+    if (!data || len == 0) {
+        snprintf(err, errlen, "empty video payload");
+        return false;
+    }
+    runtime_image_frames all = {0};
+    const unsigned char *p = data;
+    const unsigned char *end = data + len;
+    while (p < end) {
+        netpbm_skip_ws_comments(&p, end);
+        if (p >= end) break;
+        runtime_image_rgb img = {0};
+        size_t consumed = 0;
+        if (!runtime_image_decode_netpbm_one(p, (size_t)(end - p),
+                                             &img, &consumed,
+                                             err, errlen)) {
+            runtime_image_frames_free(&all);
+            return false;
+        }
+        if (consumed == 0 || consumed > (size_t)(end - p)) {
+            runtime_image_rgb_free(&img);
+            runtime_image_frames_free(&all);
+            snprintf(err, errlen, "invalid Netpbm video frame length");
+            return false;
+        }
+        runtime_image_frames_push_move(&all, &img);
+        p += consumed;
+    }
+    if (all.len == 0) {
+        snprintf(err, errlen, "video payload has no Netpbm frames");
+        return false;
+    }
+    bool ok = runtime_video_sample_decoded_frames(&all, ref, out,
+                                                  err, errlen);
+    runtime_image_frames_free(&all);
+    return ok;
+}
+
+static bool runtime_video_decode_frames(const unsigned char *data,
+                                        size_t len,
+                                        const runtime_media_ref *ref,
+                                        runtime_image_frames *out,
+                                        char *err,
+                                        size_t errlen) {
+    memset(out, 0, sizeof(*out));
+    if (!data || len == 0) {
+        snprintf(err, errlen, "empty video payload");
+        return false;
+    }
+#ifdef __APPLE__
+    unsigned char **rgbs = NULL;
+    uint32_t *widths = NULL;
+    uint32_t *heights = NULL;
+    uint32_t count = 0;
+    if (ref && ref->nframes && ref->has_fps) {
+        snprintf(err, errlen,
+                 "Qwen video media accepts either nframes or fps, not both");
+        return false;
+    }
+    if (!ds4_av_decode_video_frames_rgb(data, len,
+                                        ref ? ref->nframes : 0,
+                                        ref ? ref->min_frames : 0,
+                                        runtime_media_ref_video_max_frames(ref),
+                                        ref ? ref->has_fps : false,
+                                        ref ? ref->fps : 0.0,
+                                        ref ? ref->has_video_start : false,
+                                        ref ? ref->video_start : 0.0,
+                                        ref ? ref->has_video_end : false,
+                                        ref ? ref->video_end : 0.0,
+                                        &rgbs, &widths, &heights, &count,
+                                        err, errlen)) {
+        return false;
+    }
+    if (count == 0 || !rgbs || !widths || !heights) {
+        for (uint32_t i = 0; rgbs && i < count; i++) free(rgbs[i]);
+        free(rgbs);
+        free(widths);
+        free(heights);
+        snprintf(err, errlen, "video frame decode produced no frames");
+        return false;
+    }
+    out->v = xmalloc((size_t)count * sizeof(out->v[0]));
+    memset(out->v, 0, (size_t)count * sizeof(out->v[0]));
+    out->len = count;
+    for (uint32_t i = 0; i < count; i++) {
+        out->v[i].width = widths[i];
+        out->v[i].height = heights[i];
+        out->v[i].rgb = rgbs[i];
+        rgbs[i] = NULL;
+    }
+    free(rgbs);
+    free(widths);
+    free(heights);
+    return true;
+#else
+    snprintf(err, errlen,
+             "video container frame extraction is available on macOS builds only");
+    return false;
+#endif
+}
+
+static uint32_t runtime_media_ref_video_max_frames(const runtime_media_ref *ref) {
+    uint32_t n = 4;
+    if (ref && ref->nframes) {
+        n = ref->nframes;
+    } else if (ref && ref->max_frames) {
+        n = ref->max_frames;
+    }
+    if (ref && ref->min_frames && n < ref->min_frames) n = ref->min_frames;
+    if (n == 0) n = 1;
+    if (n > DS4_QWEN_MAX_VIDEO_FRAMES) n = DS4_QWEN_MAX_VIDEO_FRAMES;
+    return n;
+}
+
+static bool runtime_media_ref_url_bytes(const runtime_media_ref *ref,
+                                        unsigned char **owned,
+                                        size_t *len,
+                                        char *err,
+                                        size_t errlen) {
+    *owned = NULL;
+    *len = 0;
+    if (!ref || !ref->url) {
+        snprintf(err, errlen, "media is missing bytes");
+        return false;
+    }
+    const char *path = NULL;
+    if (!strncmp(ref->url, "file://", 7)) {
+        path = ref->url + 7;
+        if (!strncmp(path, "localhost/", 10)) path += 9;
+    } else if (!strncasecmp(ref->url, "http://", 7) ||
+               !strncasecmp(ref->url, "https://", 8)) {
+#ifdef __APPLE__
+        return ds4_av_fetch_url_bytes(ref->url, owned, len, err, errlen);
+#else
+        snprintf(err, errlen,
+                 "remote media URL decoding is available on macOS builds only");
+        return false;
+#endif
+    } else {
+        snprintf(err, errlen, "unsupported media URL scheme");
+        return false;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        snprintf(err, errlen, "failed to open media file '%s': %s",
+                 path, strerror(errno));
+        return false;
+    }
+    bool ok = false;
+    if (fseek(fp, 0, SEEK_END) != 0) goto done;
+    long n = ftell(fp);
+    if (n < 0) goto done;
+    rewind(fp);
+    unsigned char *buf = xmalloc((size_t)n + 1u);
+    if (fread(buf, 1, (size_t)n, fp) != (size_t)n) {
+        free(buf);
+        goto done;
+    }
+    *owned = buf;
+    *len = (size_t)n;
+    ok = true;
+done:
+    fclose(fp);
+    if (!ok) snprintf(err, errlen, "failed to read media file '%s'", path);
+    return ok;
+}
+
+static bool runtime_media_ref_decode_image(const runtime_media_ref *ref,
+                                           runtime_image_rgb *out,
+                                           char *err,
+                                           size_t errlen) {
+    if (!ref) {
+        snprintf(err, errlen, "Qwen media is missing");
+        return false;
+    }
+    const unsigned char *data = ref->bytes;
+    size_t len = ref->bytes_len;
+    unsigned char *owned = NULL;
+    if (!data || len == 0) {
+        if (!runtime_media_ref_url_bytes(ref, &owned, &len, err, errlen)) return false;
+        data = owned;
+    }
+    bool ok = runtime_image_decode_netpbm(data, len, out, err, errlen);
+    if (!ok && !ref->video) {
+        char imageio_err[160] = {0};
+        char png_err[160] = {0};
+        char netpbm_err[160] = {0};
+        snprintf(netpbm_err, sizeof(netpbm_err), "%s",
+                 err && err[0] ? err : "unsupported image format");
+        ok = runtime_image_decode_imageio(data, len, out,
+                                          imageio_err, sizeof(imageio_err));
+        if (!ok) {
+            ok = runtime_image_decode_png(data, len, out,
+                                          png_err, sizeof(png_err));
+            if (ok) {
+                free(owned);
+                return true;
+            }
+            snprintf(err, errlen,
+                     "%s; ImageIO decode failed: %s; PNG decode failed: %s",
+                     netpbm_err,
+                     imageio_err[0] ? imageio_err : "unknown error",
+                     png_err[0] ? png_err : "unknown error");
+        }
+    }
+    if (!ok && ref->video) {
+        char netpbm_err[160] = {0};
+        char video_err[160] = {0};
+        snprintf(netpbm_err, sizeof(netpbm_err), "%s",
+                 err && err[0] ? err : "unsupported video frame format");
+        ok = runtime_video_decode_first_frame(data, len, out,
+                                              video_err, sizeof(video_err));
+        if (!ok) {
+            snprintf(err, errlen,
+                     "%s; video first-frame decode failed: %s",
+                     netpbm_err,
+                     video_err[0] ? video_err : "unknown error");
+        }
+    }
+    free(owned);
+    return ok;
+}
+
+static bool runtime_media_ref_decode_frames(const runtime_media_ref *ref,
+                                            runtime_image_frames *out,
+                                            char *err,
+                                            size_t errlen) {
+    memset(out, 0, sizeof(*out));
+    if (!ref) {
+        snprintf(err, errlen, "Qwen media is missing");
+        return false;
+    }
+    if (!ref->video) {
+        out->v = xmalloc(sizeof(out->v[0]));
+        memset(out->v, 0, sizeof(out->v[0]));
+        out->len = 1;
+        if (!runtime_media_ref_decode_image(ref, &out->v[0], err, errlen)) {
+            runtime_image_frames_free(out);
+            return false;
+        }
+        return true;
+    }
+
+    const unsigned char *data = ref->bytes;
+    size_t len = ref->bytes_len;
+    unsigned char *owned = NULL;
+    if (ref->nframes && ref->has_fps) {
+        snprintf(err, errlen,
+                 "Qwen video media accepts either nframes or fps, not both");
+        return false;
+    }
+    if (!data || len == 0) {
+        if (!runtime_media_ref_url_bytes(ref, &owned, &len, err, errlen)) {
+            return false;
+        }
+        data = owned;
+    }
+
+    char netpbm_err[160] = {0};
+    char video_err[160] = {0};
+    bool ok = runtime_video_decode_netpbm_frames(data, len, ref, out,
+                                                 netpbm_err,
+                                                 sizeof(netpbm_err));
+    if (!ok) {
+        ok = runtime_video_decode_frames(data, len, ref, out,
+                                         video_err, sizeof(video_err));
+        if (!ok) {
+            snprintf(err, errlen,
+                     "%s; video frame sampling failed: %s",
+                     netpbm_err,
+                     video_err[0] ? video_err : "unknown error");
+        }
+    }
+    free(owned);
+    return ok;
+}
+
+static uint32_t qwen_round_by_factor_u32(uint32_t n, uint32_t factor) {
+    if (factor == 0) return 0;
+    double q = floor((double)n / (double)factor + 0.5);
+    if (q < 1.0) q = 1.0;
+    if (q > (double)(UINT32_MAX / factor)) q = (double)(UINT32_MAX / factor);
+    return (uint32_t)q * factor;
+}
+
+static uint32_t qwen_floor_by_factor_double(double n, uint32_t factor) {
+    if (factor == 0 || !isfinite(n)) return 0;
+    double q = floor(n / (double)factor);
+    if (q < 1.0) q = 1.0;
+    if (q > (double)(UINT32_MAX / factor)) q = (double)(UINT32_MAX / factor);
+    return (uint32_t)q * factor;
+}
+
+static uint32_t qwen_ceil_by_factor_double(double n, uint32_t factor) {
+    if (factor == 0 || !isfinite(n)) return 0;
+    double q = ceil(n / (double)factor);
+    if (q < 1.0) q = 1.0;
+    if (q > (double)(UINT32_MAX / factor)) q = (double)(UINT32_MAX / factor);
+    return (uint32_t)q * factor;
+}
+
+static bool qwen_smart_resize(uint32_t height,
+                              uint32_t width,
+                              uint32_t factor,
+                              uint64_t min_pixels,
+                              uint64_t max_pixels,
+                              uint32_t *out_h,
+                              uint32_t *out_w,
+                              char *err,
+                              size_t errlen) {
+    *out_h = 0;
+    *out_w = 0;
+    if (height == 0 || width == 0 || factor == 0) {
+        snprintf(err, errlen, "invalid image dimensions");
+        return false;
+    }
+    uint64_t factor_pixels = (uint64_t)factor * factor;
+    if (factor_pixels == 0 || factor_pixels / factor != factor) {
+        snprintf(err, errlen, "Qwen image patch geometry overflow");
+        return false;
+    }
+    if (min_pixels < factor_pixels) min_pixels = factor_pixels;
+    if (max_pixels < min_pixels) {
+        snprintf(err, errlen, "invalid Qwen image pixel budget");
+        return false;
+    }
+    double ratio = width > height ?
+        (double)width / (double)height :
+        (double)height / (double)width;
+    if (ratio > 200.0) {
+        snprintf(err, errlen, "Qwen image aspect ratio exceeds 200:1");
+        return false;
+    }
+
+    uint32_t h_bar = qwen_round_by_factor_u32(height, factor);
+    uint32_t w_bar = qwen_round_by_factor_u32(width, factor);
+    long double area = (long double)h_bar * (long double)w_bar;
+    if (area > (long double)max_pixels) {
+        double beta = sqrt(((double)height * (double)width) /
+                           (double)max_pixels);
+        h_bar = qwen_floor_by_factor_double((double)height / beta, factor);
+        w_bar = qwen_floor_by_factor_double((double)width / beta, factor);
+    } else if (area < (long double)min_pixels) {
+        double beta = sqrt((double)min_pixels /
+                           ((double)height * (double)width));
+        h_bar = qwen_ceil_by_factor_double((double)height * beta, factor);
+        w_bar = qwen_ceil_by_factor_double((double)width * beta, factor);
+    }
+    if (h_bar == 0 || w_bar == 0) {
+        snprintf(err, errlen, "invalid Qwen resized image dimensions");
+        return false;
+    }
+    *out_h = h_bar;
+    *out_w = w_bar;
+    return true;
+}
+
+static double qwen_bicubic_weight(double x) {
+    const double a = -0.5;
+    x = fabs(x);
+    if (x <= 1.0) {
+        return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+    }
+    if (x < 2.0) {
+        return (((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a);
+    }
+    return 0.0;
+}
+
+static unsigned char runtime_image_rgb_at(const runtime_image_rgb *img,
+                                          int x,
+                                          int y,
+                                          uint32_t channel) {
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if ((uint32_t)x >= img->width) x = (int)img->width - 1;
+    if ((uint32_t)y >= img->height) y = (int)img->height - 1;
+    return img->rgb[((uint64_t)(uint32_t)y * img->width + (uint32_t)x) * 3u +
+                    channel];
+}
+
+static float runtime_image_sample_qwen_pixel(const runtime_image_rgb *img,
+                                             uint32_t target_h,
+                                             uint32_t target_w,
+                                             uint32_t ty,
+                                             uint32_t tx,
+                                             uint32_t channel) {
+    static const float mean[3] = {0.48145466f, 0.45782750f, 0.40821073f};
+    static const float std[3] = {0.26862954f, 0.26130258f, 0.27577711f};
+    double sy = ((double)ty + 0.5) * (double)img->height / (double)target_h - 0.5;
+    double sx = ((double)tx + 0.5) * (double)img->width / (double)target_w - 0.5;
+    int iy = (int)floor(sy);
+    int ix = (int)floor(sx);
+    double sum = 0.0;
+    double weight_sum = 0.0;
+    for (int dy = -1; dy <= 2; dy++) {
+        double wy = qwen_bicubic_weight(sy - (double)(iy + dy));
+        for (int dx = -1; dx <= 2; dx++) {
+            double wx = qwen_bicubic_weight(sx - (double)(ix + dx));
+            double w = wy * wx;
+            sum += w * (double)runtime_image_rgb_at(img, ix + dx, iy + dy,
+                                                    channel);
+            weight_sum += w;
+        }
+    }
+    if (weight_sum != 0.0) sum /= weight_sum;
+    if (sum < 0.0) sum = 0.0;
+    if (sum > 255.0) sum = 255.0;
+    float scaled = (float)(sum / 255.0);
+    return (scaled - mean[channel]) / std[channel];
+}
+
+static bool runtime_image_to_qwen_patches(const runtime_image_rgb *img,
+                                          const qwen36_runtime_vision_config *cfg,
+                                          const runtime_media_ref *ref,
+                                          float **out,
+                                          uint32_t *grid_h,
+                                          uint32_t *grid_w,
+                                          char *err,
+                                          size_t errlen) {
+    *out = NULL;
+    *grid_h = 0;
+    *grid_w = 0;
+    if (!img || !img->rgb || !cfg || cfg->patch_size == 0 ||
+        cfg->spatial_merge_size == 0) {
+        snprintf(err, errlen, "invalid Qwen image patch request");
+        return false;
+    }
+    const uint32_t patch = cfg->patch_size;
+    const uint32_t merge = cfg->spatial_merge_size;
+    if (patch > UINT32_MAX / merge) {
+        snprintf(err, errlen, "Qwen image patch geometry overflow");
+        return false;
+    }
+    const uint32_t unit = patch * merge;
+    uint64_t cfg_min_pixels = cfg->min_pixels;
+    uint64_t cfg_max_pixels = cfg->max_pixels;
+    uint64_t unit_pixels = (uint64_t)unit * unit;
+    if (unit_pixels == 0 || unit_pixels / unit != unit) {
+        snprintf(err, errlen, "Qwen image patch geometry overflow");
+        return false;
+    }
+    if (cfg_min_pixels == 0) {
+        if (unit_pixels > UINT64_MAX / 4u) {
+            snprintf(err, errlen, "Qwen image pixel budget overflow");
+            return false;
+        }
+        cfg_min_pixels = 4u * unit_pixels;
+    }
+    if (cfg_max_pixels == 0) {
+        uint64_t max_dim = cfg->image_size ? cfg->image_size : unit;
+        if (max_dim < unit) max_dim = unit;
+        cfg_max_pixels = max_dim * max_dim;
+        if (cfg_max_pixels / max_dim != max_dim) {
+            snprintf(err, errlen, "Qwen image pixel budget overflow");
+            return false;
+        }
+    }
+    uint64_t min_pixels = ref && ref->min_pixels ? ref->min_pixels : cfg_min_pixels;
+    uint64_t max_pixels = ref && ref->max_pixels ? ref->max_pixels : cfg_max_pixels;
+
+    uint32_t target_h = 0;
+    uint32_t target_w = 0;
+    if (ref && ref->resized_height && ref->resized_width) {
+        if (!qwen_smart_resize(ref->resized_height, ref->resized_width, unit,
+                               cfg_min_pixels, cfg_max_pixels,
+                               &target_h, &target_w, err, errlen)) {
+            return false;
+        }
+    } else if (!qwen_smart_resize(img->height, img->width, unit,
+                                  min_pixels, max_pixels,
+                                  &target_h, &target_w, err, errlen)) {
+        return false;
+    }
+
+    const uint32_t gh = target_h / patch;
+    const uint32_t gw = target_w / patch;
+    uint64_t patch_elems = (uint64_t)patch * patch * 3u;
+    uint64_t n_values = (uint64_t)gh * gw * patch_elems;
+    if (target_h / patch != gh || target_w / patch != gw ||
+        n_values > SIZE_MAX / sizeof(float)) {
+        snprintf(err, errlen, "Qwen image patch allocation overflow");
+        return false;
+    }
+    float *patches = calloc((size_t)n_values, sizeof(patches[0]));
+    if (!patches) {
+        snprintf(err, errlen, "failed to allocate Qwen image patches");
+        return false;
+    }
+    for (uint32_t gy = 0; gy < gh; gy++) {
+        for (uint32_t gx = 0; gx < gw; gx++) {
+            float *dst = patches + ((uint64_t)gy * gw + gx) * patch_elems;
+            uint64_t di = 0;
+            for (uint32_t py = 0; py < patch; py++) {
+                uint32_t ty = gy * patch + py;
+                for (uint32_t px = 0; px < patch; px++) {
+                    uint32_t tx = gx * patch + px;
+                    dst[di++] = runtime_image_sample_qwen_pixel(
+                        img, target_h, target_w, ty, tx, 0);
+                    dst[di++] = runtime_image_sample_qwen_pixel(
+                        img, target_h, target_w, ty, tx, 1);
+                    dst[di++] = runtime_image_sample_qwen_pixel(
+                        img, target_h, target_w, ty, tx, 2);
+                }
+            }
+        }
+    }
+    *out = patches;
+    *grid_h = gh;
+    *grid_w = gw;
+    return true;
+}
+
+static bool runtime_images_to_qwen_patches(const runtime_image_frames *frames,
+                                           const qwen36_runtime_vision_config *cfg,
+                                           const runtime_media_ref *ref,
+                                           float **out,
+                                           uint32_t *grid_h,
+                                           uint32_t *grid_w,
+                                           char *err,
+                                           size_t errlen) {
+    *out = NULL;
+    *grid_h = 0;
+    *grid_w = 0;
+    if (!frames || !frames->v || frames->len == 0 || !cfg ||
+        cfg->patch_size == 0) {
+        snprintf(err, errlen, "Qwen media has no decoded frames");
+        return false;
+    }
+    float *all = NULL;
+    uint32_t total_h = 0;
+    uint32_t out_w = 0;
+    uint64_t values = 0;
+    uint64_t patch_elems = (uint64_t)cfg->patch_size * cfg->patch_size * 3u;
+    for (size_t i = 0; i < frames->len; i++) {
+        float *frame_patches = NULL;
+        uint32_t fh = 0;
+        uint32_t fw = 0;
+        if (!runtime_image_to_qwen_patches(&frames->v[i], cfg, ref,
+                                           &frame_patches, &fh, &fw,
+                                           err, errlen)) {
+            free(all);
+            return false;
+        }
+        if (i == 0) {
+            out_w = fw;
+        } else if (fw != out_w) {
+            free(frame_patches);
+            free(all);
+            snprintf(err, errlen,
+                     "Qwen video frames produced inconsistent patch widths");
+            return false;
+        }
+        if (fh > UINT32_MAX - total_h ||
+            fw == 0 ||
+            patch_elems == 0 ||
+            (uint64_t)fh > UINT64_MAX / fw ||
+            (uint64_t)fh * fw > UINT64_MAX / patch_elems) {
+            free(frame_patches);
+            free(all);
+            snprintf(err, errlen, "Qwen media patch grid overflow");
+            return false;
+        }
+        uint64_t frame_values = (uint64_t)fh * fw * patch_elems;
+        if (frame_values > SIZE_MAX / sizeof(float) ||
+            values > UINT64_MAX - frame_values ||
+            values + frame_values > SIZE_MAX / sizeof(float)) {
+            free(frame_patches);
+            free(all);
+            snprintf(err, errlen, "Qwen media patch allocation overflow");
+            return false;
+        }
+        float *next = xrealloc(all, (size_t)(values + frame_values) * sizeof(all[0]));
+        all = next;
+        memcpy(all + values, frame_patches,
+               (size_t)frame_values * sizeof(all[0]));
+        values += frame_values;
+        total_h += fh;
+        free(frame_patches);
+    }
+    *out = all;
+    *grid_h = total_h;
+    *grid_w = out_w;
+    return true;
+}
+
+static int qwen_runtime_next_placeholder(const rt_tokens *prompt,
+                                         int start,
+                                         int token_id) {
+    if (!prompt || token_id < 0) return -1;
+    if (start < 0) start = 0;
+    for (int i = start; i < prompt->len; i++) {
+        if (prompt->v[i] == token_id) return i;
+    }
+    return -1;
+}
+
+static bool qwen_runtime_build_media_embeddings(rt_engine *engine,
+                                                const request *req,
+                                                const rt_tokens *prompt,
+                                                qwen_runtime_media_spans *out,
+                                                char *err,
+                                                size_t errlen) {
+    memset(out, 0, sizeof(*out));
+    if (!request_has_media(req)) return true;
+    if (!prompt || prompt->len < 0) {
+        snprintf(err, errlen, "invalid Qwen media prompt");
+        return false;
+    }
+    qwen36_runtime_vision_config cfg = {0};
+    if (!qwen36_runtime_vision_config_get(engine, &cfg)) {
+        snprintf(err, errlen, "media prompts require the Qwen runtime");
+        return false;
+    }
+    if (!cfg.loaded) {
+        snprintf(err, errlen, "Qwen media requires a compatible --mmproj");
+        return false;
+    }
+    out->spans = xmalloc((size_t)req->media.len * sizeof(out->spans[0]));
+    out->embeddings = xmalloc((size_t)req->media.len * sizeof(out->embeddings[0]));
+    memset(out->spans, 0, (size_t)req->media.len * sizeof(out->spans[0]));
+    memset(out->embeddings, 0, (size_t)req->media.len * sizeof(out->embeddings[0]));
+
+    int search_from = 0;
+    int copy_from = 0;
+    rt_tokens expanded = {0};
+    for (int i = 0; i < req->media.len; i++) {
+        const runtime_media_ref *ref = &req->media.v[i];
+        const int pad_token = ref->video ? cfg.video_pad_token : cfg.image_pad_token;
+        const char *kind = ref->video ? "video" : "image";
+        if (pad_token < 0) {
+            snprintf(err, errlen, "Qwen %s media requires a compatible --mmproj", kind);
+            rt_tokens_free(&expanded);
+            qwen_runtime_media_spans_free(out);
+            return false;
+        }
+        int pos = qwen_runtime_next_placeholder(prompt, search_from, pad_token);
+        if (pos < 0) {
+            snprintf(err, errlen,
+                     "Qwen %s media did not match a %s placeholder token",
+                     kind, kind);
+            rt_tokens_free(&expanded);
+            qwen_runtime_media_spans_free(out);
+            return false;
+        }
+        search_from = pos + 1;
+
+        runtime_image_frames frames = {0};
+        float *patches = NULL;
+        uint32_t grid_h = 0, grid_w = 0;
+        bool ok = runtime_media_ref_decode_frames(ref, &frames, err, errlen) &&
+                  runtime_images_to_qwen_patches(&frames, &cfg, ref, &patches,
+                                                 &grid_h, &grid_w, err, errlen);
+        runtime_image_frames_free(&frames);
+        if (!ok) {
+            free(patches);
+            rt_tokens_free(&expanded);
+            qwen_runtime_media_spans_free(out);
+            return false;
+        }
+        qwen36_runtime_vision_embedding *embedding = &out->embeddings[out->len];
+        if (qwen36_runtime_embed_image_patches_f32(engine, patches, grid_h, grid_w,
+                                                   embedding, err, errlen) != 0) {
+            free(patches);
+            rt_tokens_free(&expanded);
+            qwen_runtime_media_spans_free(out);
+            return false;
+        }
+        free(patches);
+        if (embedding->n_tokens == 0 ||
+            embedding->n_tokens > (uint32_t)INT_MAX) {
+            snprintf(err, errlen,
+                     "Qwen %s embedding produced invalid placeholder count %u",
+                     kind, embedding->n_tokens);
+            rt_tokens_free(&expanded);
+            qwen_runtime_media_spans_free(out);
+            return false;
+        }
+        for (int j = copy_from; j < pos; j++) rt_tokens_push(&expanded, prompt->v[j]);
+        int expanded_pos = expanded.len;
+        for (uint32_t j = 0; j < embedding->n_tokens; j++) {
+            rt_tokens_push(&expanded, pad_token);
+        }
+        copy_from = pos + 1;
+        out->spans[out->len] = (qwen36_runtime_embedding_span){
+            .token_pos = expanded_pos,
+            .n_tokens = embedding->n_tokens,
+            .hidden_size = embedding->hidden_size,
+            .data = embedding->data,
+        };
+        out->len++;
+    }
+    for (int j = copy_from; j < prompt->len; j++) rt_tokens_push(&expanded, prompt->v[j]);
+    out->prompt = expanded;
+    out->prompt_expanded = true;
+    return true;
+}
+
+static int qwen_runtime_session_sync_request(rt_engine *engine,
+                                             rt_session *session,
+                                             const request *req,
+                                             const rt_tokens *prompt,
+                                             char *err,
+                                             size_t errlen) {
+    if (!request_has_media(req)) return rt_session_sync(session, prompt, err, errlen);
+    qwen_runtime_media_spans media = {0};
+    if (!qwen_runtime_build_media_embeddings(engine, req, prompt, &media,
+                                             err, errlen)) {
+        return -1;
+    }
+    const rt_tokens *media_prompt = media.prompt_expanded ? &media.prompt : prompt;
+    int rc = qwen36_runtime_session_sync_embeddings(session, media_prompt,
+                                                    media.spans, media.len,
+                                                    err, errlen);
+    qwen_runtime_media_spans_free(&media);
+    return rc;
 }
 
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
@@ -887,6 +3076,91 @@ static bool model_alias_disables_thinking(const char *model) {
 
 static bool model_alias_enables_thinking(const char *model) {
     return model && !strcmp(model, "deepseek-reasoner");
+}
+
+static bool model_alias_is_ds4_served(const char *model) {
+    return !model || !model[0] ||
+           !strcmp(model, "deepseek-v4-flash") ||
+           !strcmp(model, "deepseek-chat") ||
+           !strcmp(model, "deepseek-reasoner");
+}
+
+static bool model_alias_is_known_unserved_runtime(const char *model) {
+    return model &&
+           (!strcmp(model, "qwen3.6-27b") ||
+            !strcmp(model, "Qwen/Qwen3.6-27B") ||
+            !strcmp(model, "qwen36-27b") ||
+            !strcmp(model, "qwen3-6-27b") ||
+            !strcmp(model, "mistral-medium-3.5") ||
+            !strcmp(model, "mistral-medium-3.5-128b") ||
+            !strcmp(model, "mistralai/Mistral-Medium-3.5-128B"));
+}
+
+static bool request_model_supported_by_ds4_server(const request *r,
+                                                  char *err, size_t errlen) {
+    const char *model = (r && r->model) ? r->model : "deepseek-v4-flash";
+    if (model_alias_is_ds4_served(model)) return true;
+    if (!model_alias_is_known_unserved_runtime(model)) return true;
+    snprintf(err, errlen,
+             "model %s is registered in runtime-core but this server is currently serving deepseek-v4-flash only",
+             model);
+    return false;
+}
+
+static bool model_alias_is_qwen36_served(const char *model) {
+    return !model || !model[0] ||
+           !strcmp(model, QWEN36_RUNTIME_FAMILY) ||
+           !strcmp(model, QWEN36_RUNTIME_HF_REPO) ||
+           !strcmp(model, "qwen36-27b") ||
+           !strcmp(model, "qwen3-6-27b") ||
+           !strcmp(model, "qwen3.6") ||
+           !strcmp(model, "qwen3.6-27b-dense");
+}
+
+static bool model_alias_is_mistral35_served(const char *model) {
+    return !model || !model[0] ||
+           !strcmp(model, MISTRAL35_RUNTIME_FAMILY) ||
+           !strcmp(model, MISTRAL35_RUNTIME_API_MODEL) ||
+           !strcmp(model, MISTRAL35_RUNTIME_HF_REPO);
+}
+
+static const char *rt_ops_served_model_id(const rt_model_ops *ops) {
+    return ops && ops->family ? ops->family : "runtime-core";
+}
+
+static bool model_alias_is_runtime_ops_served(const rt_model_ops *ops, const char *model) {
+    const char *family = rt_ops_served_model_id(ops);
+    if (!model || !model[0] || !strcmp(model, family)) return true;
+    if (!strcmp(family, QWEN36_RUNTIME_FAMILY)) return model_alias_is_qwen36_served(model);
+    if (!strcmp(family, MISTRAL35_RUNTIME_FAMILY)) return model_alias_is_mistral35_served(model);
+    return false;
+}
+
+static bool request_model_supported_by_runtime_ops(const rt_model_ops *ops,
+                                                   const request *r,
+                                                   char *err, size_t errlen) {
+    const char *model = r && r->model ? r->model : "";
+    if (model_alias_is_runtime_ops_served(ops, model)) return true;
+    snprintf(err, errlen,
+             "model %s is not served by this runtime-core server; active model is %s",
+             model && model[0] ? model : "(empty)",
+             rt_ops_served_model_id(ops));
+    return false;
+}
+
+static void request_set_served_model_from_ops(request *r, const rt_model_ops *ops) {
+    if (!r) return;
+    free(r->model);
+    r->model = xstrdup(rt_ops_served_model_id(ops));
+}
+
+static void request_take_rt_tokens(request *r, rt_tokens *tokens) {
+    if (!r || !tokens) return;
+    ds4_tokens_free(&r->prompt);
+    r->prompt.v = tokens->v;
+    r->prompt.len = tokens->len;
+    r->prompt.cap = tokens->cap;
+    memset(tokens, 0, sizeof(*tokens));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -1580,7 +3854,9 @@ bad:
     return false;
 }
 
-static bool parse_messages(const char **p, chat_msgs *msgs) {
+static bool parse_messages_ex(const char **p, chat_msgs *msgs,
+                              bool media_placeholders,
+                              runtime_media_refs *media) {
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
@@ -1608,7 +3884,8 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                 }
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
-                if (!json_content(p, &msg.content)) {
+                if (!json_content_ex(p, &msg.content, media_placeholders,
+                                     media)) {
                     free(key);
                     goto fail;
                 }
@@ -1660,6 +3937,10 @@ fail:
     return true;
 }
 
+static bool parse_messages(const char **p, chat_msgs *msgs) {
+    return parse_messages_ex(p, msgs, false, NULL);
+}
+
 static void append_tool_result_text(buf *b, const char *s);
 
 static bool append_anthropic_block_content(buf *dst, const char *text) {
@@ -1672,7 +3953,10 @@ static bool append_anthropic_block_content(buf *dst, const char *text) {
  * chat_msg per role.  Parsing collapses text/thinking into strings, converts
  * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
  * escaped text because DS4 sees tool results in its chat template. */
-static bool parse_anthropic_content_block(const char **p, const char *role, chat_msg *msg) {
+static bool parse_anthropic_content_block(const char **p, const char *role,
+                                          chat_msg *msg,
+                                          bool media_placeholders,
+                                          runtime_media_refs *media) {
     (void)role;
     if (**p != '{') return false;
     (*p)++;
@@ -1683,6 +3967,10 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     char *name = NULL;
     char *input = NULL;
     char *tool_result = NULL;
+    char *media_url = NULL;
+    char *media_type = NULL;
+    char *media_data = NULL;
+    runtime_media_ref media_opts = {0};
 
     json_ws(p);
     while (**p && **p != '}') {
@@ -1736,9 +4024,43 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
                 free(key);
                 goto bad;
             }
-        } else if (!json_skip_value(p)) {
-            free(key);
-            goto bad;
+        } else if (!strcmp(key, "source")) {
+            if (!parse_media_source_value(p, &media_url, &media_type,
+                                          &media_data, &media_opts)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "image_url") ||
+                   !strcmp(key, "video_url") ||
+                   !strcmp(key, "url")) {
+            if (!parse_media_url_value(p, &media_url, &media_type,
+                                       &media_opts)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "media_type") || !strcmp(key, "mime_type")) {
+            free(media_type);
+            if (!json_string(p, &media_type)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "data")) {
+            free(media_data);
+            if (!json_string(p, &media_data)) {
+                free(key);
+                goto bad;
+            }
+        } else {
+            bool handled = false;
+            if (!parse_media_ref_option_value(key, p, &media_opts,
+                                              &handled)) {
+                free(key);
+                goto bad;
+            }
+            if (!handled && !json_skip_value(p)) {
+                free(key);
+                goto bad;
+            }
         }
         free(key);
         json_ws(p);
@@ -1768,6 +4090,22 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         buf_puts(&b, "</tool_result>");
         free(msg->content);
         msg->content = buf_take(&b);
+    } else if (media_placeholders &&
+               (content_type_is_image(type) || content_type_is_video(type))) {
+        bool video = content_type_is_video(type);
+        buf b = {0};
+        buf_puts(&b, msg->content ? msg->content : "");
+        append_runtime_media_placeholder(&b, video);
+        free(msg->content);
+        msg->content = buf_take(&b);
+        if (media) {
+            runtime_media_ref ref = media_opts;
+            if (!runtime_media_ref_fill(&ref, video, media_url,
+                                        media_type, media_data)) {
+                goto bad;
+            }
+            runtime_media_refs_push(media, ref);
+        }
     } else {
         if (text) {
             buf b = {0};
@@ -1792,6 +4130,9 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     free(name);
     free(input);
     free(tool_result);
+    free(media_url);
+    free(media_type);
+    free(media_data);
     return true;
 bad:
     free(type);
@@ -1801,10 +4142,15 @@ bad:
     free(name);
     free(input);
     free(tool_result);
+    free(media_url);
+    free(media_type);
+    free(media_data);
     return false;
 }
 
-static bool parse_anthropic_content(const char **p, chat_msg *msg) {
+static bool parse_anthropic_content_ex(const char **p, chat_msg *msg,
+                                       bool media_placeholders,
+                                       runtime_media_refs *media) {
     json_ws(p);
     if (**p == '"') return json_string(p, &msg->content);
     if (json_lit(p, "null")) {
@@ -1825,7 +4171,9 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
             msg->content = buf_take(&b);
             free(s);
         } else if (**p == '{') {
-            if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg)) return false;
+            if (!parse_anthropic_content_block(p, msg->role ? msg->role : "",
+                                               msg, media_placeholders,
+                                               media)) return false;
         } else if (!json_skip_value(p)) {
             return false;
         }
@@ -1839,7 +4187,9 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
     return true;
 }
 
-static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
+static bool parse_anthropic_messages_ex(const char **p, chat_msgs *msgs,
+                                        bool media_placeholders,
+                                        runtime_media_refs *media) {
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
@@ -1868,7 +4218,8 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
                 msg.content = NULL;
-                if (!parse_anthropic_content(p, &msg)) {
+                if (!parse_anthropic_content_ex(p, &msg, media_placeholders,
+                                                media)) {
                     free(key);
                     goto fail;
                 }
@@ -1898,6 +4249,10 @@ fail:
     if (**p != ']') return false;
     (*p)++;
     return true;
+}
+
+static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
+    return parse_anthropic_messages_ex(p, msgs, false, NULL);
 }
 
 static bool anthropic_system_part_is_private(const char *s) {
@@ -2016,6 +4371,47 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
     buf_puts(b, tool_schemas);
     buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
                 "Use the exact parameter names from the schemas.");
+}
+
+static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
+    if (!tool_schemas || !tool_schemas[0]) return;
+    buf_puts(b,
+        "# Tools\n\n"
+        "You have access to the following functions:\n\n"
+        "<tools>");
+    const char *p = tool_schemas;
+    while (*p) {
+        const char *line = strchr(p, '\n');
+        size_t n = line ? (size_t)(line - p) : strlen(p);
+        if (n > 0) {
+            buf_putc(b, '\n');
+            buf_append(b, p, n);
+        }
+        if (!line) break;
+        p = line + 1;
+    }
+    buf_puts(b,
+        "\n</tools>\n\n"
+        "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+        "<tool_call>\n"
+        "<function=example_function_name>\n"
+        "<parameter=example_parameter_1>\n"
+        "value_1\n"
+        "</parameter>\n"
+        "<parameter=example_parameter_2>\n"
+        "This is the value for the second parameter\n"
+        "that can span\n"
+        "multiple lines\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>\n\n"
+        "<IMPORTANT>\n"
+        "Reminder:\n"
+        "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+        "- Required parameters MUST be specified\n"
+        "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+        "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+        "</IMPORTANT>");
 }
 
 static void json_escape(buf *b, const char *s);
@@ -2141,6 +4537,67 @@ static void append_tool_result_text(buf *b, const char *s) {
         } else {
             buf_putc(b, *s++);
         }
+    }
+}
+
+static void append_qwen_tool_xml_text(buf *b, const char *s, const char *end) {
+    size_t endlen = strlen(end);
+    for (s = s ? s : ""; *s;) {
+        if (endlen && !strncmp(s, end, endlen)) {
+            buf_puts(b, "&lt;");
+            s++;
+        } else {
+            buf_putc(b, *s++);
+        }
+    }
+}
+
+static void append_qwen_tool_calls_text(buf *b,
+                                        const tool_calls *calls,
+                                        const tool_schema_orders *orders) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_dsml && calls->raw_dsml[0]) {
+        buf_puts(b, calls->raw_dsml);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        buf_puts(b, i == 0 ? "\n\n<tool_call>\n<function=" : "\n<tool_call>\n<function=");
+        append_qwen_tool_xml_text(b, tc->name, ">");
+        buf_puts(b, ">\n");
+
+        json_args args = {0};
+        if (json_args_parse(tc->arguments, &args)) {
+            const tool_schema_order *order =
+                tool_schema_orders_find(orders, tc->name);
+            if (order) {
+                for (int j = 0; j < order->len; j++) {
+                    int idx = json_args_find_unused(&args, order->prop[j]);
+                    if (idx < 0) continue;
+                    buf_puts(b, "<parameter=");
+                    append_qwen_tool_xml_text(b, args.v[idx].key, ">");
+                    buf_puts(b, ">\n");
+                    append_qwen_tool_xml_text(b, args.v[idx].value, "</parameter>");
+                    buf_puts(b, "\n</parameter>\n");
+                    args.v[idx].used = true;
+                }
+            }
+            for (int j = 0; j < args.len; j++) {
+                if (args.v[j].used) continue;
+                buf_puts(b, "<parameter=");
+                append_qwen_tool_xml_text(b, args.v[j].key, ">");
+                buf_puts(b, ">\n");
+                append_qwen_tool_xml_text(b, args.v[j].value, "</parameter>");
+                buf_puts(b, "\n</parameter>\n");
+            }
+            json_args_free(&args);
+        } else {
+            buf_puts(b, "<parameter=arguments>\n");
+            append_qwen_tool_xml_text(b, tc->arguments, "</parameter>");
+            buf_puts(b, "\n</parameter>\n");
+        }
+
+        buf_puts(b, "</function>\n</tool_call>");
     }
 }
 
@@ -2351,11 +4808,12 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
  * suffix tokenization happens later after the cache decision, using the live
  * token prefix as the boundary.  That avoids BPE merges across the visible
  * replay/live-KV boundary. */
-static char *render_live_tool_tail(const chat_msgs *msgs, int start,
-                                   ds4_think_mode think_mode) {
+static char *render_response_prompt_tail(const chat_msgs *msgs, int start,
+                                         ds4_think_mode think_mode,
+                                         bool leading_eos) {
     const bool think = ds4_think_mode_enabled(think_mode);
     buf out = {0};
-    buf_puts(&out, "<｜end▁of▁sentence｜>");
+    if (leading_eos) buf_puts(&out, "<｜end▁of▁sentence｜>");
 
     bool pending_assistant = false;
     bool pending_tool_result = false;
@@ -2399,6 +4857,147 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
         buf_puts(&out, think ? "<think>" : "</think>");
     }
     return buf_take(&out);
+}
+
+static char *render_live_tool_tail(const chat_msgs *msgs, int start,
+                                   ds4_think_mode think_mode) {
+    return render_response_prompt_tail(msgs, start, think_mode, true);
+}
+
+static const char *qwen_chat_role_text(const char *role) {
+    if (!role || !role[0]) return "user";
+    if (role_is_system(role)) return "system";
+    if (!strcmp(role, "assistant")) return "assistant";
+    return "user";
+}
+
+static void append_qwen_assistant_generation_prefix(buf *out,
+                                                    ds4_think_mode think_mode) {
+    buf_puts(out, "<|im_start|>assistant\n");
+    if (ds4_think_mode_enabled(think_mode)) {
+        buf_puts(out, "<think>\n");
+    } else {
+        buf_puts(out, "<think>\n\n</think>\n\n");
+    }
+}
+
+static const char *qwen_runtime_role_text(const char *role) {
+    if (!role || !role[0]) return "user";
+    if (!strcmp(role, "developer")) return "system";
+    if (!strcmp(role, "function")) return "tool";
+    return role;
+}
+
+static const char *qwen_runtime_visible_assistant_content(
+        const char *content, bool preserve_thinking) {
+    if (!content) return "";
+    if (preserve_thinking) return content;
+    const char *end = strstr(content, "</think>");
+    if (!end) return content;
+    end += strlen("</think>");
+    while (*end == '\n' || *end == '\r') end++;
+    return end;
+}
+
+static bool qwen_runtime_content_is_tool_response(const char *content) {
+    static const char open[] = "<tool_response>";
+    static const char close[] = "</tool_response>";
+    const size_t open_len = sizeof(open) - 1;
+    const size_t close_len = sizeof(close) - 1;
+    const char *p = content ? content : "";
+    while (*p && isspace((unsigned char)*p)) p++;
+    bool saw_response = false;
+    while (*p) {
+        if (strncmp(p, open, open_len) != 0) return false;
+        p += open_len;
+        const char *end = strstr(p, close);
+        if (!end) return false;
+        p = end + close_len;
+        while (*p && isspace((unsigned char)*p)) p++;
+        saw_response = true;
+    }
+    return saw_response;
+}
+
+static bool qwen_runtime_last_real_user_query_index(
+        const rt_chat_message *messages, size_t n_messages, size_t *out_index) {
+    for (size_t remain = n_messages; remain > 0; remain--) {
+        size_t i = remain - 1;
+        const char *role = qwen_runtime_role_text(messages[i].role);
+        if (!strcmp(role, "user") &&
+            !qwen_runtime_content_is_tool_response(messages[i].content)) {
+            if (out_index) *out_index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static char *render_qwen_runtime_messages_text(
+        const rt_chat_message *messages,
+        size_t n_messages,
+        ds4_think_mode think_mode) {
+    size_t last_query_index = 0;
+    bool has_last_query = qwen_runtime_last_real_user_query_index(
+        messages, n_messages, &last_query_index);
+    buf out = {0};
+    for (size_t i = 0; i < n_messages; i++) {
+        const char *role = qwen_runtime_role_text(messages[i].role);
+        const char *content = messages[i].content ? messages[i].content : "";
+        if (!strcmp(role, "assistant")) {
+            content = qwen_runtime_visible_assistant_content(
+                content, has_last_query && i > last_query_index);
+        }
+        buf_puts(&out, "<|im_start|>");
+        buf_puts(&out, role);
+        buf_puts(&out, "\n");
+        buf_puts(&out, content);
+        buf_puts(&out, "<|im_end|>\n");
+    }
+    append_qwen_assistant_generation_prefix(&out, think_mode);
+    return buf_take(&out);
+}
+
+static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
+                                        ds4_think_mode think_mode,
+                                        const tool_schema_orders *orders);
+
+static char *render_qwen_response_prompt_tail(const chat_msgs *msgs, int start,
+                                              ds4_think_mode think_mode,
+                                              const tool_schema_orders *orders,
+                                              bool leading_im_end) {
+    buf out = {0};
+    if (leading_im_end) buf_puts(&out, "<|im_end|>\n");
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            continue;
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            buf_puts(&out, "<|im_start|>user\n<tool_response>\n");
+            append_qwen_tool_xml_text(&out, m->content, "</tool_response>");
+            buf_puts(&out, "\n</tool_response><|im_end|>\n");
+        } else if (!strcmp(m->role, "assistant")) {
+            buf_puts(&out, "<|im_start|>assistant\n");
+            buf_puts(&out, m->content ? m->content : "");
+            append_qwen_tool_calls_text(&out, &m->calls, orders);
+            buf_puts(&out, "<|im_end|>\n");
+        } else {
+            buf_puts(&out, "<|im_start|>");
+            buf_puts(&out, qwen_chat_role_text(m->role));
+            buf_puts(&out, "\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|im_end|>\n");
+        }
+    }
+    append_qwen_assistant_generation_prefix(&out, think_mode);
+    return buf_take(&out);
+}
+
+static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
+                                        ds4_think_mode think_mode,
+                                        const tool_schema_orders *orders) {
+    return render_qwen_response_prompt_tail(msgs, start, think_mode, orders,
+                                            true);
 }
 
 static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
@@ -2445,6 +5044,7 @@ static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
  * session. */
 static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
                                             ds4_think_mode think_mode,
+                                            const stop_list *durable_call_ids,
                                             bool *requires_live_tool_state,
                                             bool *requires_live_reasoning,
                                             char *err, size_t errlen) {
@@ -2461,8 +5061,9 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
         for (int j = 0; j < ids.len; j++) {
             const char *id = ids.v[j];
             const bool live_known = responses_live_has_call_id(s, id);
+            const bool durable_known = id_list_contains(durable_call_ids, id);
             const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
-            if (!live_known && !prior) {
+            if (!live_known && !durable_known && !prior) {
                 snprintf(err, errlen,
                          "Responses continuation state is not available for call_id %s; retry by replaying the full input history",
                          id);
@@ -2470,7 +5071,9 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
                 return false;
             }
             if (!prior) {
-                if (requires_live_tool_state) *requires_live_tool_state = true;
+                if (!durable_known && requires_live_tool_state) {
+                    *requires_live_tool_state = true;
+                }
                 continue;
             }
             if (needs_reasoning &&
@@ -2490,8 +5093,10 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
  * server state is still exactly at the remembered token frontier before using
  * it.  If another request already replaced the session, normal token/text/disk
  * prefix matching handles the request instead. */
-static void responses_prepare_live_continuation(request *r,
-                                                const chat_msgs *msgs) {
+static void responses_prepare_live_continuation_ex(
+        request *r,
+        const chat_msgs *msgs,
+        bool qwen_tail) {
     if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
 
     int tail_start = msgs->len;
@@ -2518,8 +5123,20 @@ static void responses_prepare_live_continuation(request *r,
     if (r->responses_live_call_ids.len == 0) return;
 
     free(r->responses_live_suffix_text);
-    r->responses_live_suffix_text =
+    r->responses_live_suffix_text = qwen_tail ?
+        render_qwen_live_tool_tail(msgs, tail_start, r->think_mode,
+                                   &r->tool_orders) :
         render_live_tool_tail(msgs, tail_start, r->think_mode);
+}
+
+static void responses_prepare_live_continuation(request *r,
+                                                const chat_msgs *msgs) {
+    responses_prepare_live_continuation_ex(r, msgs, false);
+}
+
+static void responses_prepare_live_continuation_qwen(request *r,
+                                                     const chat_msgs *msgs) {
+    responses_prepare_live_continuation_ex(r, msgs, true);
 }
 
 static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
@@ -2575,8 +5192,10 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
  * model sampled.  If the incoming tool_result IDs match the live sampled
  * frontier, generate_job() can skip replay matching entirely and append just
  * EOS + tool_result + next assistant prefix to the real KV. */
-static void anthropic_prepare_live_continuation(request *r,
-                                                const chat_msgs *msgs) {
+static void anthropic_prepare_live_continuation_ex(
+        request *r,
+        const chat_msgs *msgs,
+        bool qwen_tail) {
     if (!r || r->api != API_ANTHROPIC || !msgs || msgs->len == 0) return;
 
     int tail_end = msgs->len;
@@ -2596,8 +5215,20 @@ static void anthropic_prepare_live_continuation(request *r,
     if (r->anthropic_live_call_ids.len == 0) return;
 
     free(r->anthropic_live_suffix_text);
-    r->anthropic_live_suffix_text =
+    r->anthropic_live_suffix_text = qwen_tail ?
+        render_qwen_live_tool_tail(msgs, tail_start, r->think_mode,
+                                   &r->tool_orders) :
         render_live_tool_tail(msgs, tail_start, r->think_mode);
+}
+
+static void anthropic_prepare_live_continuation(request *r,
+                                                const chat_msgs *msgs) {
+    anthropic_prepare_live_continuation_ex(r, msgs, false);
+}
+
+static void anthropic_prepare_live_continuation_qwen(request *r,
+                                                     const chat_msgs *msgs) {
+    anthropic_prepare_live_continuation_ex(r, msgs, true);
 }
 
 /* The API parsers are intentionally selective JSON parsers: they keep only
@@ -2750,6 +5381,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
+    if (!request_model_supported_by_ds4_server(r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
@@ -2770,6 +5407,339 @@ bad:
     chat_msgs_free(&msgs);
     free(tool_schemas);
     snprintf(err, errlen, "invalid JSON request");
+    request_free(r);
+    return false;
+}
+
+static size_t build_qwen_runtime_messages(const chat_msgs *msgs,
+                                          const char *active_tool_schemas,
+                                          const tool_schema_orders *tool_orders,
+                                          rt_chat_message *rt_msgs,
+                                          char **owned) {
+    size_t n = 0;
+    buf system = {0};
+    if (active_tool_schemas && active_tool_schemas[0]) {
+        append_qwen_tools_prompt_text(&system, active_tool_schemas);
+    }
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!role_is_system(m->role)) continue;
+        if (system.len) buf_puts(&system, "\n\n");
+        buf_puts(&system, m->content ? m->content : "");
+    }
+    if (system.len) {
+        owned[n] = buf_take(&system);
+        rt_msgs[n].role = "system";
+        rt_msgs[n].content = owned[n];
+        n++;
+    } else {
+        buf_free(&system);
+    }
+
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) continue;
+        if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            buf b = {0};
+            buf_puts(&b, "<tool_response>\n");
+            append_qwen_tool_xml_text(&b, m->content, "</tool_response>");
+            buf_puts(&b, "\n</tool_response>");
+            owned[n] = buf_take(&b);
+            rt_msgs[n].role = "user";
+            rt_msgs[n].content = owned[n];
+            n++;
+            continue;
+        }
+        if (!strcmp(m->role, "assistant") && m->calls.len > 0) {
+            buf b = {0};
+            buf_puts(&b, m->content ? m->content : "");
+            append_qwen_tool_calls_text(&b, &m->calls, tool_orders);
+            owned[n] = buf_take(&b);
+            rt_msgs[n].role = "assistant";
+            rt_msgs[n].content = owned[n];
+            n++;
+            continue;
+        }
+        rt_msgs[n].role = m->role;
+        rt_msgs[n].content = m->content;
+        n++;
+    }
+    return n;
+}
+
+static bool render_runtime_chat_request(rt_engine *engine, const rt_model_ops *ops,
+                                        int ctx_size, request *r,
+                                        const chat_msgs *msgs,
+                                        const char *active_tool_schemas,
+                                        bool thinking_enabled,
+                                        ds4_think_mode reasoning_effort,
+                                        char *err, size_t errlen) {
+    if (!request_model_supported_by_runtime_ops(ops, r, err, errlen)) return false;
+    request_set_served_model_from_ops(r, ops);
+
+    r->has_tools = active_tool_schemas && active_tool_schemas[0];
+    bool qwen_runtime = !strcmp(rt_ops_served_model_id(ops), QWEN36_RUNTIME_FAMILY);
+    bool tool_context = r->has_tools || chat_history_uses_tool_context(msgs, NULL);
+    if (tool_context && !qwen_runtime) {
+        snprintf(err, errlen,
+                 "runtime-core server path only supports tools for %s",
+                 QWEN36_RUNTIME_FAMILY);
+        return false;
+    }
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+
+    size_t cap = (size_t)msgs->len + 1u;
+    rt_chat_message *rt_msgs = xmalloc((cap ? cap : 1u) * sizeof(rt_msgs[0]));
+    char **owned = xmalloc((cap ? cap : 1u) * sizeof(owned[0]));
+    memset(rt_msgs, 0, (cap ? cap : 1u) * sizeof(rt_msgs[0]));
+    memset(owned, 0, (cap ? cap : 1u) * sizeof(owned[0]));
+    size_t n_rt_msgs = 0;
+    if (qwen_runtime && tool_context) {
+        n_rt_msgs = build_qwen_runtime_messages(msgs, active_tool_schemas,
+                                                &r->tool_orders, rt_msgs, owned);
+    } else {
+        for (int i = 0; i < msgs->len; i++) {
+            rt_msgs[n_rt_msgs].role = msgs->v[i].role;
+            rt_msgs[n_rt_msgs].content = msgs->v[i].content;
+            n_rt_msgs++;
+        }
+    }
+    qwen36_runtime_chat_options qwen_chat = {
+        .think_mode = ds4_think_mode_enabled(r->think_mode) ?
+            QWEN36_THINK_ENABLED : QWEN36_THINK_DISABLED,
+    };
+    rt_chat_render_options render = {
+        .add_generation_prompt = true,
+        .model_options = !strcmp(rt_ops_served_model_id(ops), QWEN36_RUNTIME_FAMILY) ?
+            &qwen_chat : NULL,
+    };
+    rt_tokens prompt = {0};
+    int rc = rt_render_chat(engine, rt_msgs, n_rt_msgs, &render, &prompt);
+    if (rc == 0 && qwen_runtime) {
+        free(r->prompt_text);
+        r->prompt_text = render_qwen_runtime_messages_text(
+            rt_msgs, n_rt_msgs, r->think_mode);
+    }
+    for (size_t i = 0; i < cap; i++) free(owned[i]);
+    free(owned);
+    free(rt_msgs);
+    if (rc != 0 || prompt.len == 0) {
+        rt_tokens_free(&prompt);
+        snprintf(err, errlen,
+                 "failed to render runtime-core chat prompt; vision placeholders require a compatible --mmproj");
+        return false;
+    }
+    request_take_rt_tokens(r, &prompt);
+    return true;
+}
+
+static bool render_runtime_previous_response_request(
+        rt_engine *engine, const rt_model_ops *ops, int ctx_size, request *r,
+        const chat_msgs *msgs, const char *active_tool_schemas,
+        bool thinking_enabled, ds4_think_mode reasoning_effort,
+        char *err, size_t errlen) {
+    if (!request_model_supported_by_runtime_ops(ops, r, err, errlen)) return false;
+    request_set_served_model_from_ops(r, ops);
+    if (strcmp(rt_ops_served_model_id(ops), QWEN36_RUNTIME_FAMILY)) {
+        snprintf(err, errlen,
+                 "previous_response_id is only supported on the runtime-core %s path",
+                 QWEN36_RUNTIME_FAMILY);
+        return false;
+    }
+
+    r->has_tools = active_tool_schemas && active_tool_schemas[0];
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+
+    char *tail = render_qwen_response_prompt_tail(
+        msgs, 0, r->think_mode, &r->tool_orders, false);
+    buf rendered = {0};
+    buf_puts(&rendered, r->responses_previous_visible_text ?
+             r->responses_previous_visible_text : "");
+    buf_puts(&rendered, tail ? tail : "");
+    free(tail);
+
+    rt_tokens prompt = {0};
+    int rc = rt_tokenize_text(engine, rendered.ptr ? rendered.ptr : "", &prompt);
+    if (rc != 0 || prompt.len == 0) {
+        rt_tokens_free(&prompt);
+        buf_free(&rendered);
+        snprintf(err, errlen,
+                 "failed to tokenize previous_response_id prompt");
+        return false;
+    }
+    free(r->prompt_text);
+    r->prompt_text = buf_take(&rendered);
+    request_take_rt_tokens(r, &prompt);
+    return true;
+}
+
+static bool parse_chat_request_rt(rt_engine *engine, const rt_model_ops *ops,
+                                  server *s,
+                                  const char *body, int def_tokens,
+                                  int ctx_size, request *r, char *err, size_t errlen) {
+    request_init(r, REQ_CHAT, def_tokens);
+    request_set_served_model_from_ops(r, ops);
+    const char *p = body;
+    bool got_messages = false;
+    bool thinking_enabled = true;
+    bool tool_choice_none = false;
+    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    chat_msgs msgs = {0};
+    char *tool_schemas = NULL;
+
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "messages")) {
+            chat_msgs_free(&msgs);
+            if (!parse_messages_ex(&p, &msgs, true, &r->media)) {
+                free(key);
+                goto bad;
+            }
+            got_messages = true;
+        } else if (!strcmp(key, "tools")) {
+            free(tool_schemas);
+            tool_schemas = NULL;
+            tool_schema_orders_free(&r->tool_orders);
+            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tool_choice")) {
+            json_ws(&p);
+            if (*p == '"') {
+                char *choice = NULL;
+                if (!json_string(&p, &choice)) {
+                    free(key);
+                    goto bad;
+                }
+                tool_choice_none = !strcmp(choice, "none");
+                free(choice);
+            } else if (!json_skip_value(&p)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            if (!json_string(&p, &r->model)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
+            if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "temperature")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->temperature = (float)v;
+        } else if (!strcmp(key, "top_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_p = (float)v;
+        } else if (!strcmp(key, "min_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->min_p = (float)v;
+        } else if (!strcmp(key, "top_k")) {
+            if (!json_int(&p, &r->top_k)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "seed")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->seed = v > 0.0 ? (uint64_t)v : 0;
+        } else if (!strcmp(key, "stream")) {
+            if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stream_options")) {
+            if (!parse_stream_options(&p, &r->stream_include_usage)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "thinking")) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "reasoning_effort")) {
+            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "think")) {
+            if (!json_bool(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stop")) {
+            if (!parse_stop(&p, &r->stops)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!got_messages) {
+        snprintf(err, errlen, "missing messages");
+        goto fail;
+    }
+    kv_cache_restore_tool_memory_for_messages(s, &msgs);
+    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    const char *active_tool_schemas =
+        (!tool_choice_none && tool_schemas && tool_schemas[0]) ? tool_schemas : NULL;
+    if (!render_runtime_chat_request(engine, ops, ctx_size, r, &msgs,
+                                     active_tool_schemas, thinking_enabled,
+                                     reasoning_effort, err, errlen)) goto fail;
+
+    chat_msgs_free(&msgs);
+    free(tool_schemas);
+    return true;
+
+fail:
+    chat_msgs_free(&msgs);
+    free(tool_schemas);
+    request_free(r);
+    return false;
+bad:
+    snprintf(err, errlen, "invalid JSON request");
+    chat_msgs_free(&msgs);
+    free(tool_schemas);
     request_free(r);
     return false;
 }
@@ -2941,6 +5911,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         request_free(r);
         return false;
     }
+    if (!request_model_supported_by_ds4_server(r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     if (system && system[0]) {
         chat_msg msg = {0};
         msg.role = xstrdup("system");
@@ -2985,12 +5962,223 @@ bad:
     return false;
 }
 
+static bool parse_anthropic_request_rt(rt_engine *engine, const rt_model_ops *ops,
+                                       server *s,
+                                       const char *body, int def_tokens,
+                                       int ctx_size, request *r,
+                                       char *err, size_t errlen) {
+    request_init(r, REQ_CHAT, def_tokens);
+    r->api = API_ANTHROPIC;
+    request_set_served_model_from_ops(r, ops);
+    const char *p = body;
+    bool got_messages = false;
+    bool tool_choice_none = false;
+    bool got_thinking = false;
+    bool thinking_enabled = true;
+    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    chat_msgs msgs = {0};
+    char *system = NULL;
+    char *tool_schemas = NULL;
+
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "messages")) {
+            chat_msgs_free(&msgs);
+            if (!parse_anthropic_messages_ex(&p, &msgs, true, &r->media)) {
+                free(key);
+                goto bad;
+            }
+            got_messages = true;
+        } else if (!strcmp(key, "system")) {
+            free(system);
+            if (!parse_anthropic_system(&p, &system)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tools")) {
+            free(tool_schemas);
+            tool_schemas = NULL;
+            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tool_choice")) {
+            json_ws(&p);
+            if (*p == '{') {
+                p++;
+                json_ws(&p);
+                while (*p && *p != '}') {
+                    char *ckey = NULL;
+                    if (!json_string(&p, &ckey)) {
+                        free(key);
+                        goto bad;
+                    }
+                    json_ws(&p);
+                    if (*p != ':') {
+                        free(ckey);
+                        free(key);
+                        goto bad;
+                    }
+                    p++;
+                    if (!strcmp(ckey, "type")) {
+                        char *choice = NULL;
+                        if (!json_string(&p, &choice)) {
+                            free(ckey);
+                            free(key);
+                            goto bad;
+                        }
+                        tool_choice_none = !strcmp(choice, "none");
+                        free(choice);
+                    } else if (!json_skip_value(&p)) {
+                        free(ckey);
+                        free(key);
+                        goto bad;
+                    }
+                    free(ckey);
+                    json_ws(&p);
+                    if (*p == ',') p++;
+                    json_ws(&p);
+                }
+                if (*p != '}') {
+                    free(key);
+                    goto bad;
+                }
+                p++;
+            } else if (!json_skip_value(&p)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            if (!json_string(&p, &r->model)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "max_tokens")) {
+            if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "temperature")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->temperature = (float)v;
+        } else if (!strcmp(key, "top_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_p = (float)v;
+        } else if (!strcmp(key, "top_k")) {
+            if (!json_int(&p, &r->top_k)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stream")) {
+            if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stop_sequences")) {
+            if (!parse_stop(&p, &r->stops)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "thinking")) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+            got_thinking = true;
+        } else if (!strcmp(key, "output_config")) {
+            if (!parse_output_config_effort(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "reasoning_effort")) {
+            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!got_messages) {
+        snprintf(err, errlen, "missing messages");
+        goto fail;
+    }
+    if (system && system[0]) {
+        chat_msg msg = {0};
+        msg.role = xstrdup("system");
+        msg.content = system;
+        system = NULL;
+        chat_msgs_push(&msgs, msg);
+    }
+    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
+    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    if (!anthropic_validate_tool_results(s, &msgs,
+                                         &r->anthropic_requires_live_tool_state,
+                                         err, errlen)) {
+        goto fail;
+    }
+    kv_cache_restore_tool_memory_for_messages(s, &msgs);
+    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    if (!strcmp(rt_ops_served_model_id(ops), QWEN36_RUNTIME_FAMILY)) {
+        anthropic_prepare_live_continuation_qwen(r, &msgs);
+    } else {
+        anthropic_prepare_live_continuation(r, &msgs);
+    }
+    const char *active_tool_schemas =
+        (!tool_choice_none && tool_schemas && tool_schemas[0]) ? tool_schemas : NULL;
+    if (!render_runtime_chat_request(engine, ops, ctx_size, r, &msgs,
+                                     active_tool_schemas, thinking_enabled,
+                                     reasoning_effort, err, errlen)) goto fail;
+    chat_msgs_free(&msgs);
+    free(system);
+    free(tool_schemas);
+    return true;
+bad:
+    snprintf(err, errlen, "invalid JSON request");
+fail:
+    chat_msgs_free(&msgs);
+    free(system);
+    free(tool_schemas);
+    request_free(r);
+    return false;
+}
+
 /* Responses API: convert a content-array item (input_text/output_text/text) into a
  * concatenated string. Strict shape check: bare string, null, or an array of
  * recognized text blocks. Numbers / objects / arrays-of-primitives at the top
  * level all reject so the client sees a 400 instead of an answer built on
  * silently dropped context. */
-static bool parse_responses_content_array(const char **p, char **out) {
+static bool parse_responses_content_array_ex(const char **p, char **out,
+                                             bool media_placeholders,
+                                             runtime_media_refs *media) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (json_lit(p, "null")) {
@@ -3013,12 +6201,19 @@ static bool parse_responses_content_array(const char **p, char **out) {
             (*p)++;
             char *type = NULL;
             char *text = NULL;
+            char *media_url = NULL;
+            char *media_type = NULL;
+            char *media_data = NULL;
+            runtime_media_ref media_opts = {0};
             json_ws(p);
             while (**p && **p != '}') {
                 char *key = NULL;
                 if (!json_string(p, &key)) {
                     free(type);
                     free(text);
+                    free(media_url);
+                    free(media_type);
+                    free(media_data);
                     goto fail;
                 }
                 json_ws(p);
@@ -3026,6 +6221,9 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     free(key);
                     free(type);
                     free(text);
+                    free(media_url);
+                    free(media_type);
+                    free(media_data);
                     goto fail;
                 }
                 (*p)++;
@@ -3034,6 +6232,9 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     if (!json_string(p, &type)) {
                         free(key);
                         free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
                         goto fail;
                     }
                 } else if (!strcmp(key, "text")) {
@@ -3047,13 +6248,77 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     } else if (!json_string(p, &text)) {
                         free(key);
                         free(type);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
                         goto fail;
                     }
-                } else if (!json_skip_value(p)) {
-                    free(key);
-                    free(type);
-                    free(text);
-                    goto fail;
+                } else if (!strcmp(key, "image_url") ||
+                           !strcmp(key, "video_url") ||
+                           !strcmp(key, "url")) {
+                    if (!parse_media_url_value(p, &media_url, &media_type,
+                                               &media_opts)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "source")) {
+                    if (!parse_media_source_value(p, &media_url, &media_type,
+                                                  &media_data,
+                                                  &media_opts)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "media_type") || !strcmp(key, "mime_type")) {
+                    free(media_type);
+                    if (!json_string(p, &media_type)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_data);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "data")) {
+                    free(media_data);
+                    if (!json_string(p, &media_data)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        goto fail;
+                    }
+                } else {
+                    bool handled = false;
+                    if (!parse_media_ref_option_value(key, p, &media_opts,
+                                                      &handled)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
+                        goto fail;
+                    }
+                    if (!handled && !json_skip_value(p)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
+                        goto fail;
+                    }
                 }
                 free(key);
                 json_ws(p);
@@ -3063,6 +6328,9 @@ static bool parse_responses_content_array(const char **p, char **out) {
             if (**p != '}') {
                 free(type);
                 free(text);
+                free(media_url);
+                free(media_type);
+                free(media_data);
                 goto fail;
             }
             (*p)++;
@@ -3071,20 +6339,45 @@ static bool parse_responses_content_array(const char **p, char **out) {
              * image/file/audio types, future schema-drift — is rejected so the
              * client gets a 400 instead of an answer built on context the
              * server discarded silently. */
+            bool is_media_block = media_placeholders &&
+                (content_type_is_image(type) || content_type_is_video(type));
             bool is_text_block = type && (
                 !strcmp(type, "input_text") ||
                 !strcmp(type, "output_text") ||
                 !strcmp(type, "text") ||
                 !strcmp(type, "summary_text") ||
                 !strcmp(type, "reasoning_text"));
-            if (!is_text_block || !text) {
+            if (is_media_block) {
+                bool video = content_type_is_video(type);
+                append_runtime_media_placeholder(&b, video);
+                if (media) {
+                    runtime_media_ref ref = media_opts;
+                    if (!runtime_media_ref_fill(&ref, video, media_url,
+                                                media_type, media_data)) {
+                        free(type);
+                        free(text);
+                        free(media_url);
+                        free(media_type);
+                        free(media_data);
+                        goto fail;
+                    }
+                    runtime_media_refs_push(media, ref);
+                }
+            } else if (is_text_block && text) {
+                buf_puts(&b, text);
+            } else {
                 free(type);
                 free(text);
+                free(media_url);
+                free(media_type);
+                free(media_data);
                 goto fail;
             }
-            buf_puts(&b, text);
             free(type);
             free(text);
+            free(media_url);
+            free(media_type);
+            free(media_data);
         } else {
             /* Reject primitives, arrays-of-arrays, nulls: a content array
              * element must be either a string or a typed text object. */
@@ -3120,9 +6413,11 @@ fail:
  *
  * Reasoning items are merged into the next assistant message so
  * render_chat_prompt_text can wrap them in <think>. */
-static bool parse_responses_input(const char **p, chat_msgs *msgs,
-                                  buf *loaded_tool_schemas,
-                                  tool_schema_orders *orders) {
+static bool parse_responses_input_ex(const char **p, chat_msgs *msgs,
+                                     buf *loaded_tool_schemas,
+                                     tool_schema_orders *orders,
+                                     bool media_placeholders,
+                                     runtime_media_refs *media) {
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
@@ -3172,7 +6467,9 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "content")) {
                 free(content);
-                if (!parse_responses_content_array(p, &content)) {
+                if (!parse_responses_content_array_ex(p, &content,
+                                                      media_placeholders,
+                                                      media)) {
                     free(key);
                     goto item_fail;
                 }
@@ -3216,7 +6513,9 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 free(output);
                 json_ws(p);
                 if (**p == '[') {
-                    if (!parse_responses_content_array(p, &output)) {
+                    if (!parse_responses_content_array_ex(p, &output,
+                                                          media_placeholders,
+                                                          media)) {
                         free(key);
                         goto item_fail;
                     }
@@ -3243,7 +6542,9 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "summary")) {
                 free(summary);
-                if (!parse_responses_content_array(p, &summary)) {
+                if (!parse_responses_content_array_ex(p, &summary,
+                                                      media_placeholders,
+                                                      media)) {
                     free(key);
                     goto item_fail;
                 }
@@ -3592,6 +6893,53 @@ fail:
     return false;
 }
 
+static bool parse_responses_input(const char **p, chat_msgs *msgs,
+                                  buf *loaded_tool_schemas,
+                                  tool_schema_orders *orders) {
+    return parse_responses_input_ex(p, msgs, loaded_tool_schemas, orders,
+                                    false, NULL);
+}
+
+static bool conversation_items_prepend_messages(const char *items_json,
+                                                chat_msgs *msgs,
+                                                buf *loaded_tool_schemas,
+                                                tool_schema_orders *orders) {
+    if (!items_json || conversation_items_empty(items_json)) return true;
+    const char *p = items_json;
+    chat_msgs prefix = {0};
+    if (!parse_responses_input(&p, &prefix, loaded_tool_schemas, orders)) {
+        chat_msgs_free(&prefix);
+        return false;
+    }
+    json_ws(&p);
+    if (*p) {
+        chat_msgs_free(&prefix);
+        return false;
+    }
+    if (prefix.len == 0) {
+        chat_msgs_free(&prefix);
+        return true;
+    }
+
+    chat_msgs combined = {0};
+    for (int i = 0; i < prefix.len; i++) {
+        chat_msgs_push(&combined, prefix.v[i]);
+        memset(&prefix.v[i], 0, sizeof(prefix.v[i]));
+    }
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        chat_msgs_push(&combined, msgs->v[i]);
+        memset(&msgs->v[i], 0, sizeof(msgs->v[i]));
+    }
+    free(prefix.v);
+    if (msgs) {
+        free(msgs->v);
+        *msgs = combined;
+    } else {
+        chat_msgs_free(&combined);
+    }
+    return true;
+}
+
 /* Responses API has `reasoning: {"effort": "...", "summary": "..."}`. effort
  * controls thinking depth; summary mode (auto/concise/detailed) controls
  * whether the wire emits summary deltas at all — per the spec, no reasoning
@@ -3663,6 +7011,48 @@ static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
     return true;
 }
 
+static bool parse_responses_conversation(const char **p, char **out) {
+    json_ws(p);
+    free(*out);
+    *out = NULL;
+    if (json_lit(p, "null")) return true;
+    if (**p == '"') return json_string(p, out);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    bool saw_id = false;
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "id")) {
+            saw_id = true;
+            json_ws(p);
+            free(*out);
+            *out = NULL;
+            if (!json_lit(p, "null") && !json_string(p, out)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return saw_id;
+}
+
 static bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -3677,6 +7067,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
     char *tool_schemas = NULL;
+    char *previous_response_id = NULL;
+    char *conversation_id = NULL;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -3751,6 +7143,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                     buf_free(&loaded_tool_schemas);
                     free(instructions);
                     free(tool_schemas);
+                    free(previous_response_id);
+                    free(conversation_id);
                     request_free(r);
                     return false;
                 }
@@ -3762,6 +7156,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 buf_free(&loaded_tool_schemas);
                 free(instructions);
                 free(tool_schemas);
+                free(previous_response_id);
+                free(conversation_id);
                 request_free(r);
                 return false;
             } else if (!json_skip_value(&p)) {
@@ -3815,31 +7211,25 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                  * thinking. Other effort values choose between HIGH and MAX. */
                 if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
             }
-        } else if (!strcmp(key, "previous_response_id") ||
-                   !strcmp(key, "conversation"))
-        {
+        } else if (!strcmp(key, "previous_response_id")) {
             /* Official Responses state can be durable:
              *   previous_response_id chains to a stored prior response, and
              *   conversation points at a persistent Conversations object.
              *
-             * DS4 does not yet implement that durable store.  The supported
-             * modes are either (a) a live in-memory continuation checked by
-             * visible transcript / tool call ids, or (b) stateless replay of
-             * the full input items.  Accepting a non-null durable reference
-             * without loading the referenced items would silently truncate the
-             * prompt, so reject it explicitly. */
+             * DS4 maps both to the same local response-object store keyed by
+             * the visible rendered transcript. A new conversation id starts
+             * empty and is refreshed after each successful turn. */
             json_ws(&p);
-            if (!json_lit(&p, "null")) {
-                snprintf(err, errlen,
-                         "%s is not supported; replay full input instead",
-                         key);
+            free(previous_response_id);
+            previous_response_id = NULL;
+            if (!json_lit(&p, "null") && !json_string(&p, &previous_response_id)) {
                 free(key);
-                chat_msgs_free(&msgs);
-                buf_free(&loaded_tool_schemas);
-                free(instructions);
-                free(tool_schemas);
-                request_free(r);
-                return false;
+                goto bad;
+            }
+        } else if (!strcmp(key, "conversation")) {
+            if (!parse_responses_conversation(&p, &conversation_id)) {
+                free(key);
+                goto bad;
             }
         } else if (!json_skip_value(&p)) {
             free(key);
@@ -3857,8 +7247,64 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         buf_free(&loaded_tool_schemas);
         free(instructions);
         free(tool_schemas);
+        free(previous_response_id);
+        free(conversation_id);
         request_free(r);
         return false;
+    }
+    if (!request_model_supported_by_ds4_server(r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        free(previous_response_id);
+        free(conversation_id);
+        request_free(r);
+        return false;
+    }
+    bool has_previous_response_id =
+        previous_response_id && previous_response_id[0];
+    bool has_conversation_id = conversation_id && conversation_id[0];
+    if (has_previous_response_id && has_conversation_id) {
+        snprintf(err, errlen,
+                 "conversation cannot be combined with previous_response_id");
+        chat_msgs_free(&msgs);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        free(previous_response_id);
+        free(conversation_id);
+        request_free(r);
+        return false;
+    }
+    if (has_conversation_id) {
+        r->responses_conversation_id = xstrdup(conversation_id);
+        bool found = responses_object_store_lookup(
+            s, conversation_id,
+            &r->responses_previous_visible_text,
+            &r->responses_previous_call_ids);
+        if (!found) {
+            char *items_json = NULL;
+            if (conversation_store_lookup_items(s, conversation_id,
+                                                &items_json)) {
+                if (!conversation_items_prepend_messages(
+                        items_json, &msgs, &loaded_tool_schemas,
+                        &r->tool_orders)) {
+                    snprintf(err, errlen,
+                             "conversation items are not supported by this runtime");
+                    free(items_json);
+                    chat_msgs_free(&msgs);
+                    buf_free(&loaded_tool_schemas);
+                    free(instructions);
+                    free(tool_schemas);
+                    free(previous_response_id);
+                    free(conversation_id);
+                    request_free(r);
+                    return false;
+                }
+                free(items_json);
+            }
+        }
     }
     /* instructions in the Responses API replaces any system message — for Codex
      * it carries the full agent system prompt. Prepend it so render produces a
@@ -3891,7 +7337,29 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    const char *response_state_id = has_previous_response_id ?
+        previous_response_id : (has_conversation_id ? conversation_id : NULL);
+    if (response_state_id && !r->responses_previous_visible_text) {
+        bool found = responses_object_store_lookup(s, response_state_id,
+                                           &r->responses_previous_visible_text,
+                                           &r->responses_previous_call_ids);
+        if (!found && has_previous_response_id) {
+            snprintf(err, errlen,
+                     "previous_response_id %s is not available; replay full input instead",
+                     previous_response_id);
+            chat_msgs_free(&msgs);
+            buf_free(&combined_tool_schemas);
+            buf_free(&loaded_tool_schemas);
+            free(instructions);
+            free(tool_schemas);
+            free(previous_response_id);
+            free(conversation_id);
+            request_free(r);
+            return false;
+        }
+    }
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
+                                         &r->responses_previous_call_ids,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
                                          err, errlen)) {
@@ -3900,6 +7368,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         buf_free(&loaded_tool_schemas);
         free(instructions);
         free(tool_schemas);
+        free(previous_response_id);
+        free(conversation_id);
         request_free(r);
         return false;
     }
@@ -3908,21 +7378,338 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+    if (r->responses_previous_visible_text) {
+        char *tail = render_response_prompt_tail(&msgs, 0, r->think_mode,
+                                                 false);
+        buf prompt = {0};
+        buf_puts(&prompt, r->responses_previous_visible_text);
+        buf_puts(&prompt, tail ? tail : "");
+        r->prompt_text = buf_take(&prompt);
+        free(tail);
+    } else {
+        r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
+                                                 &r->tool_orders,
+                                                 r->think_mode);
+    }
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
+    free(previous_response_id);
+    free(conversation_id);
     return true;
 bad:
     chat_msgs_free(&msgs);
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
+    free(previous_response_id);
+    free(conversation_id);
     snprintf(err, errlen, "invalid JSON request");
+    request_free(r);
+    return false;
+}
+
+static bool parse_responses_request_rt(rt_engine *engine, const rt_model_ops *ops,
+                                       server *s,
+                                       const char *body, int def_tokens,
+                                       int ctx_size, request *r,
+                                       char *err, size_t errlen) {
+    request_init(r, REQ_CHAT, def_tokens);
+    r->api = API_RESPONSES;
+    request_set_served_model_from_ops(r, ops);
+    const char *p = body;
+    bool got_input = false;
+    bool tool_choice_none = false;
+    bool got_thinking = false;
+    bool thinking_enabled = true;
+    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    chat_msgs msgs = {0};
+    buf loaded_tool_schemas = {0};
+    char *instructions = NULL;
+    char *tool_schemas = NULL;
+    char *previous_response_id = NULL;
+    char *conversation_id = NULL;
+
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "input")) {
+            chat_msgs_free(&msgs);
+            json_ws(&p);
+            if (*p == '"') {
+                char *plain = NULL;
+                if (!json_string(&p, &plain)) {
+                    free(key);
+                    goto bad;
+                }
+                chat_msg msg = {0};
+                msg.role = xstrdup("user");
+                msg.content = plain;
+                chat_msgs_push(&msgs, msg);
+            } else if (!parse_responses_input_ex(&p, &msgs, &loaded_tool_schemas,
+                                                 &r->tool_orders, true,
+                                                 &r->media)) {
+                free(key);
+                goto bad;
+            }
+            got_input = true;
+        } else if (!strcmp(key, "instructions")) {
+            free(instructions);
+            instructions = NULL;
+            json_ws(&p);
+            if (json_lit(&p, "null")) {
+                instructions = xstrdup("");
+            } else if (!json_string(&p, &instructions)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tools")) {
+            free(tool_schemas);
+            tool_schemas = NULL;
+            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tool_choice")) {
+            json_ws(&p);
+            if (*p == '"') {
+                char *choice = NULL;
+                if (!json_string(&p, &choice)) {
+                    free(key);
+                    goto bad;
+                }
+                if (!strcmp(choice, "none")) {
+                    tool_choice_none = true;
+                } else if (strcmp(choice, "auto") != 0) {
+                    snprintf(err, errlen, "tool_choice=%s not supported", choice);
+                    free(choice);
+                    free(key);
+                    goto fail;
+                }
+                free(choice);
+            } else if (*p == '{') {
+                snprintf(err, errlen, "forced tool_choice not supported");
+                free(key);
+                goto fail;
+            } else if (!json_skip_value(&p)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            if (!json_string(&p, &r->model)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
+            if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "temperature")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->temperature = (float)v;
+        } else if (!strcmp(key, "top_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_p = (float)v;
+        } else if (!strcmp(key, "top_k")) {
+            if (!json_int(&p, &r->top_k)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "min_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->min_p = (float)v;
+        } else if (!strcmp(key, "seed")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->seed = v > 0.0 ? (uint64_t)v : 0;
+        } else if (!strcmp(key, "stream")) {
+            if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "reasoning")) {
+            bool effort_seen = false;
+            if (!parse_responses_reasoning(&p, &reasoning_effort,
+                                           &r->reasoning_summary_emit,
+                                           &effort_seen)) {
+                free(key);
+                goto bad;
+            }
+            if (effort_seen) {
+                got_thinking = true;
+                if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
+            }
+        } else if (!strcmp(key, "previous_response_id")) {
+            json_ws(&p);
+            free(previous_response_id);
+            previous_response_id = NULL;
+            if (!json_lit(&p, "null") && !json_string(&p, &previous_response_id)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "conversation")) {
+            if (!parse_responses_conversation(&p, &conversation_id)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!got_input) {
+        snprintf(err, errlen, "missing input");
+        goto fail;
+    }
+    bool has_previous_response_id =
+        previous_response_id && previous_response_id[0];
+    bool has_conversation_id = conversation_id && conversation_id[0];
+    if (has_previous_response_id && has_conversation_id) {
+        snprintf(err, errlen,
+                 "conversation cannot be combined with previous_response_id");
+        goto fail;
+    }
+    if (has_conversation_id) {
+        r->responses_conversation_id = xstrdup(conversation_id);
+        bool found = responses_object_store_lookup(
+            s, conversation_id,
+            &r->responses_previous_visible_text,
+            &r->responses_previous_call_ids);
+        if (!found) {
+            char *items_json = NULL;
+            if (conversation_store_lookup_items(s, conversation_id,
+                                                &items_json)) {
+                if (!conversation_items_prepend_messages(
+                        items_json, &msgs, &loaded_tool_schemas,
+                        &r->tool_orders)) {
+                    snprintf(err, errlen,
+                             "conversation items are not supported by this runtime");
+                    free(items_json);
+                    goto fail;
+                }
+                free(items_json);
+            }
+        }
+    }
+    if (instructions && instructions[0]) {
+        chat_msg msg = {0};
+        msg.role = xstrdup("system");
+        msg.content = instructions;
+        instructions = NULL;
+        chat_msgs_push(&msgs, msg);
+        if (msgs.len > 1) {
+            chat_msg tmp = msgs.v[msgs.len - 1];
+            for (int i = msgs.len - 1; i > 0; i--) msgs.v[i] = msgs.v[i - 1];
+            msgs.v[0] = tmp;
+        }
+    }
+    buf combined_tool_schemas = {0};
+    if (tool_schemas && tool_schemas[0]) buf_puts(&combined_tool_schemas, tool_schemas);
+    if (loaded_tool_schemas.len) {
+        if (combined_tool_schemas.len) buf_putc(&combined_tool_schemas, '\n');
+        buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
+                   loaded_tool_schemas.len);
+    }
+    const char *active_tool_schemas =
+        (!tool_choice_none && combined_tool_schemas.len) ?
+        combined_tool_schemas.ptr : NULL;
+    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
+    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    r->has_tools = active_tool_schemas && active_tool_schemas[0];
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    const char *response_state_id = has_previous_response_id ?
+        previous_response_id : (has_conversation_id ? conversation_id : NULL);
+    if (response_state_id && !r->responses_previous_visible_text) {
+        bool found = responses_object_store_lookup(s, response_state_id,
+                                           &r->responses_previous_visible_text,
+                                           &r->responses_previous_call_ids);
+        if (!found && has_previous_response_id) {
+            snprintf(err, errlen,
+                     "previous_response_id %s is not available; replay full input instead",
+                     previous_response_id);
+            buf_free(&combined_tool_schemas);
+            goto fail;
+        }
+    }
+    if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
+                                         &r->responses_previous_call_ids,
+                                         &r->responses_requires_live_tool_state,
+                                         &r->responses_requires_live_reasoning,
+                                         err, errlen)) {
+        buf_free(&combined_tool_schemas);
+        goto fail;
+    }
+    kv_cache_restore_tool_memory_for_messages(s, &msgs);
+    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    if (!strcmp(rt_ops_served_model_id(ops), QWEN36_RUNTIME_FAMILY)) {
+        responses_prepare_live_continuation_qwen(r, &msgs);
+    } else {
+        responses_prepare_live_continuation(r, &msgs);
+    }
+    bool ok;
+    if (r->responses_previous_visible_text) {
+        ok = render_runtime_previous_response_request(
+            engine, ops, ctx_size, r, &msgs, active_tool_schemas,
+            thinking_enabled, reasoning_effort, err, errlen);
+    } else {
+        ok = render_runtime_chat_request(engine, ops, ctx_size, r, &msgs,
+                                         active_tool_schemas, thinking_enabled,
+                                         reasoning_effort, err, errlen);
+    }
+    buf_free(&combined_tool_schemas);
+    if (!ok) goto fail;
+    chat_msgs_free(&msgs);
+    buf_free(&loaded_tool_schemas);
+    free(instructions);
+    free(tool_schemas);
+    free(previous_response_id);
+    free(conversation_id);
+    return true;
+bad:
+    snprintf(err, errlen, "invalid JSON request");
+fail:
+    chat_msgs_free(&msgs);
+    buf_free(&loaded_tool_schemas);
+    free(instructions);
+    free(tool_schemas);
+    free(previous_response_id);
+    free(conversation_id);
     request_free(r);
     return false;
 }
@@ -4076,6 +7863,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         request_free(r);
         return false;
     }
+    if (!request_model_supported_by_ds4_server(r, err, errlen)) {
+        free(prompt);
+        request_free(r);
+        return false;
+    }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
@@ -4091,6 +7883,155 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);
     return true;
+bad:
+    free(prompt);
+    snprintf(err, errlen, "invalid JSON request");
+    request_free(r);
+    return false;
+}
+
+static bool parse_completion_request_rt(rt_engine *engine, const rt_model_ops *ops,
+                                        const char *body, int def_tokens,
+                                        int ctx_size, request *r, char *err, size_t errlen) {
+    request_init(r, REQ_COMPLETION, def_tokens);
+    request_set_served_model_from_ops(r, ops);
+    const char *p = body;
+    char *prompt = NULL;
+    bool thinking_enabled = true;
+    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "prompt")) {
+            free(prompt);
+            if (!parse_prompt(&p, &prompt)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            if (!json_string(&p, &r->model)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "max_tokens")) {
+            if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "temperature")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->temperature = (float)v;
+        } else if (!strcmp(key, "top_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_p = (float)v;
+        } else if (!strcmp(key, "min_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->min_p = (float)v;
+        } else if (!strcmp(key, "top_k")) {
+            if (!json_int(&p, &r->top_k)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "seed")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->seed = v > 0.0 ? (uint64_t)v : 0;
+        } else if (!strcmp(key, "stream")) {
+            if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stream_options")) {
+            if (!parse_stream_options(&p, &r->stream_include_usage)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "thinking")) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "reasoning_effort")) {
+            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "think")) {
+            if (!json_bool(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "stop")) {
+            if (!parse_stop(&p, &r->stops)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!prompt) {
+        snprintf(err, errlen, "missing prompt");
+        goto fail;
+    }
+    if (!prompt[0]) {
+        snprintf(err, errlen, "prompt must not be empty");
+        goto fail;
+    }
+    if (!request_model_supported_by_runtime_ops(ops, r, err, errlen)) goto fail;
+    request_set_served_model_from_ops(r, ops);
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled && reasoning_effort != DS4_THINK_NONE,
+                                reasoning_effort),
+        ctx_size);
+    rt_tokens tokens = {0};
+    if (rt_tokenize_text(engine, prompt, &tokens) != 0 || tokens.len == 0) {
+        rt_tokens_free(&tokens);
+        snprintf(err, errlen, "failed to tokenize runtime-core prompt");
+        goto fail;
+    }
+    r->prompt_text = xstrdup(prompt);
+    request_take_rt_tokens(r, &tokens);
+    free(prompt);
+    return true;
+
+fail:
+    free(prompt);
+    request_free(r);
+    return false;
 bad:
     free(prompt);
     snprintf(err, errlen, "invalid JSON request");
@@ -4200,6 +8141,7 @@ static const char *find_any_tool_start(const char *s) {
         strstr(s, DS4_TOOL_CALLS_START),
         strstr(s, DS4_TOOL_CALLS_START_SHORT),
         strstr(s, "<tool_calls>"),
+        strstr(s, "<tool_call>"),
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
@@ -4213,6 +8155,7 @@ static const char *find_any_tool_end(const char *s) {
         strstr(s, DS4_TOOL_CALLS_END),
         strstr(s, DS4_TOOL_CALLS_END_SHORT),
         strstr(s, "</tool_calls>"),
+        strstr(s, "</tool_call>"),
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
@@ -4412,6 +8355,130 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+static char *trimmed_xstrndup(const char *start, size_t n) {
+    while (n > 0 && isspace((unsigned char)*start)) {
+        start++;
+        n--;
+    }
+    while (n > 0 && isspace((unsigned char)start[n - 1])) n--;
+    return xstrndup(start, n);
+}
+
+static bool qwen_xml_value_is_json(const char *value) {
+    const char *p = value ? value : "";
+    json_ws(&p);
+    if (!json_skip_value(&p)) return false;
+    json_ws(&p);
+    return *p == '\0';
+}
+
+static char *qwen_xml_tag_name(const char *tag, const char *prefix) {
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(tag, prefix, prefix_len)) return NULL;
+    const char *start = tag + prefix_len;
+    const char *end = strchr(start, '>');
+    if (!end || end == start) return NULL;
+    return trimmed_xstrndup(start, (size_t)(end - start));
+}
+
+static bool parse_qwen_tool_calls(const char *text,
+                                  const char *tool_search,
+                                  char **content_out,
+                                  char **reasoning_out,
+                                  tool_calls *calls) {
+    const char *start = strstr(tool_search, "<tool_call>");
+    if (!start) return false;
+    size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
+    const char *raw_block_start = start;
+    const char *p = start;
+
+    while ((p = skip_ascii_ws(p)) && !strncmp(p, "<tool_call>", 11)) {
+        p += 11;
+        p = skip_ascii_ws(p);
+        if (strncmp(p, "<function=", 10)) return false;
+        const char *function_tag_end = strchr(p, '>');
+        if (!function_tag_end) return false;
+        char *function_tag = xstrndup(p, (size_t)(function_tag_end - p + 1));
+        char *name = qwen_xml_tag_name(function_tag, "<function=");
+        free(function_tag);
+        if (!name || !name[0]) {
+            free(name);
+            return false;
+        }
+        p = function_tag_end + 1;
+
+        buf args = {0};
+        bool wrote_arg = false;
+        for (;;) {
+            p = skip_ascii_ws(p);
+            if (!strncmp(p, "</function>", 11)) {
+                p += 11;
+                break;
+            }
+            if (strncmp(p, "<parameter=", 11)) {
+                free(name);
+                buf_free(&args);
+                return false;
+            }
+            const char *param_tag_end = strchr(p, '>');
+            if (!param_tag_end) {
+                free(name);
+                buf_free(&args);
+                return false;
+            }
+            char *param_tag = xstrndup(p, (size_t)(param_tag_end - p + 1));
+            char *param_name = qwen_xml_tag_name(param_tag, "<parameter=");
+            free(param_tag);
+            if (!param_name || !param_name[0]) {
+                free(name);
+                free(param_name);
+                buf_free(&args);
+                return false;
+            }
+
+            const char *value_start = param_tag_end + 1;
+            const char *value_end = strstr(value_start, "</parameter>");
+            if (!value_end) {
+                free(name);
+                free(param_name);
+                buf_free(&args);
+                return false;
+            }
+            char *value = trimmed_xstrndup(value_start, (size_t)(value_end - value_start));
+            const char *type = qwen_xml_value_is_json(value) ? "false" : "true";
+            tool_call_json_args_add(&args, param_name, value, type);
+            wrote_arg = true;
+            free(param_name);
+            free(value);
+            p = value_end + strlen("</parameter>");
+        }
+
+        p = skip_ascii_ws(p);
+        if (strncmp(p, "</tool_call>", 12)) {
+            free(name);
+            buf_free(&args);
+            return false;
+        }
+        p += 12;
+
+        tool_call tc = {0};
+        tc.name = name;
+        buf wrapped = {0};
+        buf_putc(&wrapped, '{');
+        if (wrote_arg) buf_puts(&wrapped, args.ptr ? args.ptr : "");
+        buf_putc(&wrapped, '}');
+        tc.arguments = buf_take(&wrapped);
+        tool_calls_push(calls, tc);
+        buf_free(&args);
+    }
+
+    const char *raw_block_end = p;
+    free(calls->raw_dsml);
+    calls->raw_dsml = xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
+    split_reasoning_content(text, content_len, content_out, reasoning_out);
+    return calls->len > 0;
+}
+
 static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls) {
@@ -4454,6 +8521,10 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
         style = start ? 1 : style;
     }
     if (!start) {
+        if (parse_qwen_tool_calls(text, tool_search, content_out,
+                                  reasoning_out, calls)) {
+            return true;
+        }
         split_reasoning_content(text, strlen(text), content_out, reasoning_out);
         return true;
     }
@@ -4690,7 +8761,7 @@ static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const 
 static void append_cors_headers(buf *h) {
     buf_puts(h,
         "Access-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
         "Access-Control-Allow-Headers: *\r\n");
 }
 
@@ -6605,9 +10676,13 @@ static bool responses_final_response(int fd, bool enable_cors,
                                      const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
-    (void)id;
-    char response_id[40], reasoning_id[40], message_id[40];
-    responses_random_id(response_id, sizeof(response_id), "resp_");
+    char generated_response_id[40], reasoning_id[40], message_id[40];
+    const char *response_id = id && !strncmp(id, "resp_", 5) ? id : NULL;
+    if (!response_id) {
+        responses_random_id(generated_response_id,
+                            sizeof(generated_response_id), "resp_");
+        response_id = generated_response_id;
+    }
     responses_random_id(reasoning_id, sizeof(reasoning_id), "rs_");
     responses_random_id(message_id, sizeof(message_id), "msg_");
 
@@ -7628,18 +11703,64 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+typedef struct responses_object_entry responses_object_entry;
+typedef struct conversation_entry conversation_entry;
+
+struct responses_object_entry {
+    char *id;
+    char *visible_text;
+    size_t visible_len;
+    stop_list call_ids;
+    uint64_t created_at;
+    responses_object_entry *prev;
+    responses_object_entry *next;
+};
+
+typedef struct {
+    rax *by_id;
+    responses_object_entry *head;
+    responses_object_entry *tail;
+    int len;
+    int max_entries;
+    char *dir;
+} responses_object_store;
+
+struct conversation_entry {
+    char *id;
+    char *metadata;
+    char *items_json;
+    uint64_t created_at;
+    conversation_entry *prev;
+    conversation_entry *next;
+};
+
+typedef struct {
+    rax *by_id;
+    conversation_entry *head;
+    conversation_entry *tail;
+    int len;
+    int max_entries;
+    char *dir;
+} conversation_store;
+
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
 struct server {
     ds4_engine *engine;
     ds4_session *session;
+    rt_engine *rt_engine;
+    rt_session *rt_session;
+    const rt_model_ops *rt_ops;
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
+    responses_object_store responses_store;
+    conversation_store conversations;
+    bool rt_live_media_state;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -7655,6 +11776,20 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static bool server_uses_runtime_core(const server *s) {
+    return s && s->rt_engine && s->rt_session && s->rt_ops;
+}
+
+static const char *server_served_model_id(const server *s) {
+    if (server_uses_runtime_core(s)) return rt_ops_served_model_id(s->rt_ops);
+    return "deepseek-v4-flash";
+}
+
+static bool model_alias_is_runtime_served(const server *s, const char *model) {
+    return server_uses_runtime_core(s) &&
+           model_alias_is_runtime_ops_served(s->rt_ops, model);
+}
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -7913,8 +12048,9 @@ static void thinking_live_remember(server *s, const char *visible_text) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
-static void responses_live_remember(server *s, const char *visible_text,
-                                    const tool_calls *calls) {
+static void responses_live_remember_at(server *s, const char *visible_text,
+                                       const tool_calls *calls,
+                                       int live_tokens) {
     if (!s || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&s->responses_live);
@@ -7925,21 +12061,32 @@ static void responses_live_remember(server *s, const char *visible_text,
             id_list_push_unique(&s->responses_live.call_ids, calls->v[i].id);
         }
     }
-    s->responses_live.live_tokens = ds4_session_pos(s->session);
+    s->responses_live.live_tokens = live_tokens;
     s->responses_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
 
-static void anthropic_live_remember(server *s, const tool_calls *calls) {
+static void responses_live_remember(server *s, const char *visible_text,
+                                    const tool_calls *calls) {
+    responses_live_remember_at(s, visible_text, calls,
+                               s ? ds4_session_pos(s->session) : 0);
+}
+
+static void anthropic_live_remember_at(server *s, const tool_calls *calls,
+                                       int live_tokens) {
     if (!s || !calls || calls->len == 0) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&s->anthropic_live);
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&s->anthropic_live.call_ids, calls->v[i].id);
     }
-    s->anthropic_live.live_tokens = ds4_session_pos(s->session);
+    s->anthropic_live.live_tokens = live_tokens;
     s->anthropic_live.valid = s->anthropic_live.call_ids.len > 0;
     pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void anthropic_live_remember(server *s, const tool_calls *calls) {
+    anthropic_live_remember_at(s, calls, s ? ds4_session_pos(s->session) : 0);
 }
 
 static void responses_live_clear(server *s) {
@@ -8217,6 +12364,10 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 #define KV_EXT_TOOL_MAP (1u << 0)
 #define KV_EXT_RESPONSES_VISIBLE (1u << 1)
 #define KV_EXT_THINKING_VISIBLE (1u << 2)
+#define KV_EXT_MEDIA_EXACT (1u << 3)
+#define KV_CACHE_RT_GENERIC 0x80u
+#define KV_CACHE_RT_QWEN36  0x81u
+#define KV_CACHE_RT_MISTRAL35 0x82u
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'
@@ -8388,6 +12539,158 @@ static void sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
     hex20(digest, out);
 }
 
+static void sha1_update_u64_le(sha1_ctx *c, uint64_t v) {
+    uint8_t b[8];
+    le_put64(b, v);
+    sha1_update(c, b, sizeof(b));
+}
+
+static void sha1_update_field(sha1_ctx *c, const void *ptr, size_t len) {
+    sha1_update_u64_le(c, (uint64_t)len);
+    if (len > 0 && ptr) sha1_update(c, ptr, len);
+}
+
+static void sha1_update_cstr_field(sha1_ctx *c, const char *s) {
+    sha1_update_field(c, s, s ? strlen(s) : 0);
+}
+
+static void tokens_sha1_hex(const ds4_tokens *tokens, char out[41]) {
+    sha1_ctx c;
+    sha1_init(&c);
+    sha1_update_u64_le(&c, tokens ? (uint64_t)tokens->len : 0);
+    for (int i = 0; tokens && i < tokens->len; i++) {
+        uint8_t b[4];
+        le_put32(b, (uint32_t)tokens->v[i]);
+        sha1_update(&c, b, sizeof(b));
+    }
+    uint8_t digest[20];
+    sha1_final(&c, digest);
+    hex20(digest, out);
+}
+
+static void sha1_update_double_le(sha1_ctx *c, double v) {
+    if (v == 0.0) v = 0.0;
+    union {
+        double d;
+        uint64_t u;
+    } bits = { .d = v };
+    sha1_update_u64_le(c, bits.u);
+}
+
+static void runtime_media_ref_digest_hex(const runtime_media_ref *ref,
+                                         char out[41]) {
+    sha1_ctx c;
+    sha1_init(&c);
+    sha1_update_cstr_field(&c, ref && ref->video ? "video" : "image");
+    sha1_update_cstr_field(&c, ref ? ref->media_type : NULL);
+    sha1_update_cstr_field(&c, ref ? ref->url : NULL);
+    sha1_update_u64_le(&c, ref ? ref->min_pixels : 0);
+    sha1_update_u64_le(&c, ref ? ref->max_pixels : 0);
+    sha1_update_u64_le(&c, ref ? ref->resized_width : 0);
+    sha1_update_u64_le(&c, ref ? ref->resized_height : 0);
+    sha1_update_u64_le(&c, ref ? ref->nframes : 0);
+    sha1_update_u64_le(&c, ref ? ref->min_frames : 0);
+    sha1_update_u64_le(&c, ref ? ref->max_frames : 0);
+    sha1_update_u64_le(&c, ref && ref->has_fps ? 1u : 0u);
+    sha1_update_double_le(&c, ref && ref->has_fps ? ref->fps : 0.0);
+    sha1_update_u64_le(&c, ref && ref->has_video_start ? 1u : 0u);
+    sha1_update_double_le(&c, ref && ref->has_video_start ? ref->video_start : 0.0);
+    sha1_update_u64_le(&c, ref && ref->has_video_end ? 1u : 0u);
+    sha1_update_double_le(&c, ref && ref->has_video_end ? ref->video_end : 0.0);
+
+    const unsigned char *data = ref ? ref->bytes : NULL;
+    size_t len = ref ? ref->bytes_len : 0;
+    unsigned char *owned = NULL;
+    if ((!data || len == 0) && ref && ref->url) {
+        char ignored[160] = {0};
+        if (runtime_media_ref_url_bytes(ref, &owned, &len,
+                                        ignored, sizeof(ignored))) {
+            data = owned;
+        }
+    }
+    if (data && len > 0) {
+        const char *owned_tag = "url-bytes";
+        if (owned && ref && ref->url && !strncmp(ref->url, "file://", 7)) {
+            owned_tag = "file-bytes";
+        }
+        sha1_update_cstr_field(&c, owned ? owned_tag : "inline-bytes");
+        sha1_update_field(&c, data, len);
+    } else {
+        sha1_update_cstr_field(&c, "url-only");
+    }
+    free(owned);
+
+    uint8_t digest[20];
+    sha1_final(&c, digest);
+    hex20(digest, out);
+}
+
+static bool build_runtime_media_cache_key(const request *req,
+                                          const ds4_tokens *tokens,
+                                          const char *prompt_text,
+                                          size_t prompt_text_len,
+                                          char **out,
+                                          size_t *out_len) {
+    if (out) *out = NULL;
+    if (out_len) *out_len = 0;
+    if (!request_has_media(req) || !tokens || !out) return false;
+    if (!prompt_text) prompt_text_len = 0;
+
+    char prompt_sha[41];
+    sha1_bytes_hex(prompt_text ? prompt_text : "", prompt_text_len, prompt_sha);
+    char token_sha[41];
+    tokens_sha1_hex(tokens, token_sha);
+
+    buf b = {0};
+    buf_puts(&b, "ds4-media-v1\n");
+    buf_printf(&b, "prompt-bytes:%llu\n",
+               (unsigned long long)prompt_text_len);
+    buf_printf(&b, "prompt-sha1:%s\n", prompt_sha);
+    buf_printf(&b, "tokens:%d:%s\n", tokens->len, token_sha);
+    buf_printf(&b, "media-count:%d\n", req->media.len);
+    for (int i = 0; i < req->media.len; i++) {
+        const runtime_media_ref *ref = &req->media.v[i];
+        char media_sha[41];
+        char media_type_sha[41];
+        char url_sha[41];
+        runtime_media_ref_digest_hex(ref, media_sha);
+        sha1_bytes_hex(ref->media_type ? ref->media_type : "",
+                       ref->media_type ? strlen(ref->media_type) : 0,
+                       media_type_sha);
+        sha1_bytes_hex(ref->url ? ref->url : "",
+                       ref->url ? strlen(ref->url) : 0,
+                       url_sha);
+        buf_printf(&b,
+                   "media:%d:%c:bytes=%llu:type=%s:url=%s:"
+                   "min_pixels=%llu:max_pixels=%llu:"
+                   "resize=%ux%u:nframes=%u:min_frames=%u:max_frames=%u:"
+                   "fps=%d:%.9g:video_start=%d:%.9g:video_end=%d:%.9g:"
+                   "digest=%s\n",
+                   i,
+                   ref->video ? 'v' : 'i',
+                   (unsigned long long)ref->bytes_len,
+                   media_type_sha,
+                   url_sha,
+                   (unsigned long long)ref->min_pixels,
+                   (unsigned long long)ref->max_pixels,
+                   ref->resized_width,
+                   ref->resized_height,
+                   ref->nframes,
+                   ref->min_frames,
+                   ref->max_frames,
+                   ref->has_fps ? 1 : 0,
+                   ref->has_fps ? ref->fps : 0.0,
+                   ref->has_video_start ? 1 : 0,
+                   ref->has_video_start ? ref->video_start : 0.0,
+                   ref->has_video_end ? 1 : 0,
+                   ref->has_video_end ? ref->video_end : 0.0,
+                   media_sha);
+    }
+    *out = buf_take(&b);
+    if (out_len) *out_len = strlen(*out);
+    return true;
+}
+
 static bool id_list_contains(const stop_list *ids, const char *id) {
     if (!ids || !id || !id[0]) return false;
     for (int i = 0; i < ids->len; i++) {
@@ -8463,6 +12766,1021 @@ static bool mkdir_p(const char *path) {
     return ok;
 }
 
+static void responses_object_entry_free(responses_object_entry *e) {
+    if (!e) return;
+    free(e->id);
+    free(e->visible_text);
+    id_list_free(&e->call_ids);
+    free(e);
+}
+
+static void responses_object_store_init_locked(responses_object_store *st) {
+    if (st->by_id) return;
+    st->by_id = raxNew();
+    if (!st->by_id) die("out of memory");
+    if (st->max_entries <= 0) st->max_entries = 4096;
+}
+
+static void responses_object_unlink(responses_object_store *st,
+                                    responses_object_entry *e) {
+    if (!e) return;
+    if (e->prev) e->prev->next = e->next;
+    else st->head = e->next;
+    if (e->next) e->next->prev = e->prev;
+    else st->tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+static void responses_object_link_head(responses_object_store *st,
+                                       responses_object_entry *e) {
+    e->prev = NULL;
+    e->next = st->head;
+    if (st->head) st->head->prev = e;
+    else st->tail = e;
+    st->head = e;
+}
+
+static bool responses_object_id_safe(const char *id) {
+    if (!id || !id[0]) return false;
+    for (const unsigned char *p = (const unsigned char *)id; *p; p++) {
+        if (isalnum(*p) || *p == '_' || *p == '-') continue;
+        return false;
+    }
+    return true;
+}
+
+static char *responses_object_path(const responses_object_store *st,
+                                   const char *id) {
+    if (!st || !st->dir || !responses_object_id_safe(id)) return NULL;
+    buf name = {0};
+    buf_puts(&name, id);
+    buf_puts(&name, ".resp");
+    char *path = path_join(st->dir, name.ptr ? name.ptr : "");
+    buf_free(&name);
+    return path;
+}
+
+#define RESPONSES_OBJECT_HEADER 24u
+#define RESPONSES_OBJECT_MAX_VISIBLE (64u * 1024u * 1024u)
+#define RESPONSES_OBJECT_MAX_CALL_IDS 16384u
+#define RESPONSES_OBJECT_MAX_CALL_ID 4096u
+
+static bool responses_object_write_disk(const responses_object_store *st,
+                                        const responses_object_entry *e) {
+    if (!st || !st->dir || !e || !e->id || !e->visible_text) return false;
+    if (e->visible_len > UINT32_MAX ||
+        (uint64_t)e->call_ids.len > UINT32_MAX) return false;
+    char *path = responses_object_path(st, e->id);
+    if (!path) return false;
+    buf tmpb = {0};
+    buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
+    char *tmp = buf_take(&tmpb);
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) {
+        free(tmp);
+        free(path);
+        return false;
+    }
+    uint8_t h[RESPONSES_OBJECT_HEADER] = {
+        'D', 'S', '4', 'R', 'S', 'P', '1', '\0'
+    };
+    le_put32(h + 8, (uint32_t)e->visible_len);
+    le_put32(h + 12, (uint32_t)e->call_ids.len);
+    le_put64(h + 16, e->created_at);
+    bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+              fwrite(e->visible_text, 1, e->visible_len, fp) == e->visible_len;
+    for (int i = 0; ok && i < e->call_ids.len; i++) {
+        const char *id = e->call_ids.v[i] ? e->call_ids.v[i] : "";
+        size_t len = strlen(id);
+        if (len > UINT32_MAX) {
+            ok = false;
+            break;
+        }
+        uint8_t lb[4];
+        le_put32(lb, (uint32_t)len);
+        ok = fwrite(lb, 1, sizeof(lb), fp) == sizeof(lb) &&
+             fwrite(id, 1, len, fp) == len;
+    }
+    ok = ok && fflush(fp) == 0;
+    if (fclose(fp) != 0) ok = false;
+    if (ok && rename(tmp, path) != 0) ok = false;
+    if (!ok) unlink(tmp);
+    free(tmp);
+    free(path);
+    return ok;
+}
+
+static bool responses_object_read_disk(const responses_object_store *st,
+                                       const char *id,
+                                       char **visible_text_out,
+                                       stop_list *call_ids_out,
+                                       uint64_t *created_at_out) {
+    if (visible_text_out) *visible_text_out = NULL;
+    if (call_ids_out) memset(call_ids_out, 0, sizeof(*call_ids_out));
+    if (created_at_out) *created_at_out = 0;
+    char *path = responses_object_path(st, id);
+    if (!path) return false;
+    FILE *fp = fopen(path, "rb");
+    free(path);
+    if (!fp) return false;
+    uint8_t h[RESPONSES_OBJECT_HEADER];
+    bool ok = fread(h, 1, sizeof(h), fp) == sizeof(h) &&
+              h[0] == 'D' && h[1] == 'S' && h[2] == '4' &&
+              h[3] == 'R' && h[4] == 'S' && h[5] == 'P' &&
+              h[6] == '1';
+    uint32_t visible_len = ok ? le_get32(h + 8) : 0;
+    uint32_t call_count = ok ? le_get32(h + 12) : 0;
+    uint64_t created_at = ok ? le_get64(h + 16) : 0;
+    char *visible = NULL;
+    stop_list ids = {0};
+    if (ok && (visible_len > RESPONSES_OBJECT_MAX_VISIBLE ||
+               call_count > RESPONSES_OBJECT_MAX_CALL_IDS)) {
+        ok = false;
+    }
+    if (ok) {
+        visible = xmalloc((size_t)visible_len + 1);
+        ok = fread(visible, 1, visible_len, fp) == visible_len;
+        if (ok) visible[visible_len] = '\0';
+    }
+    for (uint32_t i = 0; ok && i < call_count; i++) {
+        uint8_t lb[4];
+        if (fread(lb, 1, sizeof(lb), fp) != sizeof(lb)) {
+            ok = false;
+            break;
+        }
+        uint32_t len = le_get32(lb);
+        if (len > RESPONSES_OBJECT_MAX_CALL_ID) {
+            ok = false;
+            break;
+        }
+        char *call_id = xmalloc((size_t)len + 1);
+        if (fread(call_id, 1, len, fp) != len) {
+            free(call_id);
+            ok = false;
+            break;
+        }
+        call_id[len] = '\0';
+        stop_list_push(&ids, call_id);
+    }
+    fclose(fp);
+    if (!ok) {
+        free(visible);
+        id_list_free(&ids);
+        return false;
+    }
+    if (visible_text_out) *visible_text_out = visible;
+    else free(visible);
+    if (call_ids_out) *call_ids_out = ids;
+    else id_list_free(&ids);
+    if (created_at_out) *created_at_out = created_at;
+    return true;
+}
+
+static responses_object_entry *responses_object_find_locked(
+        responses_object_store *st, const char *id) {
+    if (!st || !st->by_id || !id || !id[0]) return NULL;
+    void *v = raxFind(st->by_id, (unsigned char *)id, strlen(id));
+    return v == raxNotFound ? NULL : v;
+}
+
+static void responses_object_remove_locked(responses_object_store *st,
+                                           responses_object_entry *e) {
+    if (!st || !e) return;
+    if (st->by_id && e->id) {
+        void *old = NULL;
+        (void)raxRemove(st->by_id, (unsigned char *)e->id, strlen(e->id), &old);
+    }
+    responses_object_unlink(st, e);
+    if (st->len > 0) st->len--;
+    responses_object_entry_free(e);
+}
+
+static void responses_object_put_locked(responses_object_store *st,
+                                        const char *id,
+                                        const char *visible_text,
+                                        const stop_list *call_ids,
+                                        uint64_t created_at,
+                                        bool write_disk) {
+    if (!id || !id[0] || !visible_text || !visible_text[0]) return;
+    responses_object_store_init_locked(st);
+    responses_object_entry *old = responses_object_find_locked(st, id);
+    if (old) responses_object_remove_locked(st, old);
+
+    responses_object_entry *e = xmalloc(sizeof(*e));
+    memset(e, 0, sizeof(*e));
+    e->id = xstrdup(id);
+    e->visible_text = xstrdup(visible_text);
+    e->visible_len = strlen(e->visible_text);
+    e->created_at = created_at ? created_at : (uint64_t)time(NULL);
+    for (int i = 0; call_ids && i < call_ids->len; i++) {
+        id_list_push_unique(&e->call_ids, call_ids->v[i]);
+    }
+    if (!raxInsert(st->by_id, (unsigned char *)e->id, strlen(e->id), e, NULL)) {
+        responses_object_entry_free(e);
+        die("out of memory");
+    }
+    responses_object_link_head(st, e);
+    st->len++;
+    while (st->max_entries > 0 && st->len > st->max_entries && st->tail) {
+        responses_object_remove_locked(st, st->tail);
+    }
+    if (write_disk) (void)responses_object_write_disk(st, e);
+}
+
+static void responses_object_store_set_dir(server *s, const char *dir) {
+    if (!s) return;
+    free(s->responses_store.dir);
+    s->responses_store.dir = dir && dir[0] ? xstrdup(dir) : NULL;
+    conversation_store_set_dir(s, dir);
+}
+
+static void responses_object_store_remember(server *s, const char *id,
+                                            const char *visible_text,
+                                            const tool_calls *calls) {
+    if (!s || !id || !id[0] || !visible_text || !visible_text[0]) return;
+    stop_list call_ids = {0};
+    for (int i = 0; calls && i < calls->len; i++) {
+        id_list_push_unique(&call_ids, calls->v[i].id);
+    }
+    pthread_mutex_lock(&s->tool_mu);
+    responses_object_put_locked(&s->responses_store, id, visible_text,
+                                &call_ids, (uint64_t)time(NULL), true);
+    pthread_mutex_unlock(&s->tool_mu);
+    id_list_free(&call_ids);
+}
+
+static void responses_object_store_remember_response_state(
+        server *s, const request *r, const char *response_id,
+        const char *visible_text, const tool_calls *calls) {
+    responses_object_store_remember(s, response_id, visible_text, calls);
+    if (!r || !r->responses_conversation_id ||
+        !r->responses_conversation_id[0]) return;
+    (void)conversation_store_touch(s, r->responses_conversation_id);
+    if (response_id && !strcmp(response_id, r->responses_conversation_id)) return;
+    responses_object_store_remember(s, r->responses_conversation_id,
+                                    visible_text, calls);
+}
+
+static bool responses_object_store_lookup(server *s, const char *id,
+                                          char **visible_text_out,
+                                          stop_list *call_ids_out) {
+    if (visible_text_out) *visible_text_out = NULL;
+    if (call_ids_out) memset(call_ids_out, 0, sizeof(*call_ids_out));
+    if (!s || !id || !id[0]) return false;
+
+    pthread_mutex_lock(&s->tool_mu);
+    responses_object_entry *e =
+        responses_object_find_locked(&s->responses_store, id);
+    if (e) {
+        if (e != s->responses_store.head) {
+            responses_object_unlink(&s->responses_store, e);
+            responses_object_link_head(&s->responses_store, e);
+        }
+        if (visible_text_out) *visible_text_out = xstrdup(e->visible_text);
+        for (int i = 0; call_ids_out && i < e->call_ids.len; i++) {
+            id_list_push_unique(call_ids_out, e->call_ids.v[i]);
+        }
+        pthread_mutex_unlock(&s->tool_mu);
+        return true;
+    }
+    char *dir = s->responses_store.dir ? xstrdup(s->responses_store.dir) : NULL;
+    pthread_mutex_unlock(&s->tool_mu);
+    if (!dir) return false;
+
+    responses_object_store disk = { .dir = dir };
+    char *visible = NULL;
+    stop_list ids = {0};
+    uint64_t created_at = 0;
+    bool ok = responses_object_read_disk(&disk, id, &visible, &ids, &created_at);
+    free(dir);
+    if (!ok) return false;
+
+    pthread_mutex_lock(&s->tool_mu);
+    responses_object_put_locked(&s->responses_store, id, visible, &ids,
+                                created_at, false);
+    pthread_mutex_unlock(&s->tool_mu);
+    if (visible_text_out) {
+        *visible_text_out = visible;
+    } else {
+        free(visible);
+    }
+    if (call_ids_out) {
+        *call_ids_out = ids;
+    } else {
+        id_list_free(&ids);
+    }
+    return true;
+}
+
+static void responses_object_store_free(server *s) {
+    if (!s) return;
+    responses_object_store *st = &s->responses_store;
+    while (st->tail) responses_object_remove_locked(st, st->tail);
+    if (st->by_id) raxFree(st->by_id);
+    free(st->dir);
+    memset(st, 0, sizeof(*st));
+}
+
+static void responses_object_store_delete(server *s, const char *id) {
+    if (!s || !id || !id[0]) return;
+    char *path = NULL;
+    pthread_mutex_lock(&s->tool_mu);
+    responses_object_entry *e =
+        responses_object_find_locked(&s->responses_store, id);
+    if (e) responses_object_remove_locked(&s->responses_store, e);
+    path = responses_object_path(&s->responses_store, id);
+    pthread_mutex_unlock(&s->tool_mu);
+    if (path) {
+        unlink(path);
+        free(path);
+    }
+}
+
+static void conversation_entry_free(conversation_entry *e) {
+    if (!e) return;
+    free(e->id);
+    free(e->metadata);
+    free(e->items_json);
+    free(e);
+}
+
+static void conversation_store_init_locked(conversation_store *st) {
+    if (st->by_id) return;
+    st->by_id = raxNew();
+    if (!st->by_id) die("out of memory");
+    if (st->max_entries <= 0) st->max_entries = 4096;
+}
+
+static void conversation_unlink(conversation_store *st,
+                                conversation_entry *e) {
+    if (!e) return;
+    if (e->prev) e->prev->next = e->next;
+    else st->head = e->next;
+    if (e->next) e->next->prev = e->prev;
+    else st->tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+static void conversation_link_head(conversation_store *st,
+                                   conversation_entry *e) {
+    e->prev = NULL;
+    e->next = st->head;
+    if (st->head) st->head->prev = e;
+    else st->tail = e;
+    st->head = e;
+}
+
+static char *conversation_path(const conversation_store *st,
+                               const char *id) {
+    if (!st || !st->dir || !responses_object_id_safe(id)) return NULL;
+    buf name = {0};
+    buf_puts(&name, id);
+    buf_puts(&name, ".conv");
+    char *path = path_join(st->dir, name.ptr ? name.ptr : "");
+    buf_free(&name);
+    return path;
+}
+
+static bool conversation_write_disk(const conversation_store *st,
+                                    const conversation_entry *e) {
+    if (!st || !st->dir || !e || !e->id || !e->metadata) return false;
+    char *path = conversation_path(st, e->id);
+    if (!path) return false;
+    const char *items = e->items_json ? e->items_json : "[]";
+    buf tmpb = {0};
+    buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
+    char *tmp = buf_take(&tmpb);
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) {
+        free(tmp);
+        free(path);
+        return false;
+    }
+    size_t metadata_len = strlen(e->metadata);
+    size_t items_len = strlen(items);
+    bool ok = fprintf(fp, "DS4CONV2\n%llu\n%llu\n%llu\n",
+                      (unsigned long long)e->created_at,
+                      (unsigned long long)metadata_len,
+                      (unsigned long long)items_len) > 0 &&
+              fwrite(e->metadata, 1, metadata_len, fp) == metadata_len &&
+              fwrite(items, 1, items_len, fp) == items_len &&
+              fflush(fp) == 0;
+    if (fclose(fp) != 0) ok = false;
+    if (ok && rename(tmp, path) != 0) ok = false;
+    if (!ok) unlink(tmp);
+    free(tmp);
+    free(path);
+    return ok;
+}
+
+static bool conversation_metadata_valid(const char *metadata) {
+    const char *p = metadata ? metadata : "{}";
+    json_ws(&p);
+    if (*p != '{') return false;
+    if (!json_skip_value(&p)) return false;
+    json_ws(&p);
+    return *p == '\0';
+}
+
+static bool json_object_has_key_shallow(const char *json, const char *needle) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        bool found = key && needle && !strcmp(key, needle);
+        free(key);
+        json_ws(&p);
+        if (*p != ':') return false;
+        p++;
+        if (!json_skip_value(&p)) return false;
+        if (found) return true;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return false;
+}
+
+static char *json_object_string_field_shallow(const char *json,
+                                              const char *field) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return NULL;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return NULL;
+        }
+        p++;
+        if (key && field && !strcmp(key, field)) {
+            free(key);
+            char *value = NULL;
+            if (!json_string(&p, &value)) return NULL;
+            return value;
+        }
+        free(key);
+        if (!json_skip_value(&p)) return NULL;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return NULL;
+}
+
+static bool conversation_items_valid(const char *items_json) {
+    const char *p = items_json ? items_json : "[]";
+    chat_msgs msgs = {0};
+    buf loaded = {0};
+    tool_schema_orders orders = {0};
+    bool ok = parse_responses_input(&p, &msgs, &loaded, &orders);
+    json_ws(&p);
+    ok = ok && *p == '\0';
+    chat_msgs_free(&msgs);
+    buf_free(&loaded);
+    tool_schema_orders_free(&orders);
+    return ok;
+}
+
+static bool conversation_items_empty(const char *items_json) {
+    const char *p = items_json ? items_json : "[]";
+    json_ws(&p);
+    if (*p != '[') return true;
+    p++;
+    json_ws(&p);
+    return *p == ']';
+}
+
+static bool conversation_items_normalize_array_at(const char **p,
+                                                  char **items_out,
+                                                  int max_items,
+                                                  char *err,
+                                                  size_t errlen) {
+    if (items_out) *items_out = NULL;
+    json_ws(p);
+    if (**p != '[') {
+        snprintf(err, errlen, "conversation.items must be an array");
+        return false;
+    }
+    (*p)++;
+    buf out = {0};
+    buf_putc(&out, '[');
+    int count = 0;
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p != '{') {
+            snprintf(err, errlen, "conversation.items entries must be objects");
+            buf_free(&out);
+            return false;
+        }
+        char *raw = NULL;
+        if (!json_raw_value(p, &raw)) {
+            snprintf(err, errlen, "invalid conversation.items JSON");
+            buf_free(&out);
+            return false;
+        }
+        char *item = json_minify_raw_value(raw);
+        free(raw);
+        if (!item || item[0] != '{') {
+            free(item);
+            snprintf(err, errlen, "conversation.items entries must be objects");
+            buf_free(&out);
+            return false;
+        }
+        count++;
+        if (max_items > 0 && count > max_items) {
+            free(item);
+            snprintf(err, errlen, "conversation.items accepts at most %d items",
+                     max_items);
+            buf_free(&out);
+            return false;
+        }
+        if (count > 1) buf_putc(&out, ',');
+        bool has_id = json_object_has_key_shallow(item, "id");
+        bool has_status = json_object_has_key_shallow(item, "status");
+        if (!has_id || !has_status) {
+            char id[40];
+            responses_random_id(id, sizeof(id), "msg_");
+            buf_putc(&out, '{');
+            bool need_comma = false;
+            if (!has_id) {
+                buf_puts(&out, "\"id\":");
+                json_escape(&out, id);
+                need_comma = true;
+            }
+            if (!has_status) {
+                if (need_comma) buf_putc(&out, ',');
+                buf_puts(&out, "\"status\":\"completed\"");
+                need_comma = true;
+            }
+            if (item[1] != '}') {
+                if (need_comma) buf_putc(&out, ',');
+                buf_puts(&out, item + 1);
+            } else {
+                buf_putc(&out, '}');
+            }
+        } else {
+            buf_puts(&out, item);
+        }
+        free(item);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') {
+        snprintf(err, errlen, "invalid conversation.items JSON");
+        buf_free(&out);
+        return false;
+    }
+    (*p)++;
+    buf_putc(&out, ']');
+    char *items = buf_take(&out);
+    if (!conversation_items_valid(items)) {
+        free(items);
+        snprintf(err, errlen,
+                 "conversation.items supports completed text/tool items only");
+        return false;
+    }
+    if (items_out) *items_out = items;
+    else free(items);
+    return true;
+}
+
+static char *conversation_items_concat(const char *a, const char *b) {
+    if (conversation_items_empty(a)) return xstrdup(b && b[0] ? b : "[]");
+    if (conversation_items_empty(b)) return xstrdup(a && a[0] ? a : "[]");
+    buf out = {0};
+    const char *pa = a ? a : "[]";
+    const char *pb = b ? b : "[]";
+    size_t la = strlen(pa);
+    size_t lb = strlen(pb);
+    if (la < 2 || lb < 2) return xstrdup("[]");
+    buf_append(&out, pa, la - 1);
+    buf_putc(&out, ',');
+    buf_append(&out, pb + 1, lb - 1);
+    return buf_take(&out);
+}
+
+static char *conversation_items_find_object(const char *items_json,
+                                            const char *item_id) {
+    if (!item_id || !item_id[0]) return NULL;
+    const char *p = items_json ? items_json : "[]";
+    json_ws(&p);
+    if (*p != '[') return NULL;
+    p++;
+    json_ws(&p);
+    while (*p && *p != ']') {
+        if (*p != '{') return NULL;
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) return NULL;
+        char *item = json_minify_raw_value(raw);
+        free(raw);
+        char *id = json_object_string_field_shallow(item, "id");
+        bool match = id && !strcmp(id, item_id);
+        free(id);
+        if (match) return item;
+        free(item);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return NULL;
+}
+
+static bool conversation_items_remove_object(const char *items_json,
+                                             const char *item_id,
+                                             char **items_out,
+                                             bool *removed_out) {
+    if (items_out) *items_out = NULL;
+    if (removed_out) *removed_out = false;
+    const char *p = items_json ? items_json : "[]";
+    json_ws(&p);
+    if (*p != '[') return false;
+    p++;
+    buf out = {0};
+    buf_putc(&out, '[');
+    int kept = 0;
+    bool removed = false;
+    json_ws(&p);
+    while (*p && *p != ']') {
+        if (*p != '{') {
+            buf_free(&out);
+            return false;
+        }
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) {
+            buf_free(&out);
+            return false;
+        }
+        char *item = json_minify_raw_value(raw);
+        free(raw);
+        char *id = json_object_string_field_shallow(item, "id");
+        bool match = id && item_id && !strcmp(id, item_id);
+        free(id);
+        if (match) {
+            removed = true;
+            free(item);
+        } else {
+            if (kept++) buf_putc(&out, ',');
+            buf_puts(&out, item);
+            free(item);
+        }
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != ']') {
+        buf_free(&out);
+        return false;
+    }
+    buf_putc(&out, ']');
+    if (items_out) *items_out = buf_take(&out);
+    else buf_free(&out);
+    if (removed_out) *removed_out = removed;
+    return true;
+}
+
+static void conversation_items_first_last(const char *items_json,
+                                          char **first_out,
+                                          char **last_out) {
+    if (first_out) *first_out = NULL;
+    if (last_out) *last_out = NULL;
+    const char *p = items_json ? items_json : "[]";
+    json_ws(&p);
+    if (*p != '[') return;
+    p++;
+    json_ws(&p);
+    while (*p && *p != ']') {
+        if (*p != '{') return;
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) return;
+        char *item = json_minify_raw_value(raw);
+        free(raw);
+        char *id = json_object_string_field_shallow(item, "id");
+        if (id && id[0]) {
+            if (first_out && !*first_out) *first_out = xstrdup(id);
+            if (last_out) {
+                free(*last_out);
+                *last_out = xstrdup(id);
+            }
+        }
+        free(id);
+        free(item);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+}
+
+static bool conversation_read_disk(const conversation_store *st,
+                                   const char *id,
+                                   char **metadata_out,
+                                   char **items_json_out,
+                                   uint64_t *created_at_out) {
+    if (metadata_out) *metadata_out = NULL;
+    if (items_json_out) *items_json_out = NULL;
+    if (created_at_out) *created_at_out = 0;
+    char *path = conversation_path(st, id);
+    if (!path) return false;
+    FILE *fp = fopen(path, "rb");
+    free(path);
+    if (!fp) return false;
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return false;
+    }
+    long n = ftell(fp);
+    if (n < 0 || n > 1024 * 1024 || fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return false;
+    }
+    char *raw = xmalloc((size_t)n + 1);
+    bool ok = fread(raw, 1, (size_t)n, fp) == (size_t)n;
+    fclose(fp);
+    raw[n] = '\0';
+    const char *p = raw;
+    bool v2 = false;
+    if (ok && strncmp(p, "DS4CONV2\n", 9) == 0) {
+        v2 = true;
+    } else if (ok && strncmp(p, "DS4CONV1\n", 9) != 0) {
+        ok = false;
+    }
+    if (ok) p += 9;
+    char *end = NULL;
+    uint64_t created_at = 0;
+    if (ok) {
+        unsigned long long v = strtoull(p, &end, 10);
+        if (end == p || *end != '\n') ok = false;
+        else {
+            created_at = (uint64_t)v;
+            p = end + 1;
+        }
+    }
+    char *metadata = NULL;
+    char *items_json = NULL;
+    if (ok && v2) {
+        unsigned long long metadata_len = 0;
+        unsigned long long items_len = 0;
+        metadata_len = strtoull(p, &end, 10);
+        if (end == p || *end != '\n') ok = false;
+        else p = end + 1;
+        if (ok) {
+            items_len = strtoull(p, &end, 10);
+            if (end == p || *end != '\n') ok = false;
+            else p = end + 1;
+        }
+        size_t remain = ok ? strlen(p) : 0;
+        if (ok && (metadata_len > remain || items_len > remain - metadata_len)) {
+            ok = false;
+        }
+        if (ok) {
+            metadata = xstrndup(p, (size_t)metadata_len);
+            items_json = xstrndup(p + metadata_len, (size_t)items_len);
+            ok = conversation_metadata_valid(metadata) &&
+                 conversation_items_valid(items_json);
+        }
+    } else if (ok) {
+        metadata = json_minify_raw_value(p);
+        items_json = xstrdup("[]");
+        ok = conversation_metadata_valid(metadata);
+    }
+    free(raw);
+    if (!ok) {
+        free(metadata);
+        free(items_json);
+        return false;
+    }
+    if (metadata_out) *metadata_out = metadata;
+    else free(metadata);
+    if (items_json_out) *items_json_out = items_json;
+    else free(items_json);
+    if (created_at_out) *created_at_out = created_at;
+    return true;
+}
+
+static conversation_entry *conversation_find_locked(
+        conversation_store *st, const char *id) {
+    if (!st || !st->by_id || !id || !id[0]) return NULL;
+    void *v = raxFind(st->by_id, (unsigned char *)id, strlen(id));
+    return v == raxNotFound ? NULL : v;
+}
+
+static void conversation_remove_locked(conversation_store *st,
+                                       conversation_entry *e) {
+    if (!st || !e) return;
+    if (st->by_id && e->id) {
+        void *old = NULL;
+        (void)raxRemove(st->by_id, (unsigned char *)e->id, strlen(e->id), &old);
+    }
+    conversation_unlink(st, e);
+    if (st->len > 0) st->len--;
+    conversation_entry_free(e);
+}
+
+static void conversation_put_locked(conversation_store *st,
+                                    const char *id,
+                                    const char *metadata,
+                                    const char *items_json,
+                                    uint64_t created_at,
+                                    bool write_disk) {
+    if (!id || !id[0]) return;
+    conversation_store_init_locked(st);
+    conversation_entry *old = conversation_find_locked(st, id);
+    if (old) conversation_remove_locked(st, old);
+
+    conversation_entry *e = xmalloc(sizeof(*e));
+    memset(e, 0, sizeof(*e));
+    e->id = xstrdup(id);
+    e->metadata = xstrdup(metadata && metadata[0] ? metadata : "{}");
+    e->items_json = xstrdup(items_json && items_json[0] ? items_json : "[]");
+    e->created_at = created_at ? created_at : (uint64_t)time(NULL);
+    if (!raxInsert(st->by_id, (unsigned char *)e->id, strlen(e->id), e, NULL)) {
+        conversation_entry_free(e);
+        die("out of memory");
+    }
+    conversation_link_head(st, e);
+    st->len++;
+    while (st->max_entries > 0 && st->len > st->max_entries && st->tail) {
+        conversation_remove_locked(st, st->tail);
+    }
+    if (write_disk) (void)conversation_write_disk(st, e);
+}
+
+static void conversation_store_set_dir(server *s, const char *dir) {
+    if (!s) return;
+    free(s->conversations.dir);
+    s->conversations.dir = dir && dir[0] ? xstrdup(dir) : NULL;
+}
+
+static bool conversation_store_lookup_full(server *s, const char *id,
+                                           char **metadata_out,
+                                           char **items_json_out,
+                                           uint64_t *created_at_out) {
+    if (metadata_out) *metadata_out = NULL;
+    if (items_json_out) *items_json_out = NULL;
+    if (created_at_out) *created_at_out = 0;
+    if (!s || !id || !id[0]) return false;
+
+    pthread_mutex_lock(&s->tool_mu);
+    conversation_entry *e =
+        conversation_find_locked(&s->conversations, id);
+    if (e) {
+        if (e != s->conversations.head) {
+            conversation_unlink(&s->conversations, e);
+            conversation_link_head(&s->conversations, e);
+        }
+        if (metadata_out) *metadata_out = xstrdup(e->metadata);
+        if (items_json_out) {
+            *items_json_out = xstrdup(e->items_json ? e->items_json : "[]");
+        }
+        if (created_at_out) *created_at_out = e->created_at;
+        pthread_mutex_unlock(&s->tool_mu);
+        return true;
+    }
+    char *dir = s->conversations.dir ? xstrdup(s->conversations.dir) : NULL;
+    pthread_mutex_unlock(&s->tool_mu);
+    if (!dir) return false;
+
+    conversation_store disk = { .dir = dir };
+    char *metadata = NULL;
+    char *items_json = NULL;
+    uint64_t created_at = 0;
+    bool ok = conversation_read_disk(&disk, id, &metadata, &items_json,
+                                     &created_at);
+    free(dir);
+    if (!ok) return false;
+
+    pthread_mutex_lock(&s->tool_mu);
+    conversation_put_locked(&s->conversations, id, metadata, items_json,
+                            created_at, false);
+    pthread_mutex_unlock(&s->tool_mu);
+    if (metadata_out) *metadata_out = metadata;
+    else free(metadata);
+    if (items_json_out) *items_json_out = items_json;
+    else free(items_json);
+    if (created_at_out) *created_at_out = created_at;
+    return true;
+}
+
+static bool conversation_store_lookup(server *s, const char *id,
+                                      char **metadata_out,
+                                      uint64_t *created_at_out) {
+    return conversation_store_lookup_full(s, id, metadata_out, NULL,
+                                          created_at_out);
+}
+
+static bool conversation_store_lookup_items(server *s, const char *id,
+                                            char **items_json_out) {
+    return conversation_store_lookup_full(s, id, NULL, items_json_out, NULL);
+}
+
+static bool conversation_store_upsert_full(server *s, const char *id,
+                                           const char *metadata,
+                                           const char *items_json,
+                                           uint64_t created_at) {
+    if (!s || !id || !id[0] || !responses_object_id_safe(id) ||
+        !conversation_metadata_valid(metadata) ||
+        (items_json && !conversation_items_valid(items_json))) {
+        return false;
+    }
+    pthread_mutex_lock(&s->tool_mu);
+    char *preserved_items = NULL;
+    const char *items_src = items_json;
+    if (!items_src) {
+        conversation_entry *old = conversation_find_locked(&s->conversations,
+                                                           id);
+        if (old && old->items_json) {
+            preserved_items = xstrdup(old->items_json);
+            items_src = preserved_items;
+        }
+    }
+    conversation_put_locked(&s->conversations, id, metadata,
+                            items_src ? items_src : "[]",
+                            created_at, true);
+    pthread_mutex_unlock(&s->tool_mu);
+    free(preserved_items);
+    return true;
+}
+
+static bool conversation_store_upsert(server *s, const char *id,
+                                      const char *metadata,
+                                      uint64_t created_at) {
+    return conversation_store_upsert_full(s, id, metadata, NULL, created_at);
+}
+
+static bool conversation_store_append_items(server *s, const char *id,
+                                            const char *items_json) {
+    if (!s || !id || !id[0] || !responses_object_id_safe(id) ||
+        !conversation_items_valid(items_json)) {
+        return false;
+    }
+    char *metadata = NULL;
+    char *old_items = NULL;
+    uint64_t created_at = 0;
+    if (!conversation_store_lookup_full(s, id, &metadata, &old_items,
+                                        &created_at)) {
+        return false;
+    }
+    char *combined = conversation_items_concat(old_items, items_json);
+    bool ok = conversation_store_upsert_full(s, id, metadata, combined,
+                                             created_at);
+    free(metadata);
+    free(old_items);
+    free(combined);
+    return ok;
+}
+
+static bool conversation_store_touch(server *s, const char *id) {
+    if (!s || !id || !id[0] || !responses_object_id_safe(id)) return false;
+    char *metadata = NULL;
+    char *items_json = NULL;
+    uint64_t created_at = 0;
+    if (conversation_store_lookup_full(s, id, &metadata, &items_json,
+                                       &created_at)) {
+        free(metadata);
+        free(items_json);
+        return true;
+    }
+    return conversation_store_upsert_full(s, id, "{}", "[]", 0);
+}
+
+static bool conversation_store_delete(server *s, const char *id) {
+    if (!s || !id || !id[0] || !responses_object_id_safe(id)) return false;
+    bool existed = false;
+    char *path = NULL;
+    pthread_mutex_lock(&s->tool_mu);
+    conversation_entry *e = conversation_find_locked(&s->conversations, id);
+    if (e) {
+        existed = true;
+        conversation_remove_locked(&s->conversations, e);
+    }
+    path = conversation_path(&s->conversations, id);
+    pthread_mutex_unlock(&s->tool_mu);
+    if (path) {
+        if (unlink(path) == 0) existed = true;
+        free(path);
+    }
+    if (existed) responses_object_store_delete(s, id);
+    return existed;
+}
+
+static void conversation_store_free(server *s) {
+    if (!s) return;
+    conversation_store *st = &s->conversations;
+    while (st->tail) conversation_remove_locked(st, st->tail);
+    if (st->by_id) raxFree(st->by_id);
+    free(st->dir);
+    memset(st, 0, sizeof(*st));
+}
+
 static void kv_entry_free(kv_entry *e) {
     free(e->path);
     memset(e, 0, sizeof(*e));
@@ -8507,6 +13825,28 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
         best = s;
         best_end = e + strlen(forms[i].end);
     }
+
+    const char *qwen = strstr(p, "<tool_call>");
+    if (qwen && (!best || qwen < best)) {
+        const char *q = qwen;
+        const char *q_end = NULL;
+        for (;;) {
+            q = skip_ascii_ws(q);
+            if (strncmp(q, "<tool_call>", 11)) break;
+            const char *e = strstr(q, "</tool_call>");
+            if (!e) {
+                q_end = NULL;
+                break;
+            }
+            q_end = e + strlen("</tool_call>");
+            q = q_end;
+        }
+        if (q_end) {
+            best = qwen;
+            best_end = q_end;
+        }
+    }
+
     if (end_out) *end_out = best_end;
     return best;
 }
@@ -8689,6 +14029,34 @@ static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
     le_put64(h + 40, payload_bytes);
 }
 
+static bool kv_cache_tag_valid(uint8_t tag) {
+    return tag == 2 || tag == 4 ||
+           tag == KV_CACHE_RT_GENERIC ||
+           tag == KV_CACHE_RT_QWEN36 ||
+           tag == KV_CACHE_RT_MISTRAL35;
+}
+
+static bool kv_cache_tag_is_runtime(uint8_t tag) {
+    return tag >= KV_CACHE_RT_GENERIC;
+}
+
+static bool kv_cache_tags_compatible(const kv_disk_cache *kc,
+                                     uint8_t stored_tag,
+                                     uint8_t requested_tag) {
+    if (!kv_cache_tag_valid(stored_tag) || !kv_cache_tag_valid(requested_tag)) return false;
+    if (kv_cache_tag_is_runtime(stored_tag) || kv_cache_tag_is_runtime(requested_tag)) {
+        return stored_tag == requested_tag;
+    }
+    return !kc || !kc->reject_different_quant || stored_tag == requested_tag;
+}
+
+static uint8_t kv_cache_runtime_tag(const rt_model_ops *ops) {
+    const char *family = rt_ops_served_model_id(ops);
+    if (!strcmp(family, QWEN36_RUNTIME_FAMILY)) return KV_CACHE_RT_QWEN36;
+    if (!strcmp(family, MISTRAL35_RUNTIME_FAMILY)) return KV_CACHE_RT_MISTRAL35;
+    return KV_CACHE_RT_GENERIC;
+}
+
 static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
     uint8_t h[KV_CACHE_FIXED_HEADER];
     if (fread(h, 1, sizeof(h), fp) != sizeof(h)) return false;
@@ -8707,7 +14075,7 @@ static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
+    return e->tokens != 0 && kv_cache_tag_valid(e->quant_bits);
 }
 
 static bool kv_read_entry_file(const char *path, const char sha[41], kv_entry *out) {
@@ -8945,6 +14313,20 @@ static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, si
     return buf_take(&b);
 }
 
+static char *render_rt_tokens_text(rt_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
+    buf b = {0};
+    for (int i = 0; tokens && i < tokens->len; i++) {
+        size_t len = 0;
+        char *piece = rt_token_text(engine, tokens->v[i], &len);
+        if (piece) {
+            buf_append(&b, piece, len);
+            free(piece);
+        }
+    }
+    if (out_len) *out_len = b.len;
+    return buf_take(&b);
+}
+
 static bool byte_prefix_match(const char *text, size_t text_len,
                               const char *prefix, size_t prefix_len) {
     return prefix_len <= text_len &&
@@ -8952,6 +14334,7 @@ static bool byte_prefix_match(const char *text, size_t text_len,
 }
 
 static const char *kv_cache_key_kind(uint8_t ext_flags) {
+    if (ext_flags & KV_EXT_MEDIA_EXACT) return "media-exact";
     if (ext_flags & KV_EXT_RESPONSES_VISIBLE) return "responses-visible";
     if (ext_flags & KV_EXT_THINKING_VISIBLE) return "thinking-visible";
     return "token-text";
@@ -8965,6 +14348,17 @@ static void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
 
 static void tokens_append(ds4_tokens *dst, const ds4_tokens *src) {
     if (!dst || !src) return;
+    for (int i = 0; i < src->len; i++) ds4_tokens_push(dst, src->v[i]);
+}
+
+static void rt_tokens_append(rt_tokens *dst, const rt_tokens *src) {
+    if (!dst || !src) return;
+    for (int i = 0; i < src->len; i++) rt_tokens_push(dst, src->v[i]);
+}
+
+static void ds4_tokens_copy_rt(ds4_tokens *dst, const rt_tokens *src) {
+    if (!dst || !src) return;
+    ds4_tokens_free(dst);
     for (int i = 0; i < src->len; i++) ds4_tokens_push(dst, src->v[i]);
 }
 
@@ -8982,6 +14376,24 @@ static void build_prompt_from_exact_prefix_and_text_suffix(
     ds4_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
     tokens_append(out, &suffix);
     ds4_tokens_free(&suffix);
+}
+
+static bool build_rt_prompt_from_exact_prefix_and_text_suffix(
+        rt_engine *engine,
+        const rt_tokens *exact_prefix,
+        const char *suffix_text,
+        rt_tokens *out)
+{
+    rt_tokens_copy(out, exact_prefix);
+
+    rt_tokens suffix = {0};
+    if (rt_tokenize_text(engine, suffix_text ? suffix_text : "", &suffix) != 0) {
+        rt_tokens_free(out);
+        return false;
+    }
+    rt_tokens_append(out, &suffix);
+    rt_tokens_free(&suffix);
+    return true;
 }
 
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
@@ -9134,7 +14546,7 @@ static bool kv_cache_existing_compatible(kv_disk_cache *kc, const char *path,
     if (access(path, F_OK) != 0) return false;
     kv_entry e = {0};
     if (!kv_read_entry_file(path, sha, &e)) return false;
-    bool compatible = (!kc->reject_different_quant || e.quant_bits == (uint8_t)quant_bits) &&
+    bool compatible = kv_cache_tags_compatible(kc, e.quant_bits, (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
                       kv_cache_file_text_matches(path, sha, text, text_len);
     kv_entry_free(&e);
@@ -9364,7 +14776,183 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
                                            NULL, 0, NULL);
 }
 
+static bool kv_cache_store_runtime_current(server *s, const ds4_tokens *tokens,
+                                           const char *reason,
+                                           const char *cache_text,
+                                           size_t cache_text_len,
+                                           uint8_t cache_text_ext) {
+    kv_disk_cache *kc = &s->kv;
+    if (!server_uses_runtime_core(s) || !kc->enabled) return false;
+    if (!tokens || tokens->len < kc->opt.min_tokens) return false;
+    if ((uint32_t)tokens->len >= UINT32_MAX || cache_text_len > UINT32_MAX) return false;
+    if (rt_session_pos(s->rt_session) != tokens->len) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: runtime-core kv cache skipped tokens=%d reason=%s because live checkpoint is at %d",
+                   tokens->len,
+                   reason,
+                   rt_session_pos(s->rt_session));
+        return false;
+    }
+
+    uint64_t payload_bytes = rt_session_payload_bytes(s->rt_session);
+    if (payload_bytes == 0) return false;
+
+    uint64_t tool_map_est_bytes = 0;
+    if (!kv_tool_map_serialized_size(s, cache_text, &tool_map_est_bytes)) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: runtime-core kv cache skipped tokens=%d reason=%s because tool map size overflowed",
+                   tokens->len, reason);
+        return false;
+    }
+
+    uint64_t est_file_bytes = 0, est_required_bytes = 0;
+    if (!kv_cache_file_size_fits(kc, (uint64_t)cache_text_len, payload_bytes,
+                                 tool_map_est_bytes,
+                                 &est_file_bytes, &est_required_bytes)) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: runtime-core kv cache skipped tokens=%d reason=%s because estimated file size %.2f MiB (%.2f MiB with safety) exceeds budget %.2f MiB",
+                   tokens->len,
+                   reason,
+                   (double)est_file_bytes / (1024.0 * 1024.0),
+                   (double)est_required_bytes / (1024.0 * 1024.0),
+                   (double)kc->budget_bytes / (1024.0 * 1024.0));
+        return false;
+    }
+
+    const uint8_t runtime_tag = kv_cache_runtime_tag(s->rt_ops);
+    char sha[41];
+    sha1_bytes_hex(cache_text, cache_text_len, sha);
+    char *path = kv_path_for_sha(kc, sha);
+    if (kv_cache_existing_compatible(kc, path, sha, cache_text, cache_text_len,
+                                     runtime_tag, rt_session_ctx(s->rt_session))) {
+        kv_cache_rewrite_tool_map(s, path, cache_text);
+        free(path);
+        return true;
+    }
+
+    buf tmpb = {0};
+    buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
+    char *tmp = buf_take(&tmpb);
+    const double save_t0 = now_sec();
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: runtime-core kv cache failed to create %s: %s save=%.1f ms",
+                   tmp, strerror(errno), (now_sec() - save_t0) * 1000.0);
+        free(tmp);
+        free(path);
+        return false;
+    }
+
+    const uint64_t now = (uint64_t)time(NULL);
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    uint8_t ext_flags = cache_text_ext;
+    if (tool_map_est_bytes > 0) ext_flags |= KV_EXT_TOOL_MAP;
+    kv_fill_header(h, runtime_tag, kv_reason_code(reason), ext_flags,
+                   (uint32_t)tokens->len, 0,
+                   (uint32_t)rt_session_ctx(s->rt_session), now, now,
+                   payload_bytes);
+    uint8_t tb[4];
+    le_put32(tb, (uint32_t)cache_text_len);
+    char err[160] = {0};
+    uint64_t tool_map_bytes = 0;
+    errno = 0;
+    bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+              fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
+              fwrite(cache_text, 1, cache_text_len, fp) == cache_text_len &&
+              rt_session_save_payload(s->rt_session, fp, err, sizeof(err)) == 0 &&
+              kv_tool_map_write(s, fp, cache_text, &tool_map_bytes) &&
+              fflush(fp) == 0;
+    int saved_errno = errno;
+    if (fclose(fp) != 0) {
+        if (!saved_errno) saved_errno = errno;
+        ok = false;
+    }
+    if (ok && rename(tmp, path) != 0) {
+        saved_errno = errno;
+        ok = false;
+    }
+    const double save_ms = (now_sec() - save_t0) * 1000.0;
+    if (!ok) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: runtime-core kv cache store failed (%s): %s save=%.1f ms",
+                   reason,
+                   saved_errno ? strerror(saved_errno) : (err[0] ? err : "unknown error"),
+                   save_ms);
+        unlink(tmp);
+    } else {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: runtime-core kv cache stored model=%s tokens=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
+                   server_served_model_id(s),
+                   tokens->len,
+                   reason,
+                   kv_cache_key_kind(ext_flags),
+                   (double)(KV_CACHE_FIXED_HEADER + 4ull + cache_text_len + payload_bytes + tool_map_bytes) / (1024.0 * 1024.0),
+                   save_ms);
+        kv_cache_evict(kc, NULL, sha);
+    }
+    free(tmp);
+    free(path);
+    return ok;
+}
+
+static bool kv_cache_store_runtime_media_exact(server *s,
+                                               const request *req,
+                                               const ds4_tokens *tokens,
+                                               const char *prompt_text,
+                                               size_t prompt_text_len,
+                                               const char *reason) {
+    char *key = NULL;
+    size_t key_len = 0;
+    if (!build_runtime_media_cache_key(req, tokens, prompt_text,
+                                       prompt_text_len, &key, &key_len))
+        return false;
+    bool ok = kv_cache_store_runtime_current(s, tokens, reason,
+                                             key, key_len,
+                                             KV_EXT_MEDIA_EXACT);
+    free(key);
+    return ok;
+}
+
 static void kv_cache_store_current(server *s, const char *reason) {
+    if (server_uses_runtime_core(s)) {
+        if (s->rt_live_media_state) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: runtime-core kv cache store skipped for media-derived live state");
+            return;
+        }
+        const rt_tokens *rt_live = rt_session_tokens(s->rt_session);
+        if (!rt_live) return;
+
+        char *visible_text = NULL;
+        uint8_t visible_ext = 0;
+        pthread_mutex_lock(&s->tool_mu);
+        if (s->responses_live.valid &&
+            s->responses_live.live_tokens == rt_live->len &&
+            s->responses_live.visible_text &&
+            s->responses_live.visible_text[0])
+        {
+            visible_text = xstrdup(s->responses_live.visible_text);
+            visible_ext = KV_EXT_RESPONSES_VISIBLE;
+        }
+        pthread_mutex_unlock(&s->tool_mu);
+
+        ds4_tokens live = {0};
+        ds4_tokens_copy_rt(&live, rt_live);
+        if (visible_text) {
+            kv_cache_store_runtime_current(s, &live, reason, visible_text,
+                                           strlen(visible_text), visible_ext);
+            free(visible_text);
+        } else {
+            size_t text_len = 0;
+            char *text = render_rt_tokens_text(s->rt_engine, &live, &text_len);
+            kv_cache_store_runtime_current(s, &live, reason, text ? text : "",
+                                           text_len, 0);
+            free(text);
+        }
+        ds4_tokens_free(&live);
+        return;
+    }
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
     if (!tokens) return;
 
@@ -9445,10 +15033,11 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
     int best = -1;
     for (int i = 0; i < kc->len; i++) {
         kv_entry *e = &kc->entry[i];
+        if (e->ext_flags & KV_EXT_MEDIA_EXACT) continue;
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
         if ((int)e->tokens < kc->opt.min_tokens) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
-        if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
+        if (!kv_cache_tags_compatible(kc, e->quant_bits, (uint8_t)quant_bits)) continue;
         if (best >= 0) {
             kv_entry *b = &kc->entry[best];
             if (e->text_bytes < b->text_bytes) continue;
@@ -9579,6 +15168,265 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     return loaded;
 }
 
+static int kv_cache_try_load_runtime_text(server *s, const char *prompt_text,
+                                          rt_tokens *effective_prompt,
+                                          uint8_t *loaded_ext_flags_out) {
+    if (effective_prompt) effective_prompt->len = 0;
+    if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (!server_uses_runtime_core(s) || !prompt_text) return 0;
+    kv_disk_cache *kc = &s->kv;
+    if (!kc->enabled) return 0;
+    const uint8_t runtime_tag = kv_cache_runtime_tag(s->rt_ops);
+    const size_t prompt_bytes = strlen(prompt_text);
+    int idx = kv_cache_find_text_prefix(kc, prompt_text, runtime_tag,
+                                        rt_session_ctx(s->rt_session));
+    if (idx < 0) return 0;
+
+    kv_entry e = kc->entry[idx];
+    char *path = xstrdup(e.path);
+    const double load_t0 = now_sec();
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        free(path);
+        return 0;
+    }
+
+    uint32_t text_bytes = 0;
+    kv_entry hdr = {0};
+    const char *fail_reason = "invalid header";
+    bool header_ok = kv_read_header(fp, &hdr, &text_bytes);
+    char *cached_text = NULL;
+    if (header_ok) {
+        if (hdr.quant_bits != runtime_tag) {
+            header_ok = false;
+            fail_reason = "runtime tag mismatch";
+        } else if ((uint64_t)text_bytes > prompt_bytes) {
+            header_ok = false;
+            fail_reason = "cached text is longer than prompt";
+        } else {
+            cached_text = xmalloc((size_t)text_bytes + 1);
+            if (fread(cached_text, 1, text_bytes, fp) != text_bytes) {
+                header_ok = false;
+                fail_reason = "truncated cached text";
+            } else {
+                cached_text[text_bytes] = '\0';
+                char text_sha[41];
+                sha1_bytes_hex(cached_text, text_bytes, text_sha);
+                if (strcmp(text_sha, e.sha)) {
+                    header_ok = false;
+                    fail_reason = "cached text hash mismatch";
+                } else if (!byte_prefix_match(prompt_text, prompt_bytes,
+                                              cached_text, text_bytes)) {
+                    header_ok = false;
+                    fail_reason = "cached text prefix mismatch";
+                }
+            }
+        }
+    }
+
+    char err[160] = {0};
+    int loaded = 0;
+    if (header_ok &&
+        rt_session_load_payload(s->rt_session, fp, hdr.payload_bytes,
+        err, sizeof(err)) == 0) {
+        if (rt_session_pos(s->rt_session) == (int)hdr.tokens) {
+            loaded = (int)hdr.tokens;
+            if (effective_prompt) {
+                const rt_tokens *loaded_tokens = rt_session_tokens(s->rt_session);
+                if (!loaded_tokens ||
+                    !build_rt_prompt_from_exact_prefix_and_text_suffix(
+                        s->rt_engine, loaded_tokens,
+                        prompt_text + text_bytes, effective_prompt))
+                {
+                    rt_session_invalidate(s->rt_session);
+                    rt_tokens_free(effective_prompt);
+                    loaded = 0;
+                }
+            }
+            if (loaded > 0 && (hdr.ext_flags & KV_EXT_TOOL_MAP)) {
+                kv_tool_map_load_from_pos(s, fp, NULL);
+            }
+        } else {
+            rt_session_invalidate(s->rt_session);
+            unlink(path);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: runtime-core kv cache discarded corrupt payload %s",
+                       path);
+        }
+    } else {
+        if (header_ok) rt_session_invalidate(s->rt_session);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: runtime-core kv cache load failed %s: %s load=%.1f ms",
+                   path,
+                   header_ok ? err : fail_reason,
+                   (now_sec() - load_t0) * 1000.0);
+    }
+    fclose(fp);
+
+    if (loaded > 0) {
+        const double load_ms = (now_sec() - load_t0) * 1000.0;
+        if (loaded_ext_flags_out) *loaded_ext_flags_out = hdr.ext_flags;
+        kc->continued_last_store_tokens = loaded;
+        kv_cache_touch_file(path, hdr.hits + 1);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: runtime-core kv cache hit model=%s tokens=%d text=%u tag=%u key=%s load=%.1f ms file=%s",
+                   server_served_model_id(s),
+                   loaded,
+                   text_bytes,
+                   hdr.quant_bits,
+                   kv_cache_key_kind(hdr.ext_flags),
+                   load_ms,
+                   path);
+    }
+    free(cached_text);
+    free(path);
+    return loaded;
+}
+
+static bool rt_tokens_equal_ds4_tokens(const rt_tokens *rt,
+                                       const ds4_tokens *ds) {
+    if (!rt || !ds || rt->len != ds->len) return false;
+    for (int i = 0; i < rt->len; i++) {
+        if (rt->v[i] != ds->v[i]) return false;
+    }
+    return true;
+}
+
+static int kv_cache_try_load_runtime_exact_key(server *s,
+                                               const char *cache_text,
+                                               size_t cache_text_len,
+                                               const ds4_tokens *tokens,
+                                               uint8_t required_ext_flag,
+                                               uint8_t *loaded_ext_flags_out) {
+    if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (!server_uses_runtime_core(s) || !cache_text || !tokens ||
+        cache_text_len > UINT32_MAX)
+        return 0;
+    kv_disk_cache *kc = &s->kv;
+    if (!kc->enabled) return 0;
+
+    const uint8_t runtime_tag = kv_cache_runtime_tag(s->rt_ops);
+    char sha[41];
+    sha1_bytes_hex(cache_text, cache_text_len, sha);
+    char *path = kv_path_for_sha(kc, sha);
+    const double load_t0 = now_sec();
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        free(path);
+        return 0;
+    }
+
+    uint32_t text_bytes = 0;
+    kv_entry hdr = {0};
+    const char *fail_reason = "invalid header";
+    bool header_ok = kv_read_header(fp, &hdr, &text_bytes);
+    char *cached_text = NULL;
+    if (header_ok) {
+        if (hdr.quant_bits != runtime_tag) {
+            header_ok = false;
+            fail_reason = "runtime tag mismatch";
+        } else if ((uint32_t)rt_session_ctx(s->rt_session) < hdr.ctx_size) {
+            header_ok = false;
+            fail_reason = "context mismatch";
+        } else if (required_ext_flag &&
+                   (hdr.ext_flags & required_ext_flag) != required_ext_flag) {
+            header_ok = false;
+            fail_reason = "cache key kind mismatch";
+        } else if (text_bytes != (uint32_t)cache_text_len) {
+            header_ok = false;
+            fail_reason = "cached text length mismatch";
+        } else {
+            cached_text = xmalloc((size_t)text_bytes + 1);
+            if (fread(cached_text, 1, text_bytes, fp) != text_bytes) {
+                header_ok = false;
+                fail_reason = "truncated cached text";
+            } else {
+                cached_text[text_bytes] = '\0';
+                char text_sha[41];
+                sha1_bytes_hex(cached_text, text_bytes, text_sha);
+                if (strcmp(text_sha, sha)) {
+                    header_ok = false;
+                    fail_reason = "cached text hash mismatch";
+                } else if (cache_text_len > 0 &&
+                           memcmp(cached_text, cache_text, cache_text_len) != 0) {
+                    header_ok = false;
+                    fail_reason = "cached text mismatch";
+                }
+            }
+        }
+    }
+
+    char err[160] = {0};
+    int loaded = 0;
+    bool corrupt_payload = false;
+    if (header_ok &&
+        rt_session_load_payload(s->rt_session, fp, hdr.payload_bytes,
+                                err, sizeof(err)) == 0) {
+        const rt_tokens *loaded_tokens = rt_session_tokens(s->rt_session);
+        if (rt_session_pos(s->rt_session) == (int)hdr.tokens &&
+            hdr.tokens == (uint32_t)tokens->len &&
+            rt_tokens_equal_ds4_tokens(loaded_tokens, tokens)) {
+            loaded = (int)hdr.tokens;
+            if (hdr.ext_flags & KV_EXT_TOOL_MAP) {
+                kv_tool_map_load_from_pos(s, fp, NULL);
+            }
+        } else {
+            corrupt_payload = true;
+            fail_reason = "token history mismatch";
+            rt_session_invalidate(s->rt_session);
+        }
+    } else if (header_ok) {
+        fail_reason = err[0] ? err : "payload load failed";
+        rt_session_invalidate(s->rt_session);
+    }
+    fclose(fp);
+
+    if (loaded > 0) {
+        const double load_ms = (now_sec() - load_t0) * 1000.0;
+        if (loaded_ext_flags_out) *loaded_ext_flags_out = hdr.ext_flags;
+        kc->continued_last_store_tokens = loaded;
+        kv_cache_touch_file(path, hdr.hits + 1);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: runtime-core kv cache hit model=%s tokens=%d text=%u tag=%u key=%s load=%.1f ms file=%s",
+                   server_served_model_id(s),
+                   loaded,
+                   text_bytes,
+                   hdr.quant_bits,
+                   kv_cache_key_kind(hdr.ext_flags),
+                   load_ms,
+                   path);
+    } else if (header_ok || corrupt_payload) {
+        const double load_ms = (now_sec() - load_t0) * 1000.0;
+        if (corrupt_payload) unlink(path);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: runtime-core kv cache exact load failed %s: %s load=%.1f ms",
+                   path,
+                   fail_reason,
+                   load_ms);
+    }
+    free(cached_text);
+    free(path);
+    return loaded;
+}
+
+static int kv_cache_try_load_runtime_media_exact(server *s,
+                                                 const request *req,
+                                                 const ds4_tokens *tokens,
+                                                 const char *prompt_text,
+                                                 size_t prompt_text_len,
+                                                 uint8_t *loaded_ext_flags_out) {
+    if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    char *key = NULL;
+    size_t key_len = 0;
+    if (!build_runtime_media_cache_key(req, tokens, prompt_text,
+                                       prompt_text_len, &key, &key_len))
+        return 0;
+    int loaded = kv_cache_try_load_runtime_exact_key(
+        s, key, key_len, tokens, KV_EXT_MEDIA_EXACT, loaded_ext_flags_out);
+    free(key);
+    return loaded;
+}
+
 static int kv_cache_try_load(server *s, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
@@ -9665,6 +15513,50 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->anthropic_live_suffix_text,
         effective_prompt);
+    if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
+    return live_tokens->len;
+}
+
+static int responses_live_continuation_prompt_rt(server *s, const request *req,
+                                                 int live_pos,
+                                                 rt_tokens *effective_prompt,
+                                                 int *matched_ids) {
+    if (matched_ids) *matched_ids = 0;
+    if (!server_uses_runtime_core(s) || !req || !effective_prompt) return 0;
+    if (req->api != API_RESPONSES || !req->responses_live_suffix_text) return 0;
+    if (req->responses_live_call_ids.len == 0) return 0;
+    if (!responses_live_matches_request(s, &req->responses_live_call_ids,
+                                        live_pos)) return 0;
+
+    const rt_tokens *live_tokens = rt_session_tokens(s->rt_session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+    if (!build_rt_prompt_from_exact_prefix_and_text_suffix(
+            s->rt_engine, live_tokens, req->responses_live_suffix_text,
+            effective_prompt)) {
+        return 0;
+    }
+    if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
+    return live_tokens->len;
+}
+
+static int anthropic_live_continuation_prompt_rt(server *s, const request *req,
+                                                 int live_pos,
+                                                 rt_tokens *effective_prompt,
+                                                 int *matched_ids) {
+    if (matched_ids) *matched_ids = 0;
+    if (!server_uses_runtime_core(s) || !req || !effective_prompt) return 0;
+    if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
+    if (req->anthropic_live_call_ids.len == 0) return 0;
+    if (!anthropic_live_matches_request(s, &req->anthropic_live_call_ids,
+                                        live_pos)) return 0;
+
+    const rt_tokens *live_tokens = rt_session_tokens(s->rt_session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+    if (!build_rt_prompt_from_exact_prefix_and_text_suffix(
+            s->rt_engine, live_tokens, req->anthropic_live_suffix_text,
+            effective_prompt)) {
+        return 0;
+    }
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
     return live_tokens->len;
 }
@@ -10800,6 +16692,11 @@ static void generate_job(server *s, job *j) {
     const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
     const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
     long responses_created_at = (long)time(NULL);
+    char responses_wire_id[40] = {0};
+    if (j->req.api == API_RESPONSES && !responses_live_chat) {
+        responses_random_id(responses_wire_id, sizeof(responses_wire_id),
+                            "resp_");
+    }
     if (j->req.stream) {
         if (!sse_headers(j->fd, s->enable_cors)) {
             server_log(DS4_LOG_GENERATION,
@@ -10828,6 +16725,8 @@ static void generate_job(server *s, job *j) {
         if (responses_live_chat) {
             responses_stream_init(&j->req, &responses_live);
             responses_live.active = true;
+            snprintf(responses_wire_id, sizeof(responses_wire_id), "%s",
+                     responses_live.response_id);
             if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
                 server_log(DS4_LOG_GENERATION,
                            "ds4-server: chat ctx=%s%s%s responses created event failed",
@@ -10842,6 +16741,8 @@ static void generate_job(server *s, job *j) {
     }
 
     buf text = {0};
+    ds4_tokens live_tokens = {0};
+    ds4_tokens_copy(&live_tokens, &j->req.prompt);
     size_t plain_stream_pos = 0;
     size_t stop_scan_from = 0;
     const char *finish = "length";
@@ -11181,6 +17082,10 @@ static void generate_job(server *s, job *j) {
             buf_puts(&visible, visible_suffix ? visible_suffix : "");
             responses_live_remember(s, visible.ptr ? visible.ptr : "",
                                     parsed_calls.len ? &parsed_calls : NULL);
+            responses_object_store_remember_response_state(
+                s, &j->req, responses_wire_id,
+                visible.ptr ? visible.ptr : "",
+                parsed_calls.len ? &parsed_calls : NULL);
             buf_free(&visible);
             free(visible_suffix);
         } else {
@@ -11270,7 +17175,8 @@ static void generate_job(server *s, job *j) {
                                  &parsed_calls, final_finish,
                                  prompt_tokens, completion);
     } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, id,
+        responses_final_response(j->fd, s->enable_cors, &j->req,
+                                 responses_wire_id[0] ? responses_wire_id : id,
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
@@ -11351,6 +17257,655 @@ static void generate_job(server *s, job *j) {
     ds4_tokens_free(&effective_prompt);
 }
 
+static void generate_job_rt(server *s, job *j) {
+    char err[160];
+    err[0] = '\0';
+    const double t0 = now_sec();
+    const int old_pos = rt_session_pos(s->rt_session);
+
+    size_t prompt_text_len = 0;
+    char *prompt_text = render_rt_tokens_text(s->rt_engine, &j->req.prompt,
+                                              &prompt_text_len);
+    rt_tokens request_prompt = {
+        .v = j->req.prompt.v,
+        .len = j->req.prompt.len,
+        .cap = j->req.prompt.cap,
+    };
+    rt_tokens effective_prompt = {0};
+    const rt_tokens *prompt_for_sync = &request_prompt;
+    bool responses_live_continuation = false;
+    bool anthropic_live_continuation = false;
+    int responses_live_match_ids = 0;
+    int anthropic_live_match_ids = 0;
+    uint8_t loaded_ext_flags = 0;
+    const char *cache_source = "none";
+    const bool media_prompt = request_has_media(&j->req);
+    const bool live_media_before = s->rt_live_media_state;
+    bool live_media_reused = false;
+    bool media_exact_reused = false;
+    bool prompt_already_synced = false;
+    qwen_runtime_media_spans media_sync = {0};
+    bool media_prepared = false;
+    ds4_tokens media_cache_prompt = {0};
+
+    int cached = 0;
+    if (!media_prompt) {
+        cached = responses_live_continuation_prompt_rt(
+            s, &j->req, old_pos, &effective_prompt, &responses_live_match_ids);
+        if (cached > 0) {
+            responses_live_continuation = true;
+            cache_source = "responses-tool-output";
+            prompt_for_sync = &effective_prompt;
+        } else {
+            cached = anthropic_live_continuation_prompt_rt(
+                s, &j->req, old_pos, &effective_prompt, &anthropic_live_match_ids);
+            if (cached > 0) {
+                anthropic_live_continuation = true;
+                cache_source = "anthropic-tool-output";
+                prompt_for_sync = &effective_prompt;
+            }
+        }
+    } else {
+        cache_source = "media-bypass";
+    }
+    if (cached == 0 && j->req.api == API_RESPONSES &&
+        j->req.responses_requires_live_tool_state)
+    {
+        rt_tokens_free(&effective_prompt);
+        free(prompt_text);
+        http_error(j->fd, s->enable_cors, 409,
+                   "Responses continuation state is not available; retry by replaying the full input history");
+        return;
+    }
+    if (cached == 0 && j->req.api == API_ANTHROPIC &&
+        j->req.anthropic_requires_live_tool_state)
+    {
+        rt_tokens_free(&effective_prompt);
+        free(prompt_text);
+        http_error(j->fd, s->enable_cors, 409,
+                   "Anthropic continuation state is not available; retry by replaying the full messages history");
+        return;
+    }
+    if (cached == 0 && media_prompt) {
+        if (!qwen_runtime_build_media_embeddings(s->rt_engine, &j->req,
+                                                 &request_prompt, &media_sync,
+                                                 err, sizeof(err))) {
+            rt_tokens_free(&effective_prompt);
+            free(prompt_text);
+            http_error(j->fd, s->enable_cors, 400,
+                       err[0] ? err : "runtime-core media prompt preparation failed");
+            return;
+        }
+        media_prepared = true;
+        if (media_sync.prompt_expanded) prompt_for_sync = &media_sync.prompt;
+        ds4_tokens_copy_rt(&media_cache_prompt, prompt_for_sync);
+    }
+    if (cached == 0 && !media_prompt) {
+        const rt_tokens *live_tokens = rt_session_tokens(s->rt_session);
+        if (live_tokens && live_tokens->len == old_pos &&
+            old_pos >= 0 && request_prompt.len >= old_pos &&
+            rt_tokens_starts_with(&request_prompt, live_tokens))
+        {
+            cached = old_pos;
+            cache_source = cached > 0 ? "memory-token" : "none";
+        }
+    }
+    if (cached == 0 && !media_prompt && s->kv.enabled) {
+        kv_cache_store_current(s, "evict");
+        cached = kv_cache_try_load_runtime_text(s, prompt_text ? prompt_text : "",
+                                                &effective_prompt,
+                                                &loaded_ext_flags);
+        if (cached > 0) {
+            cache_source = kv_cache_key_kind(loaded_ext_flags);
+            prompt_for_sync = &effective_prompt;
+        } else {
+            cache_source = "none";
+        }
+    }
+    if (cached == 0 && media_prompt && s->kv.enabled) {
+        kv_cache_store_current(s, "evict");
+        cached = kv_cache_try_load_runtime_media_exact(
+            s, &j->req, &media_cache_prompt, prompt_text ? prompt_text : "",
+            prompt_text_len, &loaded_ext_flags);
+        if (cached > 0) {
+            cache_source = kv_cache_key_kind(loaded_ext_flags);
+            media_exact_reused = true;
+            prompt_already_synced = true;
+        } else {
+            cache_source = "media-bypass";
+        }
+    }
+    if (live_media_before && cached > 0 &&
+        (responses_live_continuation || anthropic_live_continuation ||
+         !strcmp(cache_source, "memory-token"))) {
+        live_media_reused = true;
+    }
+    if (cached > 0 && !live_media_reused && !media_exact_reused) {
+        s->rt_live_media_state = false;
+    }
+    if (cached == 0) {
+        rt_session_invalidate(s->rt_session);
+        s->rt_live_media_state = false;
+    }
+    const int prompt_tokens = prompt_for_sync->len;
+    if (responses_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: runtime-core responses live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   responses_live_match_ids, cached, prompt_tokens);
+    } else if (anthropic_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: runtime-core anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   anthropic_live_match_ids, cached, prompt_tokens);
+    } else if (cached > 0) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: runtime-core cache source=%s cached=%d prompt=%d",
+                   cache_source, cached, prompt_tokens);
+    } else if (media_prompt) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: runtime-core media prompt bypassed text-only cache media=%d prompt=%d",
+                   j->req.media.len, prompt_tokens);
+    }
+    if (!prompt_already_synced) {
+        int sync_rc = media_prepared ?
+            qwen36_runtime_session_sync_embeddings(s->rt_session, prompt_for_sync,
+                                                   media_sync.spans,
+                                                   media_sync.len,
+                                                   err, sizeof(err)) :
+            qwen_runtime_session_sync_request(s->rt_engine, s->rt_session, &j->req,
+                                              prompt_for_sync, err, sizeof(err));
+        if (sync_rc != 0) {
+            qwen_runtime_media_spans_free(&media_sync);
+            ds4_tokens_free(&media_cache_prompt);
+            rt_tokens_free(&effective_prompt);
+            free(prompt_text);
+            http_error(j->fd, s->enable_cors, media_prompt ? 400 : 500,
+                       err[0] ? err : "runtime-core prompt sync failed");
+            return;
+        }
+    } else if (rt_session_pos(s->rt_session) != prompt_tokens) {
+        qwen_runtime_media_spans_free(&media_sync);
+        ds4_tokens_free(&media_cache_prompt);
+        rt_tokens_free(&effective_prompt);
+        free(prompt_text);
+        http_error(j->fd, s->enable_cors, 500,
+                   "runtime-core media cache restored an unexpected prompt state");
+        return;
+    }
+    const bool media_state_after_sync = media_prompt || live_media_reused;
+    s->rt_live_media_state = media_state_after_sync;
+    if (!responses_live_continuation) responses_live_clear(s);
+    if (!anthropic_live_continuation) anthropic_live_clear(s);
+
+    j->req.cache_read_tokens = cached;
+    j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+    if (!responses_live_continuation && !anthropic_live_continuation &&
+        s->kv.enabled &&
+        !media_state_after_sync &&
+        prompt_tokens >= s->kv.opt.min_tokens &&
+        (s->kv.opt.cold_max_tokens == 0 || prompt_tokens <= s->kv.opt.cold_max_tokens))
+    {
+        ds4_tokens store_prompt_tokens = {0};
+        const ds4_tokens *store_prompt = &j->req.prompt;
+        if (prompt_for_sync == &effective_prompt) {
+            ds4_tokens_copy_rt(&store_prompt_tokens, &effective_prompt);
+            store_prompt = &store_prompt_tokens;
+        }
+        kv_cache_store_runtime_current(s, store_prompt,
+                                       cached > 0 ? "continued" : "cold",
+                                       prompt_text ? prompt_text : "",
+                                       prompt_text_len,
+                                       0);
+        ds4_tokens_free(&store_prompt_tokens);
+        if (prompt_tokens > s->kv.continued_last_store_tokens) {
+            kv_cache_note_store(&s->kv, prompt_tokens);
+        }
+    } else if (!responses_live_continuation && !anthropic_live_continuation &&
+               s->kv.enabled &&
+               media_prompt &&
+               !prompt_already_synced &&
+               prompt_tokens >= s->kv.opt.min_tokens &&
+               (s->kv.opt.cold_max_tokens == 0 ||
+                prompt_tokens <= s->kv.opt.cold_max_tokens))
+    {
+        if (kv_cache_store_runtime_media_exact(s, &j->req, &media_cache_prompt,
+                                               prompt_text ? prompt_text : "",
+                                               prompt_text_len,
+                                               cached > 0 ? "continued" : "cold")) {
+            kv_cache_note_store(&s->kv, prompt_tokens);
+        }
+    }
+    ds4_tokens_free(&media_cache_prompt);
+    if (media_prepared) {
+        rt_tokens_copy(&effective_prompt, prompt_for_sync);
+        prompt_for_sync = &effective_prompt;
+        qwen_runtime_media_spans_free(&media_sync);
+        media_prepared = false;
+    }
+
+    char id[96];
+    snprintf(id, sizeof(id), "%s-%llu",
+             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
+             (unsigned long long)++s->seq);
+
+    const bool structured_stream =
+        j->req.stream && (j->req.api == API_ANTHROPIC ||
+                          j->req.api == API_RESPONSES);
+    anthropic_stream anthropic_live = {0};
+    responses_stream responses_live = {0};
+    const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
+    long responses_created_at = (long)time(NULL);
+    char responses_wire_id[40] = {0};
+    if (j->req.api == API_RESPONSES && !responses_live_chat) {
+        responses_random_id(responses_wire_id, sizeof(responses_wire_id),
+                            "resp_");
+    }
+    if (j->req.stream) {
+        if (!sse_headers(j->fd, s->enable_cors)) {
+            rt_tokens_free(&effective_prompt);
+            free(prompt_text);
+            return;
+        }
+        if (j->req.api == API_ANTHROPIC &&
+            !anthropic_sse_start_live(j->fd, &j->req, id,
+                                      prompt_tokens, &anthropic_live)) {
+            anthropic_stream_free(&anthropic_live);
+            rt_tokens_free(&effective_prompt);
+            free(prompt_text);
+            return;
+        }
+        if (responses_live_chat) {
+            responses_stream_init(&j->req, &responses_live);
+            responses_live.active = true;
+            snprintf(responses_wire_id, sizeof(responses_wire_id), "%s",
+                     responses_live.response_id);
+            if (!responses_sse_created(j->fd, &j->req, &responses_live,
+                                       responses_created_at)) {
+                responses_stream_free(&responses_live);
+                anthropic_stream_free(&anthropic_live);
+                rt_tokens_free(&effective_prompt);
+                free(prompt_text);
+                return;
+            }
+        }
+        if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
+            !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
+            responses_stream_free(&responses_live);
+            anthropic_stream_free(&anthropic_live);
+            rt_tokens_free(&effective_prompt);
+            free(prompt_text);
+            return;
+        }
+    }
+
+    buf text = {0};
+    ds4_tokens live_tokens = {0};
+    ds4_tokens_copy_rt(&live_tokens, prompt_for_sync);
+    size_t plain_stream_pos = 0;
+    size_t stop_scan_from = 0;
+    const char *finish = "length";
+    int completion = 0;
+    int max_tokens = j->req.max_tokens;
+    const int ctx = rt_session_ctx(s->rt_session);
+    int room = ctx - rt_session_pos(s->rt_session);
+    size_t tool_scan_from = 0;
+    bool saw_tool_start = false;
+    bool saw_tool_end = false;
+    bool saw_orphan_tool_end = false;
+    uint64_t rng = j->req.seed ? j->req.seed :
+        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+
+    if (max_tokens < 0) max_tokens = 0;
+    if (max_tokens > room) max_tokens = room;
+
+    while (!g_stop_requested && completion < max_tokens &&
+           rt_session_pos(s->rt_session) < rt_session_ctx(s->rt_session)) {
+        int token = rt_session_sample(s->rt_session, j->req.temperature,
+                                      j->req.top_k, j->req.top_p,
+                                      j->req.min_p, &rng);
+        if (token < 0) {
+            finish = "error";
+            snprintf(err, sizeof(err), "runtime-core sampling failed");
+            break;
+        }
+        if (token == rt_token_eos(s->rt_engine)) {
+            finish = "stop";
+            break;
+        }
+        int toks[17];
+        int ntok = 0;
+        if (j->req.temperature <= 0.0f &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+        {
+            ntok = rt_session_eval_speculative_argmax(
+                s->rt_session,
+                token,
+                max_tokens - completion,
+                rt_token_eos(s->rt_engine),
+                toks,
+                (int)(sizeof(toks) / sizeof(toks[0])),
+                err,
+                sizeof(err));
+            if (ntok < 0) {
+                finish = "error";
+                break;
+            }
+        }
+        if (ntok <= 0) {
+            if (rt_session_eval(s->rt_session, token, err, sizeof(err)) != 0) {
+                finish = "error";
+                break;
+            }
+            toks[0] = token;
+            ntok = 1;
+        }
+
+        for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
+            token = toks[ti];
+            if (token == rt_token_eos(s->rt_engine)) {
+                finish = "stop";
+                break;
+            }
+
+            size_t piece_len = 0;
+            char *piece = rt_token_text(s->rt_engine, token, &piece_len);
+            if (!piece) {
+                finish = "error";
+                snprintf(err, sizeof(err), "runtime-core token decode failed");
+                break;
+            }
+            completion++;
+            ds4_tokens_push(&live_tokens, token);
+            buf_append(&text, piece, piece_len);
+            free(piece);
+
+            if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+                if (tool_scan_from > text.len) tool_scan_from = text.len;
+                const char *tool_scan = text.ptr ? text.ptr + tool_scan_from : "";
+                bool orphan_end = false;
+                observe_tool_markers(tool_scan, &saw_tool_start, &saw_tool_end, &orphan_end);
+                if (orphan_end && !saw_orphan_tool_end) {
+                    saw_orphan_tool_end = true;
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: runtime-core ignored orphan tool-call end marker after %d generated tokens",
+                               completion);
+                }
+                const size_t marker_hold = 80;
+                size_t hold_from = text.len > marker_hold ? text.len - marker_hold : 0;
+                if (hold_from > tool_scan_from) tool_scan_from = hold_from;
+                if (saw_tool_end) {
+                    finish = "tool_calls";
+                    break;
+                }
+            }
+
+            size_t stop_pos = 0, stop_len = 0;
+            bool hit_stop = stop_list_find_from(&j->req.stops, text.ptr,
+                                                stop_scan_from,
+                                                &stop_pos, &stop_len);
+            size_t stream_len = hit_stop ?
+                stop_pos : stop_list_stream_safe_len(&j->req.stops, text.len);
+            if (stream_len > text.len) stream_len = text.len;
+            stream_len = utf8_stream_safe_len(text.ptr, plain_stream_pos,
+                                              stream_len, hit_stop);
+            if (!hit_stop && j->req.stops.max_len > 1) {
+                const size_t hold = j->req.stops.max_len - 1;
+                stop_scan_from = text.len > hold ? text.len - hold : 0;
+            }
+
+            if (j->req.stream && !structured_stream && stream_len > plain_stream_pos) {
+                char *delta = xstrndup(text.ptr + plain_stream_pos,
+                                       stream_len - plain_stream_pos);
+                bool ok = sse_chunk(j->fd, &j->req, id, delta, NULL);
+                free(delta);
+                if (!ok) {
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client stream write failed");
+                    break;
+                }
+                plain_stream_pos = stream_len;
+            }
+            if (j->req.stream && j->req.api == API_ANTHROPIC &&
+                !anthropic_sse_stream_update(j->fd, s, &j->req, id,
+                                             &anthropic_live, text.ptr, stream_len,
+                                             false)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "client stream write failed");
+                break;
+            }
+            if (responses_live_chat &&
+                !responses_sse_stream_update(j->fd, &j->req,
+                                             &responses_live, text.ptr, stream_len,
+                                             false)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "client stream write failed");
+                break;
+            }
+
+            if (hit_stop) {
+                (void)stop_len;
+                finish = "stop";
+                text.len = stop_pos;
+                if (text.ptr) text.ptr[text.len] = '\0';
+                rt_session_invalidate(s->rt_session);
+                s->rt_live_media_state = false;
+                break;
+            }
+        }
+        if (strcmp(finish, "length") != 0) break;
+    }
+
+    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
+        saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
+    {
+        finish = "error";
+        snprintf(err, sizeof(err), "unterminated tool call");
+    }
+
+    if (g_stop_requested && strcmp(finish, "error") != 0) {
+        finish = "error";
+        snprintf(err, sizeof(err), "shutdown requested");
+    }
+
+    if (j->req.stream && !structured_stream &&
+        text.len > plain_stream_pos && strcmp(finish, "error") != 0) {
+        size_t stream_len = utf8_stream_safe_len(text.ptr, plain_stream_pos,
+                                                text.len, true);
+        char *tail = xstrndup(text.ptr + plain_stream_pos,
+                              stream_len - plain_stream_pos);
+        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) finish = "error";
+        free(tail);
+    }
+
+    tool_calls parsed_calls = {0};
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    const char *final_finish = finish;
+    bool recovered_tool_parse_failure = false;
+    if (j->req.kind == REQ_CHAT) {
+        bool parsed_ok = parse_generated_message_for_response(
+            text.ptr ? text.ptr : "",
+            j->req.has_tools,
+            saw_tool_start,
+            ds4_think_mode_enabled(j->req.think_mode),
+            &final_finish,
+            err,
+            sizeof(err),
+            &parsed_content,
+            &parsed_reasoning,
+            &parsed_calls,
+            &recovered_tool_parse_failure);
+        (void)parsed_ok;
+        (void)recovered_tool_parse_failure;
+        if (parsed_calls.len > 0 && strcmp(final_finish, "error") != 0) {
+            if (j->req.api == API_ANTHROPIC && j->req.stream) {
+                apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
+            }
+            assign_tool_call_ids(s, &parsed_calls, j->req.api);
+            tool_memory_remember(s, &parsed_calls);
+            final_finish = "tool_calls";
+        }
+    }
+
+    if (j->req.api == API_RESPONSES) {
+        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+            char *visible_suffix =
+                build_responses_visible_assistant_suffix(&j->req,
+                    parsed_content ? parsed_content : "",
+                    parsed_reasoning,
+                    &parsed_calls);
+            char *visible_base = NULL;
+            if (responses_live_continuation) {
+                pthread_mutex_lock(&s->tool_mu);
+                if (s->responses_live.valid && s->responses_live.visible_text) {
+                    visible_base = xstrdup(s->responses_live.visible_text);
+                }
+                pthread_mutex_unlock(&s->tool_mu);
+            }
+            buf visible = {0};
+            buf_puts(&visible, visible_base ? visible_base :
+                     (prompt_text ? prompt_text : ""));
+            buf_puts(&visible, visible_suffix ? visible_suffix : "");
+            responses_live_remember_at(s, visible.ptr ? visible.ptr : "",
+                                       parsed_calls.len ? &parsed_calls : NULL,
+                                       rt_session_pos(s->rt_session));
+            responses_object_store_remember_response_state(
+                s, &j->req, responses_wire_id,
+                visible.ptr ? visible.ptr : "",
+                parsed_calls.len ? &parsed_calls : NULL);
+            buf_free(&visible);
+            free(visible_base);
+            free(visible_suffix);
+        } else {
+            responses_live_clear(s);
+        }
+    }
+    if (j->req.api == API_ANTHROPIC) {
+        if (parsed_calls.len && strcmp(final_finish, "error") &&
+            strcmp(final_finish, "length")) {
+            anthropic_live_remember_at(s, &parsed_calls,
+                                       rt_session_pos(s->rt_session));
+        } else {
+            anthropic_live_clear(s);
+        }
+    }
+
+    if (s->kv.enabled &&
+        strcmp(final_finish, "error") != 0 &&
+        rt_session_pos(s->rt_session) == live_tokens.len &&
+        live_tokens.len > prompt_tokens &&
+        live_tokens.len >= s->kv.opt.min_tokens)
+    {
+        if (!s->rt_live_media_state) {
+            uint8_t cache_text_ext = 0;
+            char *generated_key = NULL;
+            pthread_mutex_lock(&s->tool_mu);
+            if (s->responses_live.valid &&
+                s->responses_live.live_tokens == live_tokens.len &&
+                s->responses_live.visible_text &&
+                s->responses_live.visible_text[0])
+            {
+                generated_key = xstrdup(s->responses_live.visible_text);
+                cache_text_ext = KV_EXT_RESPONSES_VISIBLE;
+            }
+            pthread_mutex_unlock(&s->tool_mu);
+            size_t generated_key_len = 0;
+            if (generated_key) {
+                generated_key_len = strlen(generated_key);
+            } else {
+                generated_key = render_rt_tokens_text(s->rt_engine, &live_tokens,
+                                                      &generated_key_len);
+            }
+            kv_cache_store_runtime_current(s, &live_tokens, "continued",
+                                           generated_key ? generated_key : "",
+                                           generated_key_len,
+                                           cache_text_ext);
+            kv_cache_note_store(&s->kv, live_tokens.len);
+            free(generated_key);
+        } else if (media_prompt) {
+            size_t generated_key_len = 0;
+            char *generated_key = render_rt_tokens_text(s->rt_engine,
+                                                        &live_tokens,
+                                                        &generated_key_len);
+            if (kv_cache_store_runtime_media_exact(
+                    s, &j->req, &live_tokens,
+                    generated_key ? generated_key : "",
+                    generated_key_len, "continued")) {
+                kv_cache_note_store(&s->kv, live_tokens.len);
+            }
+            free(generated_key);
+        }
+    }
+
+    if (j->req.stream) {
+        bool response_ok = true;
+        if (j->req.api == API_ANTHROPIC) {
+            response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id,
+                                                    &anthropic_live,
+                                                    text.ptr ? text.ptr : "",
+                                                    text.len,
+                                                    &parsed_calls,
+                                                    final_finish, completion);
+        } else if (responses_live_chat) {
+            response_ok = responses_sse_finish_live(j->fd, &j->req,
+                                                    &responses_live,
+                                                    text.ptr ? text.ptr : "",
+                                                    text.len,
+                                                    NULL,
+                                                    &parsed_calls,
+                                                    final_finish,
+                                                    prompt_tokens,
+                                                    completion,
+                                                    responses_created_at);
+        } else {
+            response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
+                          sse_done(j->fd, &j->req, id, prompt_tokens, completion);
+        }
+        if (!response_ok) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: runtime-core final stream failed");
+        }
+    } else if (j->req.api == API_ANTHROPIC) {
+        anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
+                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                 parsed_reasoning,
+                                 &parsed_calls, final_finish,
+                                 prompt_tokens, completion);
+    } else if (j->req.api == API_RESPONSES) {
+        responses_final_response(j->fd, s->enable_cors, &j->req,
+                                 responses_wire_id[0] ? responses_wire_id : id,
+                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                 parsed_reasoning,
+                                 &parsed_calls, final_finish,
+                                 prompt_tokens, completion);
+    } else {
+        final_response(j->fd, s->enable_cors, &j->req, id,
+                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                       parsed_reasoning,
+                       &parsed_calls, final_finish, prompt_tokens, completion);
+    }
+
+    if (!strcmp(finish, "error") && err[0]) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: runtime-core %s prompt=%d gen=%d finish=%s error=\"%s\" %.3fs",
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   prompt_tokens, completion, final_finish, err, now_sec() - t0);
+    } else {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: runtime-core %s prompt=%d gen=%d finish=%s %.3fs",
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   prompt_tokens, completion, final_finish, now_sec() - t0);
+    }
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&parsed_calls);
+    anthropic_stream_free(&anthropic_live);
+    responses_stream_free(&responses_live);
+    buf_free(&text);
+    ds4_tokens_free(&live_tokens);
+    rt_tokens_free(&effective_prompt);
+    free(prompt_text);
+}
+
 static bool enqueue(server *s, job *j) {
     pthread_mutex_lock(&s->mu);
     if (s->stopping) {
@@ -11384,7 +17939,8 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
-        generate_job(s, j);
+        if (server_uses_runtime_core(s)) generate_job_rt(s, j);
+        else generate_job(s, j);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -11515,8 +18071,53 @@ static void append_model_json_values(buf *b, int ctx, int default_tokens) {
         max_completion);
 }
 
+static void append_runtime_model_json_values(buf *b, const rt_model_ops *ops,
+                                             int ctx, int default_tokens) {
+    const int max_completion = default_tokens < ctx ? default_tokens : ctx;
+    const char *id = ops && ops->family ? ops->family : "runtime-core";
+    const char *name = ops && ops->display_name ? ops->display_name : id;
+    buf_puts(b, "{\"id\":");
+    json_escape(b, id);
+    buf_puts(b,
+        ",\"object\":\"model\","
+        "\"created\":1767225600,"
+        "\"owned_by\":\"runtime-core\","
+        "\"name\":");
+    json_escape(b, name);
+    buf_printf(b,
+        ",\"context_length\":%d,"
+        "\"top_provider\":{"
+            "\"context_length\":%d,"
+            "\"max_completion_tokens\":%d,"
+            "\"is_moderated\":false},"
+        "\"supported_parameters\":["
+            "\"max_tokens\","
+            "\"temperature\","
+            "\"top_p\","
+            "\"top_k\","
+            "\"min_p\","
+            "\"stop\","
+            "\"seed\","
+            "\"stream\","
+            "\"reasoning_effort\"]}",
+        ctx,
+        ctx,
+        max_completion);
+}
+
 static void append_model_json(buf *b, const server *s) {
-    append_model_json_values(b, ds4_session_ctx(s->session), s->default_tokens);
+    if (server_uses_runtime_core(s)) {
+        append_runtime_model_json_values(b, s->rt_ops,
+                                         rt_session_ctx(s->rt_session),
+                                         s->default_tokens);
+    } else {
+        append_model_json_values(b, ds4_session_ctx(s->session), s->default_tokens);
+    }
+}
+
+static bool server_model_route_matches(const server *s, const char *id) {
+    if (server_uses_runtime_core(s)) return model_alias_is_runtime_served(s, id);
+    return model_alias_is_ds4_served(id);
 }
 
 static bool send_model(server *s, int fd) {
@@ -11536,6 +18137,439 @@ static bool send_models(server *s, int fd) {
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
+}
+
+static void append_conversation_json(buf *b, const char *id,
+                                     uint64_t created_at,
+                                     const char *metadata) {
+    buf_puts(b, "{\"id\":");
+    json_escape(b, id ? id : "");
+    buf_puts(b, ",\"object\":\"conversation\",\"created_at\":");
+    buf_printf(b, "%llu", (unsigned long long)created_at);
+    buf_puts(b, ",\"metadata\":");
+    buf_puts(b, conversation_metadata_valid(metadata) ? metadata : "{}");
+    buf_putc(b, '}');
+}
+
+static bool parse_conversation_body(const char *body,
+                                    char **metadata_out,
+                                    bool *metadata_seen,
+                                    char **items_out,
+                                    bool *items_seen,
+                                    char *err,
+                                    size_t errlen) {
+    if (metadata_out) *metadata_out = xstrdup("{}");
+    if (metadata_seen) *metadata_seen = false;
+    if (items_out) *items_out = xstrdup("[]");
+    if (items_seen) *items_seen = false;
+    const char *p = body ? body : "";
+    json_ws(&p);
+    if (!*p) return true;
+    if (*p != '{') {
+        snprintf(err, errlen, "invalid JSON request");
+        return false;
+    }
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "metadata")) {
+            if (metadata_seen) *metadata_seen = true;
+            json_ws(&p);
+            free(*metadata_out);
+            *metadata_out = NULL;
+            if (json_lit(&p, "null")) {
+                *metadata_out = xstrdup("{}");
+            } else if (*p == '{') {
+                char *raw = NULL;
+                if (!json_raw_value(&p, &raw)) {
+                    free(key);
+                    goto bad;
+                }
+                *metadata_out = json_minify_raw_value(raw);
+                free(raw);
+                if (!conversation_metadata_valid(*metadata_out)) {
+                    snprintf(err, errlen, "metadata must be a JSON object");
+                    free(key);
+                    return false;
+                }
+            } else {
+                snprintf(err, errlen, "metadata must be a JSON object or null");
+                free(key);
+                return false;
+            }
+        } else if (!strcmp(key, "items")) {
+            if (items_seen) *items_seen = true;
+            json_ws(&p);
+            if (items_out) {
+                free(*items_out);
+                *items_out = NULL;
+            }
+            if (json_lit(&p, "null")) {
+                if (items_out) *items_out = xstrdup("[]");
+            } else if (*p == '[') {
+                char *items = NULL;
+                if (!conversation_items_normalize_array_at(&p, &items, 20,
+                                                           err, errlen)) {
+                    free(key);
+                    return false;
+                }
+                if (items_out) *items_out = items;
+                else free(items);
+            } else {
+                snprintf(err, errlen, "conversation.items must be an array or null");
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p) goto bad;
+    return true;
+bad:
+    snprintf(err, errlen, "invalid JSON request");
+    return false;
+}
+
+static bool send_conversation_json(server *s, int fd, const char *id) {
+    char *metadata = NULL;
+    uint64_t created_at = 0;
+    if (!conversation_store_lookup(s, id, &metadata, &created_at)) {
+        http_error(fd, s->enable_cors, 404, "unknown conversation");
+        return false;
+    }
+    buf b = {0};
+    append_conversation_json(&b, id, created_at, metadata);
+    buf_putc(&b, '\n');
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    free(metadata);
+    return ok;
+}
+
+static void append_conversation_items_list_json(buf *b,
+                                                const char *items_json) {
+    const char *items = conversation_items_valid(items_json) ? items_json : "[]";
+    char *first = NULL;
+    char *last = NULL;
+    conversation_items_first_last(items, &first, &last);
+    buf_puts(b, "{\"object\":\"list\",\"data\":");
+    buf_puts(b, items);
+    buf_puts(b, ",\"first_id\":");
+    if (first) json_escape(b, first);
+    else buf_puts(b, "null");
+    buf_puts(b, ",\"last_id\":");
+    if (last) json_escape(b, last);
+    else buf_puts(b, "null");
+    buf_puts(b, ",\"has_more\":false}");
+    free(first);
+    free(last);
+}
+
+static bool send_conversation_items_json(server *s, int fd,
+                                         const char *conversation_id,
+                                         const char *items_json) {
+    char *items = NULL;
+    if (items_json) {
+        items = xstrdup(items_json);
+    } else if (!conversation_store_lookup_items(s, conversation_id, &items)) {
+        http_error(fd, s->enable_cors, 404, "unknown conversation");
+        return false;
+    }
+    buf b = {0};
+    append_conversation_items_list_json(&b, items ? items : "[]");
+    buf_putc(&b, '\n');
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    free(items);
+    return ok;
+}
+
+static bool parse_conversation_items_body(const char *body,
+                                          char **items_out,
+                                          char *err,
+                                          size_t errlen) {
+    if (items_out) *items_out = NULL;
+    const char *p = body ? body : "";
+    bool items_seen = false;
+    json_ws(&p);
+    if (*p != '{') {
+        snprintf(err, errlen, "invalid JSON request");
+        return false;
+    }
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "items")) {
+            items_seen = true;
+            free(*items_out);
+            *items_out = NULL;
+            if (!conversation_items_normalize_array_at(&p, items_out, 20,
+                                                       err, errlen)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p) goto bad;
+    if (!items_seen) {
+        snprintf(err, errlen, "items is required");
+        return false;
+    }
+    return true;
+bad:
+    snprintf(err, errlen, "invalid JSON request");
+    return false;
+}
+
+static bool handle_conversations_http(server *s, int fd,
+                                      const char *method,
+                                      const char *path,
+                                      const char *body) {
+    if (strncmp(path, "/v1/conversations", 17) != 0) return false;
+    const char *rest = path + 17;
+    char err[160] = {0};
+    if (!*rest) {
+        if (strcmp(method, "POST")) {
+            http_error(fd, s->enable_cors, 404, "unknown endpoint");
+            return true;
+        }
+        char *metadata = NULL;
+        bool metadata_seen = false;
+        char *items_json = NULL;
+        bool items_seen = false;
+        if (!parse_conversation_body(body, &metadata, &metadata_seen,
+                                     &items_json, &items_seen,
+                                     err, sizeof(err))) {
+            http_error(fd, s->enable_cors, 400, err);
+            free(metadata);
+            free(items_json);
+            return true;
+        }
+        (void)metadata_seen;
+        (void)items_seen;
+        char id[40];
+        responses_random_id(id, sizeof(id), "conv_");
+        if (!conversation_store_upsert_full(s, id, metadata ? metadata : "{}",
+                                            items_json ? items_json : "[]", 0)) {
+            http_error(fd, s->enable_cors, 500, "failed to create conversation");
+            free(metadata);
+            free(items_json);
+            return true;
+        }
+        buf b = {0};
+        char *stored_metadata = NULL;
+        uint64_t created_at = 0;
+        (void)conversation_store_lookup(s, id, &stored_metadata, &created_at);
+        append_conversation_json(&b, id, created_at,
+                                 stored_metadata ? stored_metadata : metadata);
+        buf_putc(&b, '\n');
+        http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+        buf_free(&b);
+        free(stored_metadata);
+        free(metadata);
+        free(items_json);
+        return true;
+    }
+    if (*rest != '/') {
+        http_error(fd, s->enable_cors, 404, "unknown endpoint");
+        return true;
+    }
+    rest++;
+    const char *slash = strchr(rest, '/');
+    size_t id_len = slash ? (size_t)(slash - rest) : strlen(rest);
+    char *id = xstrndup(rest, id_len);
+    if (!responses_object_id_safe(id)) {
+        http_error(fd, s->enable_cors, 400, "invalid conversation id");
+        free(id);
+        return true;
+    }
+    if (slash) {
+        if (!strncmp(slash, "/items", 6) &&
+            (slash[6] == '\0' || slash[6] == '/' || slash[6] == '?'))
+        {
+            const char *item_rest = slash + 6;
+            if (*item_rest == '\0' || *item_rest == '?') {
+                if (!strcmp(method, "GET")) {
+                    send_conversation_items_json(s, fd, id, NULL);
+                } else if (!strcmp(method, "POST")) {
+                    char *items_json = NULL;
+                    if (!parse_conversation_items_body(body, &items_json,
+                                                       err, sizeof(err))) {
+                        http_error(fd, s->enable_cors, 400, err);
+                    } else if (!conversation_store_append_items(s, id, items_json)) {
+                        http_error(fd, s->enable_cors, 404, "unknown conversation");
+                    } else {
+                        responses_object_store_delete(s, id);
+                        send_conversation_items_json(s, fd, id, items_json);
+                    }
+                    free(items_json);
+                } else {
+                    http_error(fd, s->enable_cors, 404, "unknown endpoint");
+                }
+            } else if (*item_rest == '/') {
+                char *item_id = xstrdup(item_rest + 1);
+                char *q = strchr(item_id, '?');
+                if (q) *q = '\0';
+                if (!responses_object_id_safe(item_id)) {
+                    http_error(fd, s->enable_cors, 400, "invalid conversation item id");
+                } else if (!strcmp(method, "GET")) {
+                    char *items_json = NULL;
+                    if (!conversation_store_lookup_items(s, id, &items_json)) {
+                        http_error(fd, s->enable_cors, 404, "unknown conversation");
+                    } else {
+                        char *item = conversation_items_find_object(items_json,
+                                                                    item_id);
+                        if (!item) {
+                            http_error(fd, s->enable_cors, 404,
+                                       "unknown conversation item");
+                        } else {
+                            buf b = {0};
+                            buf_puts(&b, item);
+                            buf_putc(&b, '\n');
+                            http_response(fd, s->enable_cors, 200,
+                                          "application/json", b.ptr);
+                            buf_free(&b);
+                        }
+                        free(item);
+                        free(items_json);
+                    }
+                } else if (!strcmp(method, "DELETE")) {
+                    char *metadata = NULL;
+                    char *items_json = NULL;
+                    uint64_t created_at = 0;
+                    if (!conversation_store_lookup_full(s, id, &metadata,
+                                                        &items_json,
+                                                        &created_at)) {
+                        http_error(fd, s->enable_cors, 404, "unknown conversation");
+                    } else {
+                        char *new_items = NULL;
+                        bool removed = false;
+                        if (!conversation_items_remove_object(items_json, item_id,
+                                                              &new_items,
+                                                              &removed) ||
+                            !removed) {
+                            http_error(fd, s->enable_cors, 404,
+                                       "unknown conversation item");
+                        } else {
+                            (void)conversation_store_upsert_full(
+                                s, id, metadata, new_items, created_at);
+                            responses_object_store_delete(s, id);
+                            send_conversation_json(s, fd, id);
+                        }
+                        free(new_items);
+                        free(metadata);
+                        free(items_json);
+                    }
+                } else {
+                    http_error(fd, s->enable_cors, 404, "unknown endpoint");
+                }
+                free(item_id);
+            } else {
+                http_error(fd, s->enable_cors, 404, "unknown endpoint");
+            }
+        } else {
+            http_error(fd, s->enable_cors, 404, "unknown endpoint");
+        }
+        free(id);
+        return true;
+    }
+    if (!strcmp(method, "GET")) {
+        send_conversation_json(s, fd, id);
+    } else if (!strcmp(method, "POST")) {
+        char *old_metadata = NULL;
+        uint64_t created_at = 0;
+        if (!conversation_store_lookup(s, id, &old_metadata, &created_at)) {
+            http_error(fd, s->enable_cors, 404, "unknown conversation");
+            free(id);
+            return true;
+        }
+        char *metadata = NULL;
+        bool metadata_seen = false;
+        char *items_json = NULL;
+        bool items_seen = false;
+        if (!parse_conversation_body(body, &metadata, &metadata_seen,
+                                     &items_json, &items_seen,
+                                     err, sizeof(err))) {
+            http_error(fd, s->enable_cors, 400, err);
+            free(old_metadata);
+            free(metadata);
+            free(items_json);
+            free(id);
+            return true;
+        }
+        if (items_seen) {
+            http_error(fd, s->enable_cors, 400,
+                       "conversation.items can only be changed through /items");
+            free(old_metadata);
+            free(metadata);
+            free(items_json);
+            free(id);
+            return true;
+        }
+        if (!metadata_seen) {
+            http_error(fd, s->enable_cors, 400, "metadata is required");
+            free(old_metadata);
+            free(metadata);
+            free(items_json);
+            free(id);
+            return true;
+        }
+        (void)conversation_store_upsert(s, id, metadata, created_at);
+        send_conversation_json(s, fd, id);
+        free(old_metadata);
+        free(metadata);
+        free(items_json);
+    } else if (!strcmp(method, "DELETE")) {
+        if (!conversation_store_delete(s, id)) {
+            http_error(fd, s->enable_cors, 404, "unknown conversation");
+        } else {
+            buf b = {0};
+            buf_puts(&b, "{\"id\":");
+            json_escape(&b, id);
+            buf_puts(&b, ",\"object\":\"conversation.deleted\",\"deleted\":true}\n");
+            http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+            buf_free(&b);
+        }
+    } else {
+        http_error(fd, s->enable_cors, 404, "unknown endpoint");
+    }
+    free(id);
+    return true;
 }
 
 static void client_done(server *s) {
@@ -11570,8 +18604,17 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/deepseek-v4-flash")) {
-        send_model(s, fd);
+    if (!strcmp(hr.method, "GET") && !strncmp(hr.path, "/v1/models/", 11)) {
+        const char *id = hr.path + 11;
+        if (server_model_route_matches(s, id)) {
+            send_model(s, fd);
+        } else {
+            http_error(fd, s->enable_cors, 404, "unknown model");
+        }
+        http_request_free(&hr);
+        goto done;
+    }
+    if (handle_conversations_http(s, fd, hr.method, hr.path, hr.body)) {
         http_request_free(&hr);
         goto done;
     }
@@ -11579,8 +18622,35 @@ static void *client_main(void *arg) {
     request req;
     char err[160];
     bool ok = false;
-    const int ctx_size = ds4_session_ctx(s->session);
-    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+    err[0] = '\0';
+    const bool use_rt = server_uses_runtime_core(s);
+    const int ctx_size = use_rt ? rt_session_ctx(s->rt_session) : ds4_session_ctx(s->session);
+    if (use_rt) {
+        if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
+            ok = parse_chat_request_rt(s->rt_engine, s->rt_ops,
+                                       s,
+                                       hr.body, s->default_tokens,
+                                       ctx_size, &req, err, sizeof(err));
+        } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
+            ok = parse_completion_request_rt(s->rt_engine, s->rt_ops,
+                                             hr.body, s->default_tokens,
+                                             ctx_size, &req, err, sizeof(err));
+        } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+            ok = parse_anthropic_request_rt(s->rt_engine, s->rt_ops,
+                                            s,
+                                            hr.body, s->default_tokens,
+                                            ctx_size, &req, err, sizeof(err));
+        } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
+            ok = parse_responses_request_rt(s->rt_engine, s->rt_ops,
+                                            s,
+                                            hr.body, s->default_tokens,
+                                            ctx_size, &req, err, sizeof(err));
+        } else {
+            http_error(fd, s->enable_cors, 404, "unknown endpoint");
+            http_request_free(&hr);
+            goto done;
+        }
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
@@ -11689,11 +18759,13 @@ typedef struct {
     int default_tokens;
     const char *chdir_path;
     const char *trace_path;
+    const char *mmproj_path;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
+    bool backend_explicit;
     int tool_memory_max_ids;
     bool enable_cors;
 } server_config;
@@ -11748,12 +18820,46 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
                m.comp_cap);
 }
 
+static rt_backend rt_backend_from_ds4_backend(ds4_backend backend) {
+    switch (backend) {
+    case DS4_BACKEND_CPU:
+        return RT_BACKEND_CPU;
+    case DS4_BACKEND_METAL:
+        return RT_BACKEND_METAL;
+    case DS4_BACKEND_CUDA:
+        return RT_BACKEND_CUDA;
+    default:
+        return RT_BACKEND_AUTO;
+    }
+}
+
+static void log_rt_context_memory(const rt_model_ops *ops, rt_backend backend, int ctx_size) {
+    rt_context_memory m = rt_estimate_context_memory(ops, backend, ctx_size);
+    if (!m.total_bytes) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: context buffer estimate unavailable for %s (ctx=%d, backend=%s)",
+                   ops && ops->family ? ops->family : "runtime-core",
+                   ctx_size,
+                   rt_backend_name(backend));
+        return;
+    }
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: runtime-core context buffers %.2f MiB (ctx=%d, backend=%s, state=%.2f MiB, scratch=%.2f MiB)",
+               (double)m.total_bytes / (1024.0 * 1024.0),
+               ctx_size,
+               rt_backend_name(backend),
+               (double)m.state_bytes / (1024.0 * 1024.0),
+               (double)m.scratch_bytes / (1024.0 * 1024.0));
+}
+
 static void server_close_resources(server *s) {
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
     }
     kv_cache_close(&s->kv);
+    responses_object_store_free(s);
+    conversation_store_free(s);
     tool_memory_free(&s->tool_mem);
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
@@ -11763,6 +18869,8 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+    rt_session_free(s->rt_session);
+    rt_engine_close(s->rt_engine);
     ds4_session_free(s->session);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
@@ -11781,6 +18889,8 @@ static void usage(FILE *fp) {
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"
         "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
+        "  --mmproj FILE\n"
+        "      Optional runtime-core multimodal projector GGUF for Qwen vision placeholders.\n"
         "  -c, --ctx N\n"
         "      Context size allocated at startup. Default: 32768\n"
         "  -n, --tokens N\n"
@@ -11909,6 +19019,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--mmproj")) {
+            c.mmproj_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -11959,12 +19071,16 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
+            c.backend_explicit = true;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+            c.backend_explicit = true;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
+            c.backend_explicit = true;
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
+            c.backend_explicit = true;
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr);
@@ -12001,23 +19117,80 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    ds4_runtime_register();
+    qwen36_runtime_register();
+    mistral35_runtime_register();
+
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
-
-    log_context_memory(cfg.engine.backend, cfg.ctx_size);
-
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
-                   ds4_backend_name(cfg.engine.backend));
-        ds4_engine_close(engine);
-        return 1;
+    rt_engine *rt_engine = NULL;
+    rt_session *rt_session = NULL;
+    const rt_model_ops *rt_ops = rt_probe_model_path(cfg.engine.model_path);
+    const bool use_runtime_core =
+        rt_ops && strcmp(rt_ops->family, "deepseek-v4-flash") != 0;
+
+    if (use_runtime_core) {
+        rt_backend backend = cfg.backend_explicit ?
+            rt_backend_from_ds4_backend(cfg.engine.backend) : RT_BACKEND_AUTO;
+        qwen36_runtime_engine_options qwen_extra = {
+            .mmproj_path = cfg.mmproj_path,
+            .mtp_path = cfg.engine.mtp_path,
+            .enable_mtp = cfg.engine.mtp_path != NULL ||
+                          cfg.engine.mtp_draft_tokens > 1,
+            .mtp_draft_tokens = cfg.engine.mtp_draft_tokens,
+            .mtp_margin = cfg.engine.mtp_margin,
+        };
+        rt_engine_options rt_opt = {
+            .model_path = cfg.engine.model_path,
+            .backend = backend,
+            .n_threads = cfg.engine.n_threads,
+            .warm_weights = cfg.engine.warm_weights,
+            .quality = cfg.engine.quality,
+            .model_options = !strcmp(rt_ops->family, QWEN36_RUNTIME_FAMILY) ?
+                &qwen_extra : NULL,
+        };
+        if (cfg.engine.directional_steering_file) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: directional steering is not supported by runtime-core model %s",
+                       rt_ops->family);
+            return 2;
+        }
+        if (rt_engine_open_with_ops(&rt_engine, rt_ops, &rt_opt) != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to open runtime-core model %s with backend %s",
+                       rt_ops->family,
+                       rt_backend_name(backend));
+            return 1;
+        }
+        log_rt_context_memory(rt_ops, backend, cfg.ctx_size);
+        if (rt_session_create(&rt_session, rt_engine, cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to create runtime-core session for %s",
+                       rt_ops->family);
+            rt_engine_close(rt_engine);
+            return 1;
+        }
+        rt_engine_summary(rt_engine);
+    } else {
+        if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+
+        log_context_memory(cfg.engine.backend, cfg.ctx_size);
+
+        if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
+                       ds4_backend_name(cfg.engine.backend));
+            ds4_engine_close(engine);
+            return 1;
+        }
     }
 
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
     s.session = session;
+    s.rt_engine = rt_engine;
+    s.rt_session = rt_session;
+    s.rt_ops = rt_ops;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
@@ -12025,6 +19198,7 @@ int main(int argc, char **argv) {
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        responses_object_store_set_dir(&s, cfg.kv_disk_dir);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -12111,8 +19285,9 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    const ds4_tokens *tokens = ds4_session_tokens(s.session);
-    if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
+    const ds4_tokens *tokens = s.session ? ds4_session_tokens(s.session) : NULL;
+    if (!server_uses_runtime_core(&s) &&
+        s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);
@@ -12426,6 +19601,35 @@ static char *read_socket_text(int fd) {
         buf_append(&b, tmp, (size_t)n);
     }
     return buf_take(&b);
+}
+
+static char *test_conversation_http(server *s, const char *method,
+                                    const char *path, const char *body) {
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(handle_conversations_http(s, sv[0], method, path,
+                                          body ? body : ""));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    close(sv[0]);
+    close(sv[1]);
+    return out;
+}
+
+static char *test_json_string_field(const char *json, const char *field) {
+    buf pat = {0};
+    buf_putc(&pat, '"');
+    buf_puts(&pat, field);
+    buf_puts(&pat, "\":\"");
+    const char *p = strstr(json ? json : "", pat.ptr ? pat.ptr : "");
+    buf_free(&pat);
+    if (!p) return NULL;
+    p = strchr(p, ':');
+    if (!p || p[1] != '"') return NULL;
+    p += 2;
+    const char *end = strchr(p, '"');
+    if (!end) return NULL;
+    return xstrndup(p, (size_t)(end - p));
 }
 
 static void test_context_length_error_uses_protocol_standard_shape(void) {
@@ -14153,7 +21357,7 @@ static void test_responses_tool_output_id_validation(void) {
     chat_msgs_push(&msgs, tool);
 
     char err[160] = {0};
-    TEST_ASSERT(!responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH, NULL, NULL,
+    TEST_ASSERT(!responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH, NULL, NULL, NULL,
                                                  err, sizeof(err)));
     TEST_ASSERT(strstr(err, "Responses continuation state is not available") != NULL);
 
@@ -14165,9 +21369,22 @@ static void test_responses_tool_output_id_validation(void) {
     err[0] = '\0';
     bool needs_live_tool_state = false;
     TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+                                                NULL,
                                                 &needs_live_tool_state, NULL,
                                                 err, sizeof(err)));
     TEST_ASSERT(needs_live_tool_state);
+
+    live_tool_state_clear_locked(&s.responses_live);
+    stop_list durable_ids = {0};
+    id_list_push_unique(&durable_ids, "call_missing");
+    err[0] = '\0';
+    needs_live_tool_state = false;
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+                                                &durable_ids,
+                                                &needs_live_tool_state, NULL,
+                                                err, sizeof(err)));
+    TEST_ASSERT(!needs_live_tool_state);
+    id_list_free(&durable_ids);
 
     chat_msgs_free(&msgs);
     live_tool_state_free(&s.responses_live);
@@ -14198,6 +21415,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     bool needs_live_reasoning = false;
     bool needs_live_tool_state = false;
     TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+                                                NULL,
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
@@ -14213,6 +21431,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     needs_live_reasoning = false;
     needs_live_tool_state = false;
     TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+                                                NULL,
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
@@ -14225,6 +21444,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     needs_live_reasoning = false;
     needs_live_tool_state = false;
     TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+                                                NULL,
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
@@ -14237,6 +21457,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     needs_live_reasoning = false;
     needs_live_tool_state = false;
     TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_NONE,
+                                                NULL,
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
@@ -14278,6 +21499,192 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
 
     tool_calls_free(&calls);
     request_free(&r);
+}
+
+static void test_responses_object_store_round_trips_previous_response(void) {
+    char tmpl[] = "/tmp/ds4-resp-object-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    responses_object_store_set_dir(&s, dir);
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_obj");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&calls, tc);
+
+    responses_object_store_remember(
+        &s, "resp_object_test",
+        "<|im_start|>user\nhi<|im_end|>\n"
+        "<|im_start|>assistant\nok<|im_end|>\n",
+        &calls);
+    char conv_id[] = "conv_object_test";
+    request conv_req = {0};
+    conv_req.responses_conversation_id = conv_id;
+    responses_object_store_remember_response_state(
+        &s, &conv_req, "resp_object_conv_test",
+        "<|im_start|>user\nhello<|im_end|>\n"
+        "<|im_start|>assistant\nok<|im_end|>\n",
+        &calls);
+
+    char *visible = NULL;
+    stop_list ids = {0};
+    TEST_ASSERT(responses_object_store_lookup(&s, "resp_object_test",
+                                              &visible, &ids));
+    TEST_ASSERT(visible && strstr(visible, "assistant") != NULL);
+    TEST_ASSERT(id_list_contains(&ids, "call_obj"));
+    free(visible);
+    id_list_free(&ids);
+    TEST_ASSERT(responses_object_store_lookup(&s, "conv_object_test",
+                                              &visible, &ids));
+    TEST_ASSERT(visible && strstr(visible, "hello") != NULL);
+    TEST_ASSERT(id_list_contains(&ids, "call_obj"));
+    free(visible);
+    id_list_free(&ids);
+
+    responses_object_store_free(&s);
+    responses_object_store_set_dir(&s, dir);
+    TEST_ASSERT(responses_object_store_lookup(&s, "resp_object_test",
+                                              &visible, &ids));
+    TEST_ASSERT(visible && strstr(visible, "<|im_start|>user") != NULL);
+    TEST_ASSERT(id_list_contains(&ids, "call_obj"));
+    free(visible);
+    id_list_free(&ids);
+    TEST_ASSERT(responses_object_store_lookup(&s, "conv_object_test",
+                                              &visible, &ids));
+    TEST_ASSERT(visible && strstr(visible, "<|im_start|>user\nhello") != NULL);
+    TEST_ASSERT(id_list_contains(&ids, "call_obj"));
+    free(visible);
+    id_list_free(&ids);
+
+    const char *paths[] = {
+        "resp_object_test",
+        "resp_object_conv_test",
+        "conv_object_test",
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        char *path = responses_object_path(&s.responses_store, paths[i]);
+        if (path) {
+            unlink(path);
+            free(path);
+        }
+    }
+    responses_object_store_free(&s);
+    tool_calls_free(&calls);
+    pthread_mutex_destroy(&s.tool_mu);
+    rmdir(dir);
+}
+
+static void test_conversation_store_and_http_lifecycle(void) {
+    char tmpl[] = "/tmp/ds4-conv-object-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    responses_object_store_set_dir(&s, dir);
+
+    char *out = test_conversation_http(&s, "POST", "/v1/conversations",
+        "{\"metadata\":{\"topic\":\"demo\"}}");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "\"object\":\"conversation\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"metadata\":{\"topic\":\"demo\"}") != NULL);
+    char *id = test_json_string_field(out, "id");
+    TEST_ASSERT(id && !strncmp(id, "conv_", 5));
+    free(out);
+
+    char path[128];
+    snprintf(path, sizeof(path), "/v1/conversations/%s", id ? id : "");
+    out = test_conversation_http(&s, "GET", path, "");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "\"metadata\":{\"topic\":\"demo\"}") != NULL);
+    free(out);
+
+    out = test_conversation_http(&s, "POST", path,
+        "{\"metadata\":{\"topic\":\"updated\",\"owner\":\"local\"}}");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out,
+                       "\"metadata\":{\"topic\":\"updated\",\"owner\":\"local\"}") != NULL);
+    free(out);
+
+    responses_object_store_remember(
+        &s, id,
+        "<|im_start|>user\nhi<|im_end|>\n",
+        NULL);
+    out = test_conversation_http(&s, "DELETE", path, "");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "\"object\":\"conversation.deleted\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"deleted\":true") != NULL);
+    free(out);
+    char *visible = NULL;
+    stop_list ids = {0};
+    TEST_ASSERT(!responses_object_store_lookup(&s, id, &visible, &ids));
+    id_list_free(&ids);
+    free(visible);
+
+    out = test_conversation_http(&s, "GET", path, "");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 404 Not Found") != NULL);
+    free(out);
+
+    out = test_conversation_http(&s, "POST", "/v1/conversations",
+        "{\"items\":[{\"type\":\"message\",\"role\":\"user\","
+        "\"content\":[{\"type\":\"input_text\",\"text\":\"seed item\"}]}]}");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    char *item_conv_id = test_json_string_field(out, "id");
+    TEST_ASSERT(item_conv_id && !strncmp(item_conv_id, "conv_", 5));
+    free(out);
+
+    snprintf(path, sizeof(path), "/v1/conversations/%s/items",
+             item_conv_id ? item_conv_id : "");
+    out = test_conversation_http(&s, "GET", path, "");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "\"object\":\"list\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"seed item\"") != NULL);
+    char *item_id = test_json_string_field(out, "id");
+    TEST_ASSERT(item_id && !strncmp(item_id, "msg_", 4));
+    free(out);
+
+    out = test_conversation_http(&s, "POST", path,
+        "{\"items\":[{\"type\":\"message\",\"role\":\"user\","
+        "\"content\":\"second item\"}]}");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "\"second item\"") != NULL);
+    free(out);
+
+    char item_path[192];
+    snprintf(item_path, sizeof(item_path), "%s/%s", path, item_id ? item_id : "");
+    out = test_conversation_http(&s, "GET", item_path, "");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "\"seed item\"") != NULL);
+    free(out);
+
+    out = test_conversation_http(&s, "DELETE", item_path, "");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "\"object\":\"conversation\"") != NULL);
+    free(out);
+
+    out = test_conversation_http(&s, "GET", item_path, "");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 404 Not Found") != NULL);
+    free(out);
+
+    out = test_conversation_http(&s, "POST", "/v1/conversations",
+        "{\"items\":[{\"type\":\"message\",\"role\":\"user\","
+        "\"content\":[{\"type\":\"input_image\",\"image_url\":\"file://x\"}]}]}");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 400 Bad Request") != NULL);
+    TEST_ASSERT(strstr(out, "conversation.items supports completed text/tool items only") != NULL);
+    free(out);
+
+    free(item_id);
+    free(item_conv_id);
+    free(id);
+    responses_object_store_free(&s);
+    conversation_store_free(&s);
+    pthread_mutex_destroy(&s.tool_mu);
+    rmdir(dir);
 }
 
 static void test_exact_dsml_tool_replay_can_be_disabled(void) {
@@ -14544,6 +21951,37 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
+}
+
+static void test_server_model_guard_rejects_registered_unserved_runtime(void) {
+    request r;
+    char err[256];
+    request_init(&r, REQ_CHAT, 128);
+
+    free(r.model);
+    r.model = xstrdup("qwen3.6-27b");
+    err[0] = '\0';
+    TEST_ASSERT(!request_model_supported_by_ds4_server(&r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "runtime-core") != NULL);
+    TEST_ASSERT(strstr(err, "deepseek-v4-flash only") != NULL);
+
+    free(r.model);
+    r.model = xstrdup("mistral-medium-3.5-128b");
+    err[0] = '\0';
+    TEST_ASSERT(!request_model_supported_by_ds4_server(&r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "runtime-core") != NULL);
+
+    free(r.model);
+    r.model = xstrdup("deepseek-chat");
+    err[0] = '\0';
+    TEST_ASSERT(request_model_supported_by_ds4_server(&r, err, sizeof(err)));
+
+    free(r.model);
+    r.model = xstrdup("legacy-openai-compatible-alias");
+    err[0] = '\0';
+    TEST_ASSERT(request_model_supported_by_ds4_server(&r, err, sizeof(err)));
+
+    request_free(&r);
 }
 
 static void test_client_socket_nonblocking_flag(void) {
@@ -14857,6 +22295,9 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 768);
     TEST_ASSERT(idx >= 0 && kc.entry[idx].text_bytes == strlen(long_text));
     TEST_ASSERT(kv_cache_find_text_prefix(&kc, "transcript prefiX", 2, 32768) < 0);
+    TEST_ASSERT(kv_cache_find_text_prefix(&kc,
+        "transcript prefix with sampled token bytes and suffix",
+        KV_CACHE_RT_QWEN36, 32768) < 0);
 
     kv_cache_close(&kc);
     char short_sha[41], long_sha[41];
@@ -15529,6 +22970,8 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
     test_responses_visible_suffix_matches_client_replay();
+    test_responses_object_store_round_trips_previous_response();
+    test_conversation_store_and_http_lifecycle();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
@@ -15545,6 +22988,7 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
+    test_server_model_guard_rejects_registered_unserved_runtime();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
