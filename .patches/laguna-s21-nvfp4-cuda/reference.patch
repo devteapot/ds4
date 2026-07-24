@@ -68,7 +68,7 @@ index 81d4881..e5cfda1 100644
 -	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 +	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_laguna_smoke
 diff --git a/README.md b/README.md
-index 7d9e5c7..936ea5f 100644
+index 7d9e5c7..cc53874 100644
 --- a/README.md
 +++ b/README.md
 @@ -109,6 +109,7 @@ Download one main model. **Prefer the imatrix versions.**
@@ -96,7 +96,7 @@ index 7d9e5c7..936ea5f 100644
  
  ```sh
  ./download_model.sh laguna-q4
-@@ -189,6 +190,92 @@ reasoning, and tagged tool-call formats:
+@@ -189,6 +190,98 @@ reasoning, and tagged tool-call formats:
  ./ds4-server -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
  ```
  
@@ -144,9 +144,12 @@ index 7d9e5c7..936ea5f 100644
 +the batch. Decode and DFlash verification use the native W4A4 integer-dot
 +kernel: GB10's FP4 MMA has no GEMV-sized form, so these narrow routed batches
 +would discard most of its result columns and are slower in practice. The CUDA
-+quantizer predecodes dynamic E2M1 activations to signed bytes once per group;
-+gate, up, and down projections then reuse them directly in DP4A rather than
-+decoding the same activation nibbles for every output row.
++quantizer predecodes dynamic E2M1 activations to signed bytes once per group.
++The supported checkpoint has one routed gate/up input-global scale per layer,
++so decode quantizes each token once and shares it across all ten selected
++experts; loader preparation verifies this invariant. Gate and up consume each
++activation group together, and down reuses the quantized routed intermediate
++directly in DP4A.
 +
 +The official NVFP4 checkpoint is Blackwell-only in this backend and requires
 +the family-specific `cuda-spark` build. Use the official Q4_K_M model with
@@ -167,21 +170,24 @@ index 7d9e5c7..936ea5f 100644
 +The native NVFP4 drafter defaults to Poolside's recommended seven proposals;
 +`--mtp-draft 15` selects the longer block used in Poolside's published
 +throughput comparison. Target verification still determines every committed
-+token. On GB10, the 2K/256 `ds4.c` workload measures 14.50 generation tok/s
-+raw, 21.45 tok/s at depth 7, and 17.99 tok/s at depth 15. Depth 7 accepts
-+62.84% of proposals and is the default. The full result is in
++token. Laguna's Blackwell verifier uses a fixed head-dimension-128 split-K
++attention kernel for its at-most-16-token staged block, distributing the long
++history over 16 warps instead of walking it serially. On GB10, the 2K/256
++`ds4.c` workload measures 14.74 generation tok/s raw, 28.15 tok/s at depth 5,
++and 31.73 tok/s at depth 7. Depth 7 accepts 64.31% of proposals, commits 5.45
++tokens per verifier block, and is the default. The full result is in
 +`speed-bench/laguna_s21_nvfp4_dflash_gb10.csv`.
 +
 +An apples-to-apples rerun on one immutable 2,048-token prompt used each
 +target's official drafter and generated 256 greedy tokens. Q4_K_M with
 +`Laguna-S-2.1-DFlash-BF16` at depth 15 reached 27.81 token/s; NVFP4 with
-+`Laguna-S-2.1-DFlash-NVFP4` at depth 5 reached 20.79 token/s. The Q4 run
-+committed 8.00 tokens per 287.38 ms block, while NVFP4 committed 4.65 tokens
-+per 223.66 ms block. The full verifier accounting is in
++`Laguna-S-2.1-DFlash-NVFP4` at depth 7 reached 31.73 token/s. The Q4 run
++committed 8.00 tokens per 287.38 ms block, while NVFP4 committed 5.45 tokens
++per 171.66 ms block. The full verifier accounting is in
 +`speed-bench/laguna_s21_dflash_quant_comparison_gb10.csv`. These figures are
 +prompt-sensitive: high-acceptance Q4 workloads still reach roughly 42
-+token/s, while this NVFP4 drafter's acceptance falls sharply at longer draft
-+depths.
++token/s, while NVFP4's shorter verifier block wins this particular workload
++through substantially lower cycle latency.
 +
 +SSD streaming, distributed inference, Metal, and ROCm are not part of the
 +native NVFP4 path.
@@ -382,7 +388,7 @@ index e52da5d..7bb6b2b 100755
      cd "$ROOT"
      ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
 diff --git a/ds4.c b/ds4.c
-index 39b39be..8e13e1a 100644
+index 39b39be..9d0b702 100644
 --- a/ds4.c
 +++ b/ds4.c
 @@ -19,6 +19,7 @@
@@ -3342,16 +3348,20 @@ index 39b39be..8e13e1a 100644
      }
  
      const uint32_t prefill_cap =
-@@ -49274,6 +51329,8 @@ struct ds4_session {
+@@ -49274,6 +51329,12 @@ struct ds4_session {
      bool glm_graph_ready;
      ds4_laguna_gpu_graph laguna_graph;
      bool laguna_graph_ready;
 +    ds4_dflash_gpu_graph dflash_graph;
 +    bool dflash_graph_ready;
++    int dflash_next_argmax;
++    bool dflash_next_argmax_valid;
++    uint32_t dflash_next_logits_row;
++    bool dflash_next_logits_pending;
      uint32_t glm_dense_cache_len;
      /* GLM MTP speculative state (--glm-mtp, greedy only). */
      int glm_mtp_draft;
-@@ -51080,6 +53137,7 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
+@@ -51080,6 +53141,7 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
          return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
      }
      if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
@@ -3359,7 +3369,7 @@ index 39b39be..8e13e1a 100644
  #ifndef DS4_NO_GPU
      if (e &&
          e->backend != DS4_BACKEND_CPU &&
-@@ -57480,9 +59538,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57480,9 +59542,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
              *out = e;
              return 0;
          }
@@ -3372,7 +3382,7 @@ index 39b39be..8e13e1a 100644
              ds4_engine_close(e);
              *out = NULL;
              return 1;
-@@ -57509,12 +59568,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57509,12 +59572,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
              opt->directional_steering_ffn != 0.0f ||
              e->power_percent < 100 ||
              opt->prefill_chunk != 0 ||
@@ -3387,7 +3397,7 @@ index 39b39be..8e13e1a 100644
              ds4_engine_close(e);
              *out = NULL;
              return 1;
-@@ -57770,10 +59828,36 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57770,10 +59832,36 @@ static int ds4_engine_open_internal(ds4_engine **out,
                      e->dspark_weights.missing_tensors,
                      e->dspark_weights.invalid_tensors,
                      e->dspark_weights.metadata_errors);
@@ -3425,7 +3435,7 @@ index 39b39be..8e13e1a 100644
                      opt->mtp_path,
                      support_kind_name(e->support_kind));
              ds4_engine_close(e);
-@@ -57867,6 +59951,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57867,6 +59955,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
          }
          ds4_gpu_set_quality(e->quality);
          ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
@@ -3436,7 +3446,7 @@ index 39b39be..8e13e1a 100644
          ds4_gpu_set_ssd_streaming(e->ssd_streaming);
          if (!ds4_engine_configure_streaming_auto_cache(e)) {
              ds4_engine_close(e);
-@@ -58129,6 +60217,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -58129,6 +60221,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
          }
          const bool support_model_runtime_ready =
              e->mtp_ready ||
@@ -3444,7 +3454,7 @@ index 39b39be..8e13e1a 100644
              (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
          if (support_model_runtime_ready &&
              !ds4_gpu_set_model_map_range(e->mtp_model.map,
-@@ -58708,7 +60797,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+@@ -58708,7 +60801,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
              return 1;
          }
          s->laguna_graph_ready = true;
@@ -3468,7 +3478,7 @@ index 39b39be..8e13e1a 100644
          s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
          s->sample_probs =
              xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
-@@ -59001,6 +61105,7 @@ void ds4_session_free(ds4_session *s) {
+@@ -59001,6 +61109,7 @@ void ds4_session_free(ds4_session *s) {
  #ifndef DS4_NO_GPU
      else {
          if (ds4_session_is_laguna(s)) {
@@ -3476,7 +3486,20 @@ index 39b39be..8e13e1a 100644
              laguna_graph_free(&s->laguna_graph);
          } else if (ds4_session_is_glm(s)) {
              glm_graph_free(&s->glm_graph);
-@@ -60130,19 +62235,24 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
+@@ -59953,6 +62062,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
+  * once its matching prefill completes, surfacing worker-side failures
+  * here instead of as a gate timeout mid-decode. */
+ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
++#ifndef DS4_NO_GPU
++    if (s) {
++        s->dflash_next_argmax_valid = false;
++        s->dflash_next_logits_pending = false;
++    }
++#endif
+     const bool mirror = ds4_session_tp_leader(s);
+     if (mirror && prompt && prompt->len > 0) {
+         if (!ds4_tp_send_sync(s->engine->tp.ctx, s->tp_session_id,
+@@ -60130,19 +62245,24 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                  laguna_graph_forward_token(&s->laguna_graph,
                                             &e->model,
                                             &e->weights,
@@ -3502,7 +3525,7 @@ index 39b39be..8e13e1a 100644
              if (!ok) {
                  snprintf(err, errlen,
                           "%s Laguna prefill failed at token %d",
-@@ -60151,6 +62261,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
+@@ -60151,6 +62271,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                  s->checkpoint_valid = false;
                  return 1;
              }
@@ -3522,7 +3545,102 @@ index 39b39be..8e13e1a 100644
              for (uint32_t j = 0; j < n; j++) {
                  token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
              }
-@@ -61698,6 +63821,8 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
+@@ -60968,12 +63101,41 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
+     return i;
+ }
+ 
++#ifndef DS4_NO_GPU
++static bool ds4_session_materialize_dflash_logits(ds4_session *s) {
++    if (!s || !s->dflash_next_logits_pending) return true;
++    if (!s->dflash_graph_ready ||
++        !ds4_gpu_tensor_read(
++            s->dflash_graph.target_logits,
++            (uint64_t)s->dflash_next_logits_row *
++                DS4_N_VOCAB * sizeof(float),
++            s->logits,
++            (uint64_t)DS4_N_VOCAB * sizeof(float))) {
++        return false;
++    }
++    s->dflash_next_logits_pending = false;
++    return true;
++}
++#endif
++
+ int ds4_session_argmax(ds4_session *s) {
++#ifndef DS4_NO_GPU
++    if (s && s->dflash_next_argmax_valid) {
++        return s->dflash_next_argmax;
++    }
++#endif
+     return sample_argmax(s->logits, DS4_N_VOCAB);
+ }
+ 
+ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
+     if (!s || !s->logits) return -1;
++#ifndef DS4_NO_GPU
++    if (s->dflash_next_argmax_valid &&
++        s->dflash_next_argmax != excluded_id) {
++        return s->dflash_next_argmax;
++    }
++    if (!ds4_session_materialize_dflash_logits(s)) return -1;
++#endif
+     int best = -1;
+     float best_logit = DS4_NEG_INF;
+     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+@@ -60999,12 +63161,22 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
+ }
+ 
+ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
++#ifndef DS4_NO_GPU
++    if (s && temperature <= 0.0f && s->dflash_next_argmax_valid) {
++        s->dflash_next_argmax_valid = false;
++        return s->dflash_next_argmax;
++    }
++    if (!ds4_session_materialize_dflash_logits(s)) return -1;
++#endif
+     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
+                               top_p, min_p, rng, s->sample_probs);
+ }
+ 
+ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
+     if (!s || !out || k <= 0) return 0;
++#ifndef DS4_NO_GPU
++    if (!ds4_session_materialize_dflash_logits(s)) return 0;
++#endif
+     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
+     for (int i = 0; i < k; i++) {
+         out[i].id = -1;
+@@ -61042,6 +63214,9 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
+ 
+ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
+     if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
++#ifndef DS4_NO_GPU
++    if (!ds4_session_materialize_dflash_logits(s)) return 0;
++#endif
+ 
+     float max_logit = DS4_NEG_INF;
+     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+@@ -61064,12 +63239,19 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
+ 
+ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
+     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
++#ifndef DS4_NO_GPU
++    if (!ds4_session_materialize_dflash_logits(s)) return 0;
++#endif
+     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
+     return (int)DS4_N_VOCAB;
+ }
+ 
+ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
+     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
++#ifndef DS4_NO_GPU
++    s->dflash_next_argmax_valid = false;
++    s->dflash_next_logits_pending = false;
++#endif
+     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+     return 0;
+ }
+@@ -61698,6 +63880,8 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
      case DS4_SUPPORT_DSPARK:
          (void)ds4_session_prepare_dspark_draft(s, token, pos);
          break;
@@ -3531,7 +3649,7 @@ index 39b39be..8e13e1a 100644
      case DS4_SUPPORT_NONE:
      default:
          break;
-@@ -61758,13 +63883,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -61758,13 +63942,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
          }
          if ((uint32_t)s->checkpoint.len >= s->laguna_graph.ctx_size) {
              if (errlen) snprintf(err, errlen,
@@ -3548,7 +3666,7 @@ index 39b39be..8e13e1a 100644
                                          token,
                                          (uint32_t)s->checkpoint.len,
                                          s->logits)) {
-@@ -61773,6 +63900,18 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -61773,6 +63959,18 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
              s->checkpoint_valid = false;
              return 1;
          }
@@ -3567,7 +3685,7 @@ index 39b39be..8e13e1a 100644
          token_vec_push(&s->checkpoint, token);
          s->checkpoint_valid = true;
          s->mtp_draft_valid = false;
-@@ -66135,6 +68274,136 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
+@@ -66135,6 +68333,139 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
      return rc;
  }
  
@@ -3582,6 +3700,8 @@ index 39b39be..8e13e1a 100644
 +        char        *err,
 +        size_t       errlen) {
 +    ds4_engine *e = s->engine;
++    s->dflash_next_argmax_valid = false;
++    s->dflash_next_logits_pending = false;
 +    int draft_n = e->mtp_draft_tokens;
 +    if (draft_n > max_tokens - 1) draft_n = max_tokens - 1;
 +    if (draft_n > accepted_cap - 1) draft_n = accepted_cap - 1;
@@ -3665,15 +3785,16 @@ index 39b39be..8e13e1a 100644
 +           (int)target_tops[matched] == drafts[matched]) {
 +        matched++;
 +    }
-+    if (!ds4_gpu_tensor_read(
-+            s->dflash_graph.target_logits,
-+            (uint64_t)matched * DS4_N_VOCAB * sizeof(float),
-+            s->logits,
-+            (uint64_t)DS4_N_VOCAB * sizeof(float))) {
-+        snprintf(err, errlen, "DFlash committed logits readback failed");
-+        s->checkpoint_valid = false;
-+        return -1;
-+    }
++    /*
++     * DFlash is greedy-only and target_tops already contains the target
++     * argmax for every verifier row. Preserve that bonus token for the next
++     * cycle instead of copying a 66,560-float logits row through GB10's
++     * unified-memory boundary merely to run argmax again on the CPU.
++     */
++    s->dflash_next_argmax = (int)target_tops[matched];
++    s->dflash_next_argmax_valid = true;
++    s->dflash_next_logits_row = (uint32_t)matched;
++    s->dflash_next_logits_pending = true;
 +    token_vec_push(&s->checkpoint, first_token);
 +    accepted[0] = first_token;
 +    int n_accept = 1;
@@ -3704,7 +3825,7 @@ index 39b39be..8e13e1a 100644
  int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                          int max_tokens, int eos_token,
                                          int *accepted, int accepted_cap,
-@@ -66191,6 +68460,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+@@ -66191,6 +68522,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      return -1;
  #else
      ds4_engine *e = s->engine;
@@ -3722,6 +3843,26 @@ index 39b39be..8e13e1a 100644
      if (ds4_session_is_glm(s) && ds4_engine_glm_mtp_spec_enabled(e)) {
          int cycle_cap = accepted_cap;
          if (cycle_cap > max_tokens) cycle_cap = max_tokens;
+@@ -66869,6 +69211,8 @@ void ds4_session_invalidate(ds4_session *s) {
+     ds4_session_dspark_capture_invalidate(s);
+ #ifndef DS4_NO_GPU
+     ds4_session_glm_reset_dense_cache(s);
++    s->dflash_next_argmax_valid = false;
++    s->dflash_next_logits_pending = false;
+ #endif
+ }
+ 
+@@ -66881,6 +69225,10 @@ void ds4_session_rewind(ds4_session *s, int pos) {
+     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+     s->checkpoint.len = pos;
+     s->mtp_draft_valid = false;
++#ifndef DS4_NO_GPU
++    s->dflash_next_argmax_valid = false;
++    s->dflash_next_logits_pending = false;
++#endif
+     ds4_session_dspark_capture_invalidate(s);
+ #ifndef DS4_NO_GPU
+     ds4_session_glm_cap_dense_cache(s);
 diff --git a/ds4_bench.c b/ds4_bench.c
 index 4b2b0d3..5217fa3 100644
 --- a/ds4_bench.c
@@ -3859,7 +4000,7 @@ index 4b2b0d3..5217fa3 100644
                  "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                  frontier,
 diff --git a/ds4_cuda.cu b/ds4_cuda.cu
-index e66fa36..e728f61 100644
+index e66fa36..404375b 100644
 --- a/ds4_cuda.cu
 +++ b/ds4_cuda.cu
 @@ -1,5 +1,7 @@
@@ -5087,7 +5228,7 @@ index e66fa36..e728f61 100644
  extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
      g_ssd_streaming_mode = enabled ? 1 : 0;
      cuda_stream_selected_cache_invalidate();
-@@ -27668,103 +28597,3118 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+@@ -27668,103 +28597,3307 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
      return 0;
  }
  
@@ -5483,6 +5624,139 @@ index e66fa36..e728f61 100644
 +    oh[lane + 96u] = merged3 * inv_sum * gate_scale;
 +}
 +
++/*
++ * Laguna DFlash verifies at most sixteen staged tokens against a long shared
++ * history. The generic GQA prefill kernel walks that history serially inside
++ * one block; on GB10 that leaves most SMs idle. Stripe each (query, head)
++ * across sixteen warps and merge the online-softmax partials, matching the
++ * model's existing long-context decode schedule while reading staged K/V for
++ * the causal tail. This is deliberately fixed to Laguna's 128-wide heads.
++ */
++template <uint32_t SPLITS>
++__global__ static void laguna_attention_verify_split_kernel(
++        float *out,
++        const float *q,
++        const float *gate,
++        const __half *key_cache,
++        const __half *value_cache,
++        const __half *staged_key,
++        const __half *staged_value,
++        uint32_t pos0,
++        uint32_t n_tokens,
++        uint32_t cache_cap,
++        uint32_t n_head,
++        uint32_t n_head_kv,
++        uint32_t head_dim,
++        float scale) {
++    const uint32_t head = blockIdx.x;
++    const uint32_t token = blockIdx.y;
++    const uint32_t lane = threadIdx.x & 31u;
++    const uint32_t warp = threadIdx.x >> 5u;
++    if (head >= n_head || token >= n_tokens ||
++        warp >= SPLITS || head_dim != 128u) {
++        return;
++    }
++    const uint32_t heads_per_kv = n_head / n_head_kv;
++    const uint32_t kv_head = head / heads_per_kv;
++    const uint32_t width = n_head_kv * head_dim;
++    const uint32_t query_pos = pos0 + token;
++    const uint32_t key_count =
++        query_pos + 1u < cache_cap ? query_pos + 1u : cache_cap;
++    const uint32_t key_start = query_pos + 1u - key_count;
++    const float *qh =
++        q + ((uint64_t)token * n_head + head) * head_dim;
++
++    float acc0 = 0.0f;
++    float acc1 = 0.0f;
++    float acc2 = 0.0f;
++    float acc3 = 0.0f;
++    float max_score = -INFINITY;
++    float score_sum = 0.0f;
++    for (uint32_t i = warp; i < key_count; i += SPLITS) {
++        const uint32_t key_pos = key_start + i;
++        const bool current = key_pos >= pos0;
++        const uint32_t source_row =
++            current ? key_pos - pos0 : key_pos % cache_cap;
++        const uint64_t kv_base =
++            (uint64_t)source_row * width +
++            (uint64_t)kv_head * head_dim;
++        const __half *key_source = current ? staged_key : key_cache;
++        const __half *value_source = current ? staged_value : value_cache;
++        float score =
++            qh[lane] * __half2float(key_source[kv_base + lane]) +
++            qh[lane + 32u] *
++                __half2float(key_source[kv_base + lane + 32u]) +
++            qh[lane + 64u] *
++                __half2float(key_source[kv_base + lane + 64u]) +
++            qh[lane + 96u] *
++                __half2float(key_source[kv_base + lane + 96u]);
++        score = __shfl_sync(
++            0xffffffffu, warp_sum_f32(score), 0) * scale;
++        const float next_max = fmaxf(max_score, score);
++        const float old_scale = isinf(max_score) ?
++            0.0f : expf(max_score - next_max);
++        const float value_scale = expf(score - next_max);
++        score_sum = score_sum * old_scale + value_scale;
++        acc0 = acc0 * old_scale +
++            __half2float(value_source[kv_base + lane]) * value_scale;
++        acc1 = acc1 * old_scale +
++            __half2float(value_source[kv_base + lane + 32u]) * value_scale;
++        acc2 = acc2 * old_scale +
++            __half2float(value_source[kv_base + lane + 64u]) * value_scale;
++        acc3 = acc3 * old_scale +
++            __half2float(value_source[kv_base + lane + 96u]) * value_scale;
++        max_score = next_max;
++    }
++
++    __shared__ float partial_max[SPLITS];
++    __shared__ float partial_sum[SPLITS];
++    __shared__ float partial_value[SPLITS * 128];
++    if (lane == 0u) {
++        partial_max[warp] = max_score;
++        partial_sum[warp] = score_sum;
++    }
++    const uint32_t value_base = warp * 128u + lane;
++    partial_value[value_base] = acc0;
++    partial_value[value_base + 32u] = acc1;
++    partial_value[value_base + 64u] = acc2;
++    partial_value[value_base + 96u] = acc3;
++    __syncthreads();
++    if (warp != 0u) return;
++
++    float global_max = partial_max[0];
++#pragma unroll
++    for (uint32_t w = 1u; w < SPLITS; w++) {
++        global_max = fmaxf(global_max, partial_max[w]);
++    }
++    float merged_sum = 0.0f;
++    float merged0 = 0.0f;
++    float merged1 = 0.0f;
++    float merged2 = 0.0f;
++    float merged3 = 0.0f;
++#pragma unroll
++    for (uint32_t w = 0u; w < SPLITS; w++) {
++        const float weight = partial_sum[w] > 0.0f ?
++            expf(partial_max[w] - global_max) : 0.0f;
++        merged_sum += partial_sum[w] * weight;
++        const uint32_t base = w * 128u + lane;
++        merged0 += partial_value[base] * weight;
++        merged1 += partial_value[base + 32u] * weight;
++        merged2 += partial_value[base + 64u] * weight;
++        merged3 += partial_value[base + 96u] * weight;
++    }
++    const float inv_sum =
++        merged_sum > 0.0f ? 1.0f / merged_sum : 0.0f;
++    const uint64_t head_index = (uint64_t)token * n_head + head;
++    const float gate_value = gate[head_index];
++    const float gate_scale = gate_value > 20.0f ?
++        gate_value : log1pf(expf(gate_value));
++    float *oh = out + head_index * head_dim;
++    oh[lane] = merged0 * inv_sum * gate_scale;
++    oh[lane + 32u] = merged1 * inv_sum * gate_scale;
++    oh[lane + 64u] = merged2 * inv_sum * gate_scale;
++    oh[lane + 96u] = merged3 * inv_sum * gate_scale;
++}
++
 +__global__ static void laguna_attention_prefill_kernel(
 +        float *out,
 +        const float *q,
@@ -5847,6 +6121,39 @@ index e66fa36..e728f61 100644
 +    return (float)dot *
 +           dev_nvfp4_ue4m3_to_f32(weight_scale) *
 +           dev_nvfp4_ue4m3_to_f32(activation_scale);
++}
++
++__device__ __forceinline__ static void
++dev_dot_nvfp4_native_w4a4_gate_up_group(
++        const uint8_t *gate_packed,
++        uint8_t gate_scale,
++        const uint8_t *up_packed,
++        uint8_t up_scale,
++        const int8_t *activation_i8,
++        uint8_t activation_scale,
++        float &gate,
++        float &up) {
++    int32_t gate_dot = 0;
++    int32_t up_dot = 0;
++#pragma unroll
++    for (uint32_t i = 0u; i < 16u; i += 4u) {
++        const int32_t activation =
++            *(const int32_t *)(activation_i8 + i);
++        gate_dot = __dp4a(
++            dev_nvfp4_pack4_adjacent(gate_packed + i / 2u),
++            activation, gate_dot);
++        up_dot = __dp4a(
++            dev_nvfp4_pack4_adjacent(up_packed + i / 2u),
++            activation, up_dot);
++    }
++    const float activation_factor =
++        dev_nvfp4_ue4m3_to_f32(activation_scale);
++    gate += (float)gate_dot *
++            dev_nvfp4_ue4m3_to_f32(gate_scale) *
++            activation_factor;
++    up += (float)up_dot *
++          dev_nvfp4_ue4m3_to_f32(up_scale) *
++          activation_factor;
 +}
 +
 +/*
@@ -6433,7 +6740,8 @@ index e66fa36..e728f61 100644
 +        uint32_t expert_mid_dim,
 +        uint32_t n_total_expert,
 +        uint32_t n_expert,
-+        uint32_t n_tokens) {
++        uint32_t n_tokens,
++        bool native_input_by_token) {
 +    const uint32_t rows_per_block = 256u / LANES;
 +    const uint32_t row_tiles =
 +        (expert_mid_dim + rows_per_block - 1u) / rows_per_block;
@@ -6480,17 +6788,19 @@ index e66fa36..e728f61 100644
 +    float up_value = 0.0f;
 +    if (native) {
 +        const uint32_t groups = xq_blocks * 2u;
++        const uint64_t input_row =
++            native_input_by_token ? token : pair;
 +        const int8_t *x4_row =
-+            (const int8_t *)x4 + pair * (uint64_t)groups * 16u;
++            (const int8_t *)x4 +
++            input_row * (uint64_t)groups * 16u;
 +        const uint8_t *x4scale_row =
-+            x4scale + pair * (uint64_t)groups;
++            x4scale + input_row * (uint64_t)groups;
 +        for (uint32_t b = lane; b < groups; b += LANES) {
-+            gate_value += dev_dot_nvfp4_native_w4a4_group(
++            dev_dot_nvfp4_native_w4a4_gate_up_group(
 +                gate_packed + b * 8u, gate_scale[b],
-+                x4_row + b * 16u, x4scale_row[b]);
-+            up_value += dev_dot_nvfp4_native_w4a4_group(
 +                up_packed + b * 8u, up_scale[b],
-+                x4_row + b * 16u, x4scale_row[b]);
++                x4_row + b * 16u, x4scale_row[b],
++                gate_value, up_value);
 +        }
 +    } else {
 +        const uint32_t nv_blocks = xq_blocks / 2u;
@@ -6925,6 +7235,14 @@ index e66fa36..e728f61 100644
 +     * checkpoints calibrate them identically, allowing one W4A4 input. */
 +    for (uint32_t e = 0; e < n_total_expert; e++)
 +        if (input_global[0][e] != input_global[1][e]) return NULL;
++    /*
++     * This backend supports Poolside's fixed Laguna-S-2.1-NVFP4 checkpoint,
++     * whose routed gate/up input calibration is one scalar per layer (not
++     * per expert). Enforce that invariant before quantizing each token once
++     * and sharing it across the model's ten selected experts.
++     */
++    for (uint32_t e = 1; e < n_total_expert; e++)
++        if (input_global[0][e] != input_global[0][0]) return NULL;
 +
 +    const uint64_t pointer_bytes =
 +        (uint64_t)n_total_expert * sizeof(const uint8_t *);
@@ -7121,12 +7439,20 @@ index e66fa36..e728f61 100644
 +    const uint32_t midq_blocks = expert_mid_dim / 32u;
 +    const bool grouped_native =
 +        native && n_tokens >= 256u && pairs <= UINT32_MAX;
++    const bool shared_native_decode_input =
++        native && !grouped_native &&
++        expert_in_dim == 3072u && expert_mid_dim == 1024u &&
++        out_dim == 3072u && n_total_expert == 256u &&
++        n_expert == 10u;
++    const uint64_t native_input_rows =
++        shared_native_decode_input ? n_tokens : pairs;
 +    const uint64_t xq_bytes =
-+        native ? pairs * expert_in_dim / (grouped_native ? 2u : 1u) :
++        native ? native_input_rows * expert_in_dim /
++                     (grouped_native ? 2u : 1u) :
 +                 (uint64_t)n_tokens * expert_in_dim * sizeof(int8_t);
 +    const uint64_t xscale_offset = (xq_bytes + 255u) & ~255ull;
 +    const uint64_t xscale_bytes =
-+        native ? pairs * expert_in_dim / 16u :
++        native ? native_input_rows * expert_in_dim / 16u :
 +                 (uint64_t)n_tokens * xq_blocks * sizeof(float);
 +    if (xscale_offset > UINT64_MAX - xscale_bytes) return 0;
 +    const uint64_t midq_offset =
@@ -7189,8 +7515,9 @@ index e66fa36..e728f61 100644
 +    uint32_t *tile_starts = NULL;
 +
 +    if (native) {
-+        for (uint32_t pair0 = 0u; pair0 < (uint32_t)pairs;) {
-+            uint32_t chunk = (uint32_t)pairs - pair0;
++        const uint32_t input_rows = (uint32_t)native_input_rows;
++        for (uint32_t pair0 = 0u; pair0 < input_rows;) {
++            uint32_t chunk = input_rows - pair0;
 +            if (chunk > 65535u) chunk = 65535u;
 +            quantize_nvfp4_selected_f32_kernel
 +                <<<dim3(expert_in_dim / 16u, chunk, 1u), 32>>>(
@@ -7198,7 +7525,8 @@ index e66fa36..e728f61 100644
 +                    (const int32_t *)selected->ptr,
 +                    native_cache->gate_input_global,
 +                    expert_in_dim, expert_in_dim / 16u,
-+                    n_total_expert, (uint32_t)pairs, n_expert,
++                    n_total_expert, input_rows,
++                    shared_native_decode_input ? 1u : n_expert,
 +                    pair0, false, !grouped_native);
 +            if (!cuda_ok(cudaGetLastError(),
 +                         "Laguna native NVFP4 input quantize launch")) {
@@ -7423,7 +7751,8 @@ index e66fa36..e728f61 100644
 +#define DS4_LAUNCH_NVFP4_GATE_UP(LANES_) \
 +    laguna_moe_gate_up_nvfp4_kernel<LANES_> \
 +        <<<(uint32_t)gate_blocks, 256>>>( \
-+            (float *)mid->ptr, gate, up, \
++            (float *)mid->ptr, \
++            gate, up, \
 +            native_cache ? native_cache->gate_packed : NULL, \
 +            native_cache ? native_cache->gate_scale : NULL, \
 +            native_cache ? native_cache->up_packed : NULL, \
@@ -7437,7 +7766,8 @@ index e66fa36..e728f61 100644
 +            desc->gate_row_bytes / nvfp4_block_bytes, \
 +            desc->up_expert_bytes / nvfp4_block_bytes, \
 +            desc->up_row_bytes / nvfp4_block_bytes, \
-+            xq_blocks, expert_mid_dim, n_total_expert, n_expert, n_tokens)
++            xq_blocks, expert_mid_dim, n_total_expert, n_expert, n_tokens, \
++            shared_native_decode_input)
 +    if (blackwell) {
 +        DS4_LAUNCH_NVFP4_GATE_UP(16u);
 +    } else {
@@ -8294,7 +8624,7 @@ index e66fa36..e728f61 100644
          ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
          ds4_gpu_tensor *value_cache, ds4_gpu_tensor *staged_key,
          ds4_gpu_tensor *staged_value, const ds4_gpu_tensor *q,
-@@ -27772,10 +31716,111 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
+@@ -27772,10 +31905,127 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
          const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
          uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
          uint32_t head_dim, float scale) {
@@ -8341,7 +8671,23 @@ index e66fa36..e728f61 100644
 +            kv_values);
 +    if (!cuda_ok(cudaGetLastError(), "Laguna stage KV launch")) return 0;
 +    const uint32_t heads_per_kv = n_head / n_head_kv;
-+    if (heads_per_kv == 6u &&
++    const bool blackwell_verify_split =
++        n_tokens <= 16u && pos0 >= 256u &&
++        cuda_laguna_blackwell_ok() &&
++        getenv("DS4_CUDA_LAGUNA_NO_VERIFY_SPLIT") == NULL;
++    if (blackwell_verify_split) {
++        laguna_attention_verify_split_kernel<16><<<
++                dim3(n_head, n_tokens, 1u), 512>>>(
++                (float *)heads->ptr,
++                (const float *)q->ptr,
++                (const float *)gate->ptr,
++                (const __half *)key_cache->ptr,
++                (const __half *)value_cache->ptr,
++                (const __half *)staged_key->ptr,
++                (const __half *)staged_value->ptr,
++                pos0, n_tokens, cache_cap,
++                n_head, n_head_kv, head_dim, scale);
++    } else if (heads_per_kv == 6u &&
 +        getenv("DS4_CUDA_LAGUNA_NO_GQA_PREFILL") == NULL) {
 +        laguna_attention_prefill_gqa_kernel<6><<<
 +                dim3(n_head_kv, n_tokens, 1u), head_dim>>>(
@@ -8926,13 +9272,13 @@ index 0000000..43b391a
 +ds4.c,2048,2048,256,dflash-blackwell,291.53,41.61,265.237,254,43.19,-
 diff --git a/speed-bench/laguna_s21_dflash_quant_comparison_gb10.csv b/speed-bench/laguna_s21_dflash_quant_comparison_gb10.csv
 new file mode 100644
-index 0000000..61f60ab
+index 0000000..80fb1fa
 --- /dev/null
 +++ b/speed-bench/laguna_s21_dflash_quant_comparison_gb10.csv
 @@ -0,0 +1,3 @@
 +target,drafter,draft_cap,ctx_tokens,gen_tokens,gen_tps,verifier_blocks,drafted,matched,proposal_acceptance_pct,avg_committed_per_block,avg_draft_ms,avg_target_ms,avg_inject_ms,avg_finish_ms,avg_block_ms
 +Q4_K_M,Laguna-S-2.1-DFlash-BF16,15,2048,256,27.81,32,476,224,47.059,8.000,19.363,142.207,4.858,120.954,287.383
-+NVFP4,Laguna-S-2.1-DFlash-NVFP4,5,2048,256,20.79,55,272,201,73.897,4.655,21.697,86.333,5.255,110.379,223.664
++NVFP4,Laguna-S-2.1-DFlash-NVFP4,7,2048,256,31.73,47,325,209,64.308,5.447,16.361,63.699,5.308,86.288,171.656
 diff --git a/speed-bench/laguna_s21_gb10.csv b/speed-bench/laguna_s21_gb10.csv
 new file mode 100644
 index 0000000..6643bb9
@@ -8965,14 +9311,14 @@ index 0000000..dcb035c
 +8192,4096,132.48,256,18.27,57.577,255,18.37,0
 diff --git a/speed-bench/laguna_s21_nvfp4_dflash_gb10.csv b/speed-bench/laguna_s21_nvfp4_dflash_gb10.csv
 new file mode 100644
-index 0000000..c579889
+index 0000000..173d5f1
 --- /dev/null
 +++ b/speed-bench/laguna_s21_nvfp4_dflash_gb10.csv
 @@ -0,0 +1,4 @@
 +workload,ctx_alloc,prefill_tokens,gen_tokens,mode,draft_cap,prefill_tps,gen_tps,verifier_blocks,drafted,matched,proposal_acceptance_pct,avg_committed_per_block,avg_block_ms
-+ds4.c,4096,2048,256,raw,0,439.63,14.50,0,0,0,0.00,1.00,-
-+ds4.c,4096,2048,256,dflash-native,7,302.24,21.45,48,331,208,62.84,5.33,248.141
-+ds4.c,4096,2048,256,dflash-native,15,390.14,17.99,41,584,215,36.82,6.24,346.512
++ds4.c,4096,2048,256,raw,0,446.58,14.74,0,0,0,0.00,1.00,-
++ds4.c,4096,2048,256,dflash-native,5,382.05,28.15,61,301,195,64.78,4.20,149.043
++ds4.c,4096,2048,256,dflash-native,7,366.70,31.73,47,325,209,64.31,5.45,171.656
 diff --git a/speed-bench/laguna_s21_nvfp4_gb10.csv b/speed-bench/laguna_s21_nvfp4_gb10.csv
 new file mode 100644
 index 0000000..fe5e4ce
@@ -8985,10 +9331,10 @@ index 0000000..fe5e4ce
 +8192,4096,224.72,256,13.49,76.631,255,13.55,0
 diff --git a/tests/cuda_laguna_smoke.c b/tests/cuda_laguna_smoke.c
 new file mode 100644
-index 0000000..c2bc59b
+index 0000000..c3cd391
 --- /dev/null
 +++ b/tests/cuda_laguna_smoke.c
-@@ -0,0 +1,1556 @@
+@@ -0,0 +1,1607 @@
 +#include "ds4_gpu.h"
 +
 +#include <cuda_runtime_api.h>
@@ -9732,6 +10078,57 @@ index 0000000..c2bc59b
 +    for (uint64_t i = 0; i < q_values; i++) {
 +        CHECK(close_enough(blackwell[i], portable[i], 1e-6f, 1e-6f),
 +              "Blackwell DFlash attention equivalence");
++    }
++
++    /*
++     * Exercise the fixed long-history verifier dispatch. A zeroed 300-token
++     * cache makes both schedules deterministic while retaining the staged
++     * causal tail and the different online-softmax reduction orders.
++     */
++    const uint32_t verify_pos0 = 300u;
++    const uint32_t verify_cache_cap = 512u;
++    const uint64_t verify_cache_values =
++        (uint64_t)verify_cache_cap * n_head_kv * HEAD_DIM;
++    uint16_t *zero_cache =
++        calloc((size_t)verify_cache_values, sizeof(zero_cache[0]));
++    CHECK(zero_cache != NULL, "DFlash verify zero-cache allocation");
++    ds4_gpu_tensor_free(value_cache);
++    ds4_gpu_tensor_free(key_cache);
++    key_cache = ds4_gpu_tensor_alloc(
++        verify_cache_values * sizeof(uint16_t));
++    value_cache = ds4_gpu_tensor_alloc(
++        verify_cache_values * sizeof(uint16_t));
++    CHECK(key_cache && value_cache, "DFlash verify cache allocation");
++    CHECK(ds4_gpu_tensor_write(
++              key_cache, 0, zero_cache,
++              verify_cache_values * sizeof(uint16_t)) &&
++          ds4_gpu_tensor_write(
++              value_cache, 0, zero_cache,
++              verify_cache_values * sizeof(uint16_t)),
++          "write DFlash verify cache");
++    free(zero_cache);
++
++    CHECK(setenv("DS4_CUDA_LAGUNA_NO_VERIFY_SPLIT", "1", 1) == 0,
++          "select serial DFlash verifier attention");
++    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
++              heads, key_cache, value_cache, staged_key, staged_value,
++              q_t, k_t, v_t, gate_t, verify_pos0, n_tokens,
++              verify_cache_cap, n_head, n_head_kv, HEAD_DIM,
++              1.0f / sqrtf((float)HEAD_DIM)) &&
++          ds4_gpu_tensor_read(heads, 0, portable, sizeof(portable)),
++          "serial DFlash verifier attention");
++    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_VERIFY_SPLIT") == 0,
++          "select split DFlash verifier attention");
++    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
++              heads, key_cache, value_cache, staged_key, staged_value,
++              q_t, k_t, v_t, gate_t, verify_pos0, n_tokens,
++              verify_cache_cap, n_head, n_head_kv, HEAD_DIM,
++              1.0f / sqrtf((float)HEAD_DIM)) &&
++          ds4_gpu_tensor_read(heads, 0, blackwell, sizeof(blackwell)),
++          "split DFlash verifier attention");
++    for (uint64_t i = 0; i < q_values; i++) {
++        CHECK(close_enough(blackwell[i], portable[i], 2e-5f, 2e-5f),
++              "split DFlash verifier attention equivalence");
 +    }
 +
 +    ds4_gpu_tensor_free(gate_t);

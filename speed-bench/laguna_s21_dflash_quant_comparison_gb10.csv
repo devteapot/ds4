@@ -1,3 +1,3 @@
 target,drafter,draft_cap,ctx_tokens,gen_tokens,gen_tps,verifier_blocks,drafted,matched,proposal_acceptance_pct,avg_committed_per_block,avg_draft_ms,avg_target_ms,avg_inject_ms,avg_finish_ms,avg_block_ms
 Q4_K_M,Laguna-S-2.1-DFlash-BF16,15,2048,256,27.81,32,476,224,47.059,8.000,19.363,142.207,4.858,120.954,287.383
-NVFP4,Laguna-S-2.1-DFlash-NVFP4,5,2048,256,20.79,55,272,201,73.897,4.655,21.697,86.333,5.255,110.379,223.664
+NVFP4,Laguna-S-2.1-DFlash-NVFP4,7,2048,256,31.73,47,325,209,64.308,5.447,16.361,63.699,5.308,86.288,171.656

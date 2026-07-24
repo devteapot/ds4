@@ -1,4 +1,4 @@
 workload,ctx_alloc,prefill_tokens,gen_tokens,mode,draft_cap,prefill_tps,gen_tps,verifier_blocks,drafted,matched,proposal_acceptance_pct,avg_committed_per_block,avg_block_ms
-ds4.c,4096,2048,256,raw,0,439.63,14.50,0,0,0,0.00,1.00,-
-ds4.c,4096,2048,256,dflash-native,7,302.24,21.45,48,331,208,62.84,5.33,248.141
-ds4.c,4096,2048,256,dflash-native,15,390.14,17.99,41,584,215,36.82,6.24,346.512
+ds4.c,4096,2048,256,raw,0,446.58,14.74,0,0,0,0.00,1.00,-
+ds4.c,4096,2048,256,dflash-native,5,382.05,28.15,61,301,195,64.78,4.20,149.043
+ds4.c,4096,2048,256,dflash-native,7,366.70,31.73,47,325,209,64.31,5.45,171.656

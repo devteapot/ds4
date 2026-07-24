@@ -28975,6 +28975,139 @@ __global__ static void laguna_attention_decode_split_kernel(
     oh[lane + 96u] = merged3 * inv_sum * gate_scale;
 }
 
+/*
+ * Laguna DFlash verifies at most sixteen staged tokens against a long shared
+ * history. The generic GQA prefill kernel walks that history serially inside
+ * one block; on GB10 that leaves most SMs idle. Stripe each (query, head)
+ * across sixteen warps and merge the online-softmax partials, matching the
+ * model's existing long-context decode schedule while reading staged K/V for
+ * the causal tail. This is deliberately fixed to Laguna's 128-wide heads.
+ */
+template <uint32_t SPLITS>
+__global__ static void laguna_attention_verify_split_kernel(
+        float *out,
+        const float *q,
+        const float *gate,
+        const __half *key_cache,
+        const __half *value_cache,
+        const __half *staged_key,
+        const __half *staged_value,
+        uint32_t pos0,
+        uint32_t n_tokens,
+        uint32_t cache_cap,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        float scale) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    if (head >= n_head || token >= n_tokens ||
+        warp >= SPLITS || head_dim != 128u) {
+        return;
+    }
+    const uint32_t heads_per_kv = n_head / n_head_kv;
+    const uint32_t kv_head = head / heads_per_kv;
+    const uint32_t width = n_head_kv * head_dim;
+    const uint32_t query_pos = pos0 + token;
+    const uint32_t key_count =
+        query_pos + 1u < cache_cap ? query_pos + 1u : cache_cap;
+    const uint32_t key_start = query_pos + 1u - key_count;
+    const float *qh =
+        q + ((uint64_t)token * n_head + head) * head_dim;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    float max_score = -INFINITY;
+    float score_sum = 0.0f;
+    for (uint32_t i = warp; i < key_count; i += SPLITS) {
+        const uint32_t key_pos = key_start + i;
+        const bool current = key_pos >= pos0;
+        const uint32_t source_row =
+            current ? key_pos - pos0 : key_pos % cache_cap;
+        const uint64_t kv_base =
+            (uint64_t)source_row * width +
+            (uint64_t)kv_head * head_dim;
+        const __half *key_source = current ? staged_key : key_cache;
+        const __half *value_source = current ? staged_value : value_cache;
+        float score =
+            qh[lane] * __half2float(key_source[kv_base + lane]) +
+            qh[lane + 32u] *
+                __half2float(key_source[kv_base + lane + 32u]) +
+            qh[lane + 64u] *
+                __half2float(key_source[kv_base + lane + 64u]) +
+            qh[lane + 96u] *
+                __half2float(key_source[kv_base + lane + 96u]);
+        score = __shfl_sync(
+            0xffffffffu, warp_sum_f32(score), 0) * scale;
+        const float next_max = fmaxf(max_score, score);
+        const float old_scale = isinf(max_score) ?
+            0.0f : expf(max_score - next_max);
+        const float value_scale = expf(score - next_max);
+        score_sum = score_sum * old_scale + value_scale;
+        acc0 = acc0 * old_scale +
+            __half2float(value_source[kv_base + lane]) * value_scale;
+        acc1 = acc1 * old_scale +
+            __half2float(value_source[kv_base + lane + 32u]) * value_scale;
+        acc2 = acc2 * old_scale +
+            __half2float(value_source[kv_base + lane + 64u]) * value_scale;
+        acc3 = acc3 * old_scale +
+            __half2float(value_source[kv_base + lane + 96u]) * value_scale;
+        max_score = next_max;
+    }
+
+    __shared__ float partial_max[SPLITS];
+    __shared__ float partial_sum[SPLITS];
+    __shared__ float partial_value[SPLITS * 128];
+    if (lane == 0u) {
+        partial_max[warp] = max_score;
+        partial_sum[warp] = score_sum;
+    }
+    const uint32_t value_base = warp * 128u + lane;
+    partial_value[value_base] = acc0;
+    partial_value[value_base + 32u] = acc1;
+    partial_value[value_base + 64u] = acc2;
+    partial_value[value_base + 96u] = acc3;
+    __syncthreads();
+    if (warp != 0u) return;
+
+    float global_max = partial_max[0];
+#pragma unroll
+    for (uint32_t w = 1u; w < SPLITS; w++) {
+        global_max = fmaxf(global_max, partial_max[w]);
+    }
+    float merged_sum = 0.0f;
+    float merged0 = 0.0f;
+    float merged1 = 0.0f;
+    float merged2 = 0.0f;
+    float merged3 = 0.0f;
+#pragma unroll
+    for (uint32_t w = 0u; w < SPLITS; w++) {
+        const float weight = partial_sum[w] > 0.0f ?
+            expf(partial_max[w] - global_max) : 0.0f;
+        merged_sum += partial_sum[w] * weight;
+        const uint32_t base = w * 128u + lane;
+        merged0 += partial_value[base] * weight;
+        merged1 += partial_value[base + 32u] * weight;
+        merged2 += partial_value[base + 64u] * weight;
+        merged3 += partial_value[base + 96u] * weight;
+    }
+    const float inv_sum =
+        merged_sum > 0.0f ? 1.0f / merged_sum : 0.0f;
+    const uint64_t head_index = (uint64_t)token * n_head + head;
+    const float gate_value = gate[head_index];
+    const float gate_scale = gate_value > 20.0f ?
+        gate_value : log1pf(expf(gate_value));
+    float *oh = out + head_index * head_dim;
+    oh[lane] = merged0 * inv_sum * gate_scale;
+    oh[lane + 32u] = merged1 * inv_sum * gate_scale;
+    oh[lane + 64u] = merged2 * inv_sum * gate_scale;
+    oh[lane + 96u] = merged3 * inv_sum * gate_scale;
+}
+
 __global__ static void laguna_attention_prefill_kernel(
         float *out,
         const float *q,
@@ -29489,6 +29622,39 @@ __device__ __forceinline__ static float dev_dot_nvfp4_native_w4a4_group(
     return (float)dot *
            dev_nvfp4_ue4m3_to_f32(weight_scale) *
            dev_nvfp4_ue4m3_to_f32(activation_scale);
+}
+
+__device__ __forceinline__ static void
+dev_dot_nvfp4_native_w4a4_gate_up_group(
+        const uint8_t *gate_packed,
+        uint8_t gate_scale,
+        const uint8_t *up_packed,
+        uint8_t up_scale,
+        const int8_t *activation_i8,
+        uint8_t activation_scale,
+        float &gate,
+        float &up) {
+    int32_t gate_dot = 0;
+    int32_t up_dot = 0;
+#pragma unroll
+    for (uint32_t i = 0u; i < 16u; i += 4u) {
+        const int32_t activation =
+            *(const int32_t *)(activation_i8 + i);
+        gate_dot = __dp4a(
+            dev_nvfp4_pack4_adjacent(gate_packed + i / 2u),
+            activation, gate_dot);
+        up_dot = __dp4a(
+            dev_nvfp4_pack4_adjacent(up_packed + i / 2u),
+            activation, up_dot);
+    }
+    const float activation_factor =
+        dev_nvfp4_ue4m3_to_f32(activation_scale);
+    gate += (float)gate_dot *
+            dev_nvfp4_ue4m3_to_f32(gate_scale) *
+            activation_factor;
+    up += (float)up_dot *
+          dev_nvfp4_ue4m3_to_f32(up_scale) *
+          activation_factor;
 }
 
 /*
@@ -30075,7 +30241,8 @@ __global__ static void laguna_moe_gate_up_nvfp4_kernel(
         uint32_t expert_mid_dim,
         uint32_t n_total_expert,
         uint32_t n_expert,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        bool native_input_by_token) {
     const uint32_t rows_per_block = 256u / LANES;
     const uint32_t row_tiles =
         (expert_mid_dim + rows_per_block - 1u) / rows_per_block;
@@ -30122,17 +30289,19 @@ __global__ static void laguna_moe_gate_up_nvfp4_kernel(
     float up_value = 0.0f;
     if (native) {
         const uint32_t groups = xq_blocks * 2u;
+        const uint64_t input_row =
+            native_input_by_token ? token : pair;
         const int8_t *x4_row =
-            (const int8_t *)x4 + pair * (uint64_t)groups * 16u;
+            (const int8_t *)x4 +
+            input_row * (uint64_t)groups * 16u;
         const uint8_t *x4scale_row =
-            x4scale + pair * (uint64_t)groups;
+            x4scale + input_row * (uint64_t)groups;
         for (uint32_t b = lane; b < groups; b += LANES) {
-            gate_value += dev_dot_nvfp4_native_w4a4_group(
+            dev_dot_nvfp4_native_w4a4_gate_up_group(
                 gate_packed + b * 8u, gate_scale[b],
-                x4_row + b * 16u, x4scale_row[b]);
-            up_value += dev_dot_nvfp4_native_w4a4_group(
                 up_packed + b * 8u, up_scale[b],
-                x4_row + b * 16u, x4scale_row[b]);
+                x4_row + b * 16u, x4scale_row[b],
+                gate_value, up_value);
         }
     } else {
         const uint32_t nv_blocks = xq_blocks / 2u;
@@ -31030,6 +31199,14 @@ static const cuda_native_nvfp4_cache *cuda_native_nvfp4_prepare(
      * checkpoints calibrate them identically, allowing one W4A4 input. */
     for (uint32_t e = 0; e < n_total_expert; e++)
         if (input_global[0][e] != input_global[1][e]) return NULL;
+    /*
+     * This backend supports Poolside's fixed Laguna-S-2.1-NVFP4 checkpoint,
+     * whose routed gate/up input calibration is one scalar per layer (not
+     * per expert). Enforce that invariant before quantizing each token once
+     * and sharing it across the model's ten selected experts.
+     */
+    for (uint32_t e = 1; e < n_total_expert; e++)
+        if (input_global[0][e] != input_global[0][0]) return NULL;
 
     const uint64_t pointer_bytes =
         (uint64_t)n_total_expert * sizeof(const uint8_t *);
@@ -31226,12 +31403,20 @@ static int cuda_laguna_nvfp4_routed_moe(
     const uint32_t midq_blocks = expert_mid_dim / 32u;
     const bool grouped_native =
         native && n_tokens >= 256u && pairs <= UINT32_MAX;
+    const bool shared_native_decode_input =
+        native && !grouped_native &&
+        expert_in_dim == 3072u && expert_mid_dim == 1024u &&
+        out_dim == 3072u && n_total_expert == 256u &&
+        n_expert == 10u;
+    const uint64_t native_input_rows =
+        shared_native_decode_input ? n_tokens : pairs;
     const uint64_t xq_bytes =
-        native ? pairs * expert_in_dim / (grouped_native ? 2u : 1u) :
+        native ? native_input_rows * expert_in_dim /
+                     (grouped_native ? 2u : 1u) :
                  (uint64_t)n_tokens * expert_in_dim * sizeof(int8_t);
     const uint64_t xscale_offset = (xq_bytes + 255u) & ~255ull;
     const uint64_t xscale_bytes =
-        native ? pairs * expert_in_dim / 16u :
+        native ? native_input_rows * expert_in_dim / 16u :
                  (uint64_t)n_tokens * xq_blocks * sizeof(float);
     if (xscale_offset > UINT64_MAX - xscale_bytes) return 0;
     const uint64_t midq_offset =
@@ -31294,8 +31479,9 @@ static int cuda_laguna_nvfp4_routed_moe(
     uint32_t *tile_starts = NULL;
 
     if (native) {
-        for (uint32_t pair0 = 0u; pair0 < (uint32_t)pairs;) {
-            uint32_t chunk = (uint32_t)pairs - pair0;
+        const uint32_t input_rows = (uint32_t)native_input_rows;
+        for (uint32_t pair0 = 0u; pair0 < input_rows;) {
+            uint32_t chunk = input_rows - pair0;
             if (chunk > 65535u) chunk = 65535u;
             quantize_nvfp4_selected_f32_kernel
                 <<<dim3(expert_in_dim / 16u, chunk, 1u), 32>>>(
@@ -31303,7 +31489,8 @@ static int cuda_laguna_nvfp4_routed_moe(
                     (const int32_t *)selected->ptr,
                     native_cache->gate_input_global,
                     expert_in_dim, expert_in_dim / 16u,
-                    n_total_expert, (uint32_t)pairs, n_expert,
+                    n_total_expert, input_rows,
+                    shared_native_decode_input ? 1u : n_expert,
                     pair0, false, !grouped_native);
             if (!cuda_ok(cudaGetLastError(),
                          "Laguna native NVFP4 input quantize launch")) {
@@ -31528,7 +31715,8 @@ static int cuda_laguna_nvfp4_routed_moe(
 #define DS4_LAUNCH_NVFP4_GATE_UP(LANES_) \
     laguna_moe_gate_up_nvfp4_kernel<LANES_> \
         <<<(uint32_t)gate_blocks, 256>>>( \
-            (float *)mid->ptr, gate, up, \
+            (float *)mid->ptr, \
+            gate, up, \
             native_cache ? native_cache->gate_packed : NULL, \
             native_cache ? native_cache->gate_scale : NULL, \
             native_cache ? native_cache->up_packed : NULL, \
@@ -31542,7 +31730,8 @@ static int cuda_laguna_nvfp4_routed_moe(
             desc->gate_row_bytes / nvfp4_block_bytes, \
             desc->up_expert_bytes / nvfp4_block_bytes, \
             desc->up_row_bytes / nvfp4_block_bytes, \
-            xq_blocks, expert_mid_dim, n_total_expert, n_expert, n_tokens)
+            xq_blocks, expert_mid_dim, n_total_expert, n_expert, n_tokens, \
+            shared_native_decode_input)
     if (blackwell) {
         DS4_LAUNCH_NVFP4_GATE_UP(16u);
     } else {
@@ -32713,6 +32902,10 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
             kv_values);
     if (!cuda_ok(cudaGetLastError(), "Laguna stage KV launch")) return 0;
     const uint32_t heads_per_kv = n_head / n_head_kv;
+    const bool blackwell_verify_split =
+        n_tokens <= 16u && pos0 >= 256u &&
+        cuda_laguna_blackwell_ok() &&
+        getenv("DS4_CUDA_LAGUNA_NO_VERIFY_SPLIT") == NULL;
     const bool use_warp_gqa =
         cuda_laguna_blackwell_ok() &&
         n_head >= 48u &&
@@ -32733,7 +32926,19 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                 pos0, n_tokens, cache_cap, \
                 n_head, n_head_kv, head_dim, scale); \
     } while (0)
-    if (heads_per_kv == 6u && use_warp_gqa) {
+    if (blackwell_verify_split) {
+        laguna_attention_verify_split_kernel<16><<<
+                dim3(n_head, n_tokens, 1u), 512>>>(
+                (float *)heads->ptr,
+                (const float *)q->ptr,
+                (const float *)gate->ptr,
+                (const __half *)key_cache->ptr,
+                (const __half *)value_cache->ptr,
+                (const __half *)staged_key->ptr,
+                (const __half *)staged_value->ptr,
+                pos0, n_tokens, cache_cap,
+                n_head, n_head_kv, head_dim, scale);
+    } else if (heads_per_kv == 6u && use_warp_gqa) {
         if (use_tiled_warp_gqa) {
             DS4_LAGUNA_WARP_GQA_LAUNCH(6, 16);
         } else {

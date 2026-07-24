@@ -51366,6 +51366,10 @@ struct ds4_session {
     bool laguna_graph_ready;
     ds4_dflash_gpu_graph dflash_graph;
     bool dflash_graph_ready;
+    int dflash_next_argmax;
+    bool dflash_next_argmax_valid;
+    uint32_t dflash_next_logits_row;
+    bool dflash_next_logits_pending;
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state (--glm-mtp, greedy only). */
     int glm_mtp_draft;
@@ -62093,6 +62097,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    if (s) {
+        s->dflash_next_argmax_valid = false;
+        s->dflash_next_logits_pending = false;
+    }
+#endif
     const bool mirror = ds4_session_tp_leader(s);
     if (mirror && prompt && prompt->len > 0) {
         if (!ds4_tp_send_sync(s->engine->tp.ctx, s->tp_session_id,
@@ -63126,12 +63136,41 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+#ifndef DS4_NO_GPU
+static bool ds4_session_materialize_dflash_logits(ds4_session *s) {
+    if (!s || !s->dflash_next_logits_pending) return true;
+    if (!s->dflash_graph_ready ||
+        !ds4_gpu_tensor_read(
+            s->dflash_graph.target_logits,
+            (uint64_t)s->dflash_next_logits_row *
+                DS4_N_VOCAB * sizeof(float),
+            s->logits,
+            (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+        return false;
+    }
+    s->dflash_next_logits_pending = false;
+    return true;
+}
+#endif
+
 int ds4_session_argmax(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (s && s->dflash_next_argmax_valid) {
+        return s->dflash_next_argmax;
+    }
+#endif
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->logits) return -1;
+#ifndef DS4_NO_GPU
+    if (s->dflash_next_argmax_valid &&
+        s->dflash_next_argmax != excluded_id) {
+        return s->dflash_next_argmax;
+    }
+    if (!ds4_session_materialize_dflash_logits(s)) return -1;
+#endif
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -63157,12 +63196,22 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+#ifndef DS4_NO_GPU
+    if (s && temperature <= 0.0f && s->dflash_next_argmax_valid) {
+        s->dflash_next_argmax_valid = false;
+        return s->dflash_next_argmax;
+    }
+    if (!ds4_session_materialize_dflash_logits(s)) return -1;
+#endif
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_materialize_dflash_logits(s)) return 0;
+#endif
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
@@ -63200,6 +63249,9 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
     if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_materialize_dflash_logits(s)) return 0;
+#endif
 
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -63222,12 +63274,19 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_materialize_dflash_logits(s)) return 0;
+#endif
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
+#ifndef DS4_NO_GPU
+    s->dflash_next_argmax_valid = false;
+    s->dflash_next_logits_pending = false;
+#endif
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
 }
@@ -68320,6 +68379,8 @@ static int ds4_session_eval_dflash_argmax(
         char        *err,
         size_t       errlen) {
     ds4_engine *e = s->engine;
+    s->dflash_next_argmax_valid = false;
+    s->dflash_next_logits_pending = false;
     int draft_n = e->mtp_draft_tokens;
     if (draft_n > max_tokens - 1) draft_n = max_tokens - 1;
     if (draft_n > accepted_cap - 1) draft_n = accepted_cap - 1;
@@ -68403,15 +68464,16 @@ static int ds4_session_eval_dflash_argmax(
            (int)target_tops[matched] == drafts[matched]) {
         matched++;
     }
-    if (!ds4_gpu_tensor_read(
-            s->dflash_graph.target_logits,
-            (uint64_t)matched * DS4_N_VOCAB * sizeof(float),
-            s->logits,
-            (uint64_t)DS4_N_VOCAB * sizeof(float))) {
-        snprintf(err, errlen, "DFlash committed logits readback failed");
-        s->checkpoint_valid = false;
-        return -1;
-    }
+    /*
+     * DFlash is greedy-only and target_tops already contains the target
+     * argmax for every verifier row. Preserve that bonus token for the next
+     * cycle instead of copying a 66,560-float logits row through GB10's
+     * unified-memory boundary merely to run argmax again on the CPU.
+     */
+    s->dflash_next_argmax = (int)target_tops[matched];
+    s->dflash_next_argmax_valid = true;
+    s->dflash_next_logits_row = (uint32_t)matched;
+    s->dflash_next_logits_pending = true;
     token_vec_push(&s->checkpoint, first_token);
     accepted[0] = first_token;
     int n_accept = 1;
@@ -69184,6 +69246,8 @@ void ds4_session_invalidate(ds4_session *s) {
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_reset_dense_cache(s);
+    s->dflash_next_argmax_valid = false;
+    s->dflash_next_logits_pending = false;
 #endif
 }
 
@@ -69196,6 +69260,10 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
+#ifndef DS4_NO_GPU
+    s->dflash_next_argmax_valid = false;
+    s->dflash_next_logits_pending = false;
+#endif
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_cap_dense_cache(s);

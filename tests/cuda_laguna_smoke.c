@@ -850,6 +850,57 @@ static int check_dflash_blackwell_attention(void) {
               "Blackwell DFlash attention equivalence");
     }
 
+    /*
+     * Exercise the fixed long-history verifier dispatch. A zeroed 300-token
+     * cache makes both schedules deterministic while retaining the staged
+     * causal tail and the different online-softmax reduction orders.
+     */
+    const uint32_t verify_pos0 = 300u;
+    const uint32_t verify_cache_cap = 512u;
+    const uint64_t verify_cache_values =
+        (uint64_t)verify_cache_cap * n_head_kv * HEAD_DIM;
+    uint16_t *zero_cache =
+        calloc((size_t)verify_cache_values, sizeof(zero_cache[0]));
+    CHECK(zero_cache != NULL, "DFlash verify zero-cache allocation");
+    ds4_gpu_tensor_free(value_cache);
+    ds4_gpu_tensor_free(key_cache);
+    key_cache = ds4_gpu_tensor_alloc(
+        verify_cache_values * sizeof(uint16_t));
+    value_cache = ds4_gpu_tensor_alloc(
+        verify_cache_values * sizeof(uint16_t));
+    CHECK(key_cache && value_cache, "DFlash verify cache allocation");
+    CHECK(ds4_gpu_tensor_write(
+              key_cache, 0, zero_cache,
+              verify_cache_values * sizeof(uint16_t)) &&
+          ds4_gpu_tensor_write(
+              value_cache, 0, zero_cache,
+              verify_cache_values * sizeof(uint16_t)),
+          "write DFlash verify cache");
+    free(zero_cache);
+
+    CHECK(setenv("DS4_CUDA_LAGUNA_NO_VERIFY_SPLIT", "1", 1) == 0,
+          "select serial DFlash verifier attention");
+    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
+              heads, key_cache, value_cache, staged_key, staged_value,
+              q_t, k_t, v_t, gate_t, verify_pos0, n_tokens,
+              verify_cache_cap, n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)) &&
+          ds4_gpu_tensor_read(heads, 0, portable, sizeof(portable)),
+          "serial DFlash verifier attention");
+    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_VERIFY_SPLIT") == 0,
+          "select split DFlash verifier attention");
+    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
+              heads, key_cache, value_cache, staged_key, staged_value,
+              q_t, k_t, v_t, gate_t, verify_pos0, n_tokens,
+              verify_cache_cap, n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)) &&
+          ds4_gpu_tensor_read(heads, 0, blackwell, sizeof(blackwell)),
+          "split DFlash verifier attention");
+    for (uint64_t i = 0; i < q_values; i++) {
+        CHECK(close_enough(blackwell[i], portable[i], 2e-5f, 2e-5f),
+              "split DFlash verifier attention equivalence");
+    }
+
     ds4_gpu_tensor_free(gate_t);
     ds4_gpu_tensor_free(v_t);
     ds4_gpu_tensor_free(k_t);

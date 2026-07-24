@@ -58,6 +58,12 @@ DFlash Tensor Core and Blackwell attention kernels.
   its result tile empty.
 - Predecode each dynamically quantized E2M1 activation group once for the
   integer-dot path so every output row can consume signed bytes directly.
+- For the fixed official checkpoint, verify that routed gate/up input-global
+  scales are identical across all 256 experts in a layer, quantize each decode
+  token once, and share that activation across its ten selected experts.
+- On Blackwell, evaluate Laguna's at-most-16-token DFlash verifier blocks with
+  a head-dimension-128 split-history attention kernel instead of serially
+  walking the full context inside each query block.
 - Accept the official NVFP4 DFlash safetensors directory through `--mtp`
   without converting it to GGUF, including its fused QKV tensors, BF16 norms,
   six target residual streams, and checkpoint-specific RoPE configuration.
@@ -160,9 +166,11 @@ native target, including the batched target verifier's output norm.
   tokenizer metadata from GGUF.
 - Add BF16 CUDA matmul, embedding, RMSNorm, QKVG, and head-norm/RoPE entry
   points used by the native mixed-precision graph.
-- Quantize one activation per selected expert because input-global scales are
-  expert-specific. Reuse that activation for gate and up, then quantize the
-  routed intermediate with the selected down projection's scale.
+- The official checkpoint's gate/up input-global scale is identical across all
+  256 experts in each layer. Enforce that exact invariant and quantize one
+  activation per decode token rather than ten duplicate selected-expert rows.
+  Down input-global scales remain expert-specific, so quantize each routed
+  intermediate with its selected down projection's scale.
 - Compile GB10 with the family-specific `compute_121f` to `sm_121` target,
   which is required for SM120-family block-scaled NVFP4 MMA.
 - Group prompt routes into 16-route expert tiles, place routes in MMA's M
@@ -175,6 +183,15 @@ native target, including the batched target verifier's output norm.
   decode and DFlash verification, expand E2M1 to signed bytes during
   quantization and remove repeated activation-nibble decode from every gate,
   up, and down dot product.
+- Consume each signed activation group once for both routed gate and up DP4A
+  accumulators.
+- Borrow split-K online-softmax reduction from the major engines only for
+  Laguna's fixed Blackwell verifier shape: 128-wide heads, a long cached
+  history, and at most 16 staged tokens. Use 16 warps per query/head and retain
+  the existing grouped-GQA kernel for large prompt prefill.
+- Keep narrow decode on DP4A rather than copying a generic grouped FP4 GEMM:
+  with 256 experts and top-10 routing, a DFlash block has too few repeated
+  routes per expert to occupy SM121's `m16n8k64` tile efficiently.
 - Preserve source-offset alignment when merged safetensors spans are copied
   into CUDA's range cache so 32-bit packed/scale fragment loads remain aligned.
 - Add `download_model.sh laguna-nvfp4`; it uses the official Hugging Face
@@ -212,24 +229,33 @@ native target, including the batched target verifier's output norm.
   tensors. A deterministic `Reply with OK.` smoke produces exactly `OK`
   through target verification.
 - On the repeated 2,048-token `ds4.c` / 256-token greedy workload, raw NVFP4
-  measures 439.63/14.50 prefill/generation tok/s. DFlash depth 7 measures
-  302.24/21.45 tok/s with 62.84% proposal acceptance and 5.33 committed
-  tokens per verifier block; depth 15 measures 390.14/17.99 tok/s with 36.82%
-  proposal acceptance and 6.24 committed tokens per block. Results are stored
-  in `speed-bench/laguna_s21_nvfp4_dflash_gb10.csv`.
+  measures 446.58/14.74 prefill/generation tok/s. DFlash depth 5 measures
+  382.05/28.15 tok/s with 64.78% proposal acceptance and 4.20 committed
+  tokens per verifier block; depth 7 measures 366.70/31.73 tok/s with 64.31%
+  proposal acceptance and 5.45 committed tokens per 171.66 ms block. Results
+  are stored in `speed-bench/laguna_s21_nvfp4_dflash_gb10.csv`.
 - On an immutable common 2,048-token prompt, Q4_K_M with its official BF16
   DFlash drafter at depth 15 measures 27.81 token/s (47.06% proposal
   acceptance, 8.00 committed tokens per 287.38 ms block). Native NVFP4 with
-  its checkpoint-specific official drafter at depth 5 measures 20.79 token/s
-  (73.90% acceptance, 4.65 committed tokens per 223.66 ms block). The exact
+  its checkpoint-specific official drafter at depth 7 measures 31.73 token/s
+  (64.31% acceptance, 5.45 committed tokens per 171.66 ms block). The exact
   comparison is stored in
   `speed-bench/laguna_s21_dflash_quant_comparison_gb10.csv`.
-- The activation-predecode path measures 223.66 ms per verifier block on that
-  workload. A follow-up expert-sorted multi-route DP4A experiment preserved
-  the exact 201/272 acceptance result but regressed block latency to 224.77
-  ms, so it was rejected.
+- Before split-history verifier attention, depth 7 measured 21.45 token/s and
+  248.14 ms per block on this workload. The fixed-shape Blackwell kernel
+  improves generation by 47.9% and reduces block latency by 30.8%.
+- A depth-5 control without split-history attention preserved the exact
+  201/272 acceptance result and measured 20.13 token/s. Enabling the split
+  schedule reduced synchronized block time from 231.26 to 149.04 ms and
+  measured 28.15 token/s.
 - `make cuda-regression` passes the long-context and Laguna suites, including
-  F32/BF16 DFlash auxiliary feature-pack equivalence.
+  F32/BF16 DFlash auxiliary feature-pack equivalence and serial-versus-split
+  verifier attention over a 300-token cached history.
+- `make test` passes CUDA long-context, tensor-equivalence, kernel, unit, and
+  server checks, but exits nonzero on 28 pre-existing model-output fixture
+  assertions (tool formatting and stale official/golden vectors for the
+  configured Q4 model); those paths do not dispatch native NVFP4 or DFlash
+  verifier attention.
 - Compute Sanitizer memcheck reports zero errors with expected unsupported
   host-registration API diagnostics suppressed.
 
