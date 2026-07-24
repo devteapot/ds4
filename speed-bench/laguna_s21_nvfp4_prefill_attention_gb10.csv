@@ -5,3 +5,4 @@ cc321ba,blackwell-warp-gqa,2048,2048,518.77,-
 cc321ba,portable-grouped-gqa,2048,2048,374.67,DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1
 b991057,tiled-blackwell-warp-gqa,2048,2048,580.54,-
 b991057,untiled-blackwell-warp-gqa,2048,2048,518.49,DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL=1
+37abbc5,native-fp4-existing-tile16,2048,2048,559.33,-

@@ -68,7 +68,7 @@ index 81d4881..e5cfda1 100644
 -	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 +	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_laguna_smoke
 diff --git a/README.md b/README.md
-index 7d9e5c7..7fb00bc 100644
+index 7d9e5c7..634aaba 100644
 --- a/README.md
 +++ b/README.md
 @@ -109,6 +109,7 @@ Download one main model. **Prefer the imatrix versions.**
@@ -79,7 +79,7 @@ index 7d9e5c7..7fb00bc 100644
  ```
  
  For the full PRO Q4 distributed run, download one half on each machine:
-@@ -176,19 +177,129 @@ file are not supported for GLM yet.
+@@ -176,19 +177,130 @@ file are not supported for GLM yet.
  Laguna S 2.1 support targets Poolside's official imatrix-quantized Q4_K_M GGUF.
  The current 63.56 GiB recipe uses Q4_K routed experts and Q8_0 signal-path
  weights. DwarfStar also accepts Poolside's earlier 70.01 GiB recipe with F16
@@ -139,7 +139,8 @@ index 7d9e5c7..7fb00bc 100644
 +`DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL=1` retains the warp-per-head kernel but
 +stages one K/V row at a time, while
 +`DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16=1` retains the eight-pair tensor-core MoE
-+tile.
++tile for both projections. To isolate only the down projection,
++`DS4_CUDA_LAGUNA_NO_Q4_MMA_DOWN_TILE16=1` retains its eight-pair tile.
 +
 +CUDA also loads Poolside's official `Laguna-S-2.1-NVFP4` checkpoint directly
 +from its sharded safetensors directory—there is no GGUF conversion or
@@ -214,7 +215,7 @@ index 7d9e5c7..7fb00bc 100644
  The shipped GGUF is configured for a 262144-token context. Laguna defaults to
  temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options
  always take precedence. Use `--nothink` or the `laguna-s-2.1-chat` server alias
-@@ -1495,10 +1606,11 @@ The default graph backend is Metal on macOS and CUDA in CUDA builds:
+@@ -1495,10 +1607,11 @@ The default graph backend is Metal on macOS and CUDA in CUDA builds:
  ```
  
  On Linux, plain `make` prints the available build targets instead of selecting a
@@ -4132,7 +4133,7 @@ index 4b2b0d3..5217fa3 100644
                  "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                  frontier,
 diff --git a/ds4_cuda.cu b/ds4_cuda.cu
-index e66fa36..413adbb 100644
+index e66fa36..0337f21 100644
 --- a/ds4_cuda.cu
 +++ b/ds4_cuda.cu
 @@ -1,5 +1,7 @@
@@ -5421,7 +5422,7 @@ index e66fa36..413adbb 100644
  extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
      g_ssd_streaming_mode = enabled ? 1 : 0;
      cuda_stream_selected_cache_invalidate();
-@@ -27668,114 +28671,4322 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+@@ -27668,114 +28671,4354 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
      return 0;
  }
  
@@ -8752,6 +8753,12 @@ index e66fa36..413adbb 100644
 +        cuda_laguna_blackwell_ok() &&
 +        getenv("DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16") == NULL &&
 +        cuda_q4_mma_tile16_shmem_ok(0);
++    const bool use_q4_mma_down_tile16 =
++        use_q4_mma_gate_up_tile16 &&
++        use_q4_mma_down &&
++        out_dim % expert_mid_dim == 0u &&
++        getenv("DS4_CUDA_LAGUNA_NO_Q4_MMA_DOWN_TILE16") == NULL &&
++        cuda_q4_mma_tile16_shmem_ok(1);
 +    const uint64_t xq_bytes =
 +        (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K);
 +    const uint64_t midq_offset = (xq_bytes + 255u) & ~255ull;
@@ -9131,7 +9138,33 @@ index e66fa36..413adbb 100644
 +            }
 +            dim3 down_grid((chunk_rows + 511u) / 512u,
 +                           (uint32_t)tile_capacity, 1u);
-+            if (desc->down_type == 14u) {
++            if (use_q4_mma_down_tile16) {
++                /* Every full Laguna output chunk has the same width as the
++                 * compact term stride.  Rebase the weights to this chunk and
++                 * reuse the exact generic tile16 kernel, halving Q4_K weight
++                 * traffic without allocating the full down tensor. */
++                dim3 down16_grid(
++                        (chunk_rows + 511u) / 512u,
++                        (uint32_t)tile16_capacity, 1u);
++                const size_t tile16_shmem =
++                    16u * midq_blocks * sizeof(cuda_block_q8_K);
++                moe_down_q4K_tile16_mma_kernel<512>
++                        <<<down16_grid, 256, tile16_shmem>>>(
++                        (float *)mid->ptr,
++                        down + (uint64_t)row0 * desc->down_row_bytes,
++                        midq,
++                        sorted_pairs,
++                        sorted_offsets,
++                        sorted_counts,
++                        tile16_total,
++                        tile16_experts,
++                        tile16_starts,
++                        desc->down_expert_bytes,
++                        desc->down_row_bytes,
++                        midq_blocks,
++                        expert_mid_dim,
++                        n_expert);
++            } else if (desc->down_type == 14u) {
 +                laguna_moe_down_expert_tile8_chunk_kernel<true, 512>
 +                        <<<down_grid, 256>>>(
 +                        (float *)mid->ptr,
@@ -11020,10 +11053,10 @@ index 0000000..fe5e4ce
 +8192,4096,224.72,256,13.49,76.631,255,13.55,0
 diff --git a/speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv b/speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv
 new file mode 100644
-index 0000000..6d4b7ee
+index 0000000..05f78b6
 --- /dev/null
 +++ b/speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,8 @@
 +source,mode,ctx_tokens,prefill_tokens,prefill_tps,environment
 +pre-rebase,blackwell-warp-gqa,2048,2048,578.52,-
 +pre-rebase,portable-grouped-gqa,2048,2048,415.27,DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1
@@ -11031,6 +11064,7 @@ index 0000000..6d4b7ee
 +cc321ba,portable-grouped-gqa,2048,2048,374.67,DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1
 +b991057,tiled-blackwell-warp-gqa,2048,2048,580.54,-
 +b991057,untiled-blackwell-warp-gqa,2048,2048,518.49,DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL=1
++37abbc5,native-fp4-existing-tile16,2048,2048,559.33,-
 diff --git a/speed-bench/laguna_s21_q2_q3_gb10.csv b/speed-bench/laguna_s21_q2_q3_gb10.csv
 new file mode 100644
 index 0000000..39b2eba

@@ -114,7 +114,7 @@ DFlash Tensor Core and Blackwell attention kernels.
 - The attached CUDA host is a GB10 (`sm_121`) with CUDA 13 and is the primary
   Blackwell validation target.
 - The dependent Laguna CUDA source realization is commit
-  `b991057b0ae752defc90cca1805442cc64bac327`.
+  `37abbc5ab9fa491821df643e261cb1fc6ccf423d`.
 
 # Open questions
 
@@ -205,8 +205,9 @@ reproduce the portable reduction tree before the warp shuffle reduction.
   its existing block-scaled FP4 MMA. The source kernels are format-specific,
   while NVFP4 already applies the same expert grouping and compact chunked
   term-buffer schedule directly to packed E2M1 weights. Likewise, keep the
-  source's new Q4_K tile16 selection and PTX guard scoped to Q4_K; native
-  NVFP4 already launches its own 16-route expert tiles through FP4 MMA.
+  source's Q4_K tile16 gate/up and down selection plus PTX guards scoped to
+  Q4_K; native NVFP4 already launches its own 16-route expert tiles for both
+  projection stages through FP4 MMA.
 - Keep the 16-lane W4A4 integer-dot schedule for decode because SM121 offers
   no GEMV-sized NVFP4 MMA instruction and the direct one-column MMA path
   benchmarks slower.
@@ -263,6 +264,12 @@ reproduce the portable reduction tree before the warp shuffle reduction.
   token/s with `DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL=1`, an additional 12.0%
   improvement over the otherwise identical warp-per-head schedule. The pair
   is stored in `speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv`.
+- After rebasing onto source commit `37abbc5`, a fresh run of the same workload
+  measures 559.33 token/s. The new source optimization and its rollback are
+  Q4_K-specific; native NVFP4 continues to use its existing 16-route FP4 MMA
+  down schedule, so no misleading NVFP4 toggle pair is recorded. The result
+  is within 3.7% of the preceding 580.54 token/s run and is stored in
+  `speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv`.
 - The grouped FP4 MMA benchmark at 2K/4K/8K reports prompt throughput of
   413.38/317.80/224.72 token/s, compared with 95.05/87.59/78.13 for the prior
   integer-dot prompt kernel, and steady decode of 14.26/14.10/13.55 token/s.
@@ -328,6 +335,10 @@ Explicitly requested:
   reuse the BF16 attention tile for NVFP4, retain the native FP4-specific MoE
   schedule, benchmark the direct tiled/untiled pair, and update the patch,
   commit, and PR branch.
+- Repeat the process after the source enabled tile16 Q4_K down projection:
+  preserve that optimization for GGUF while retaining the already equivalent
+  native FP4 16-route down schedule, rerun NVFP4 acceptance and prefill
+  validation, and update the patch, commit, and PR branch.
 
 Observed from the official checkpoint:
 
