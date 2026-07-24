@@ -49,6 +49,11 @@ typedef struct {
 } block_q6_K;
 
 typedef struct {
+    uint8_t d[4];
+    uint8_t qs[32];
+} block_nvfp4;
+
+typedef struct {
     uint8_t *data;
     uint64_t size;
     uint64_t used;
@@ -130,6 +135,16 @@ static void fill_q6_ones(void *ptr, uint64_t blocks) {
         memset(out[i].qh, 0xaa, sizeof(out[i].qh));
         memset(out[i].scales, 1, sizeof(out[i].scales));
         out[i].d = 0x3c00u;
+    }
+}
+
+static void fill_nvfp4_ones(void *ptr, uint64_t blocks) {
+    block_nvfp4 *out = (block_nvfp4 *)ptr;
+    for (uint64_t i = 0; i < blocks; i++) {
+        /* GGUF NVFP4 decodes the E4M3 byte at half magnitude. 0x38 is
+         * therefore 0.5, and E2M1 code 2 is represented as integer 2. */
+        memset(out[i].d, 0x38, sizeof(out[i].d));
+        memset(out[i].qs, 0x22, sizeof(out[i].qs));
     }
 }
 
@@ -266,7 +281,8 @@ static int close_enough(float got, float expected, float atol, float rtol) {
 static int check_quant_ops(model_blob *blob,
                            uint64_t q4_offset,
                            uint64_t q6_offset,
-                           uint64_t embed_offset) {
+                           uint64_t embed_offset,
+                           uint64_t f16_embed_offset) {
     const uint32_t in_dim = QK_K;
     const uint32_t out_dim = 2;
     const uint32_t n_tokens = 4;
@@ -322,6 +338,20 @@ static int check_quant_ops(model_blob *blob,
                   "Q6_K matmul numeric");
         }
     }
+    CHECK(ds4_gpu_matmul_f16_tensor(
+              out, blob->data, blob->size, f16_embed_offset,
+              in_dim, out_dim, x, n_tokens),
+          "F16 batch matmul");
+    CHECK(ds4_gpu_tensor_read(out, 0, out_host, sizeof(out_host)),
+          "read F16 batch matmul");
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float base =
+            (float)in_dim * 0.25f * (float)(t + 1u);
+        CHECK(close_enough(out_host[t * out_dim], base, 0.01f, 1e-5f) &&
+              close_enough(out_host[t * out_dim + 1u],
+                           2.0f * base, 0.01f, 1e-5f),
+              "F16 batch matmul numeric");
+    }
     CHECK(ds4_gpu_matmul_quant_tensor(out, blob->data, blob->size,
                                       q4_offset, 12u, in_dim, out_dim,
                                       x, 1u),
@@ -365,6 +395,35 @@ static int check_quant_ops(model_blob *blob,
     for (uint32_t i = 0; i < in_dim; i++) {
         CHECK(embed_host[i] == 1.0f, "Q4_K embedding numeric");
     }
+    CHECK(ds4_gpu_embed_token_quant_tensor(
+              embed, blob->data, blob->size,
+              f16_embed_offset, 1u, 2u, 1u, in_dim),
+          "F16 token embedding");
+    CHECK(ds4_gpu_tensor_read(embed, 0, embed_host, sizeof(embed_host)),
+          "read F16 token embedding");
+    for (uint32_t i = 0; i < in_dim; i++) {
+        CHECK(embed_host[i] == 2.0f, "F16 token embedding numeric");
+    }
+    const int32_t token_ids[2] = {1, 0};
+    ds4_gpu_tensor *tokens = ds4_gpu_tensor_alloc(sizeof(token_ids));
+    ds4_gpu_tensor *embed_batch =
+        ds4_gpu_tensor_alloc(2u * in_dim * sizeof(float));
+    float embed_batch_host[2u * in_dim];
+    CHECK(tokens && embed_batch, "F16 batch embedding allocation");
+    CHECK(ds4_gpu_tensor_write(tokens, 0, token_ids, sizeof(token_ids)) &&
+          ds4_gpu_embed_tokens_quant_tensor(
+              embed_batch, tokens, blob->data, blob->size,
+              f16_embed_offset, 1u, 2u, 2u, in_dim) &&
+          ds4_gpu_tensor_read(embed_batch, 0, embed_batch_host,
+                              sizeof(embed_batch_host)),
+          "F16 batch token embedding");
+    for (uint32_t i = 0; i < in_dim; i++) {
+        CHECK(embed_batch_host[i] == 2.0f &&
+              embed_batch_host[in_dim + i] == 1.0f,
+              "F16 batch token embedding numeric");
+    }
+    ds4_gpu_tensor_free(embed_batch);
+    ds4_gpu_tensor_free(tokens);
     ds4_gpu_tensor_free(embed);
     ds4_gpu_tensor_free(out);
     ds4_gpu_tensor_free(x);
@@ -1112,6 +1171,171 @@ static int check_moe(model_blob *blob,
     return 0;
 }
 
+static float nvfp4_moe_expected(float projection,
+                                const int32_t selected[2],
+                                const float router_weights[2],
+                                const float gate_scales[2],
+                                const float up_scales[2],
+                                const float down_scales[2],
+                                uint32_t dim) {
+    float total = 0.0f;
+    for (uint32_t slot = 0u; slot < 2u; slot++) {
+        const uint32_t expert = (uint32_t)selected[slot];
+        const float gate = projection * gate_scales[expert];
+        const float up = projection * up_scales[expert];
+        const float mid =
+            (gate / (1.0f + expf(-gate))) *
+            up * router_weights[slot];
+        total += mid * (float)dim * down_scales[expert];
+    }
+    return total;
+}
+
+static int check_nvfp4_moe(model_blob *blob,
+                           const ds4_gpu_laguna_moe_desc *routed,
+                           int native_w4a4) {
+    const uint32_t dim = QK_K;
+    enum { n_tokens = 2, n_expert = 2 };
+    float x_host[n_tokens * dim];
+    for (uint32_t token = 0u; token < n_tokens; token++) {
+        for (uint32_t i = 0u; i < dim; i++) {
+            x_host[(uint64_t)token * dim + i] =
+                0.01f * (float)(token + 1u);
+        }
+    }
+    const int32_t selected_host[n_tokens * n_expert] = {0, 1, 1, 0};
+    const float weights_host[n_tokens * n_expert] = {
+        0.25f, 0.75f, 0.60f, 0.40f
+    };
+    const float gate_scales[2] = {0.5f, 1.5f};
+    const float up_scales[2] = {2.0f, 0.75f};
+    const float down_scales[2] = {1.25f, 0.25f};
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(x_host));
+    ds4_gpu_tensor *selected =
+        ds4_gpu_tensor_alloc(sizeof(selected_host));
+    ds4_gpu_tensor *weights =
+        ds4_gpu_tensor_alloc(sizeof(weights_host));
+    ds4_gpu_tensor *out =
+        ds4_gpu_tensor_alloc(n_tokens * dim * sizeof(float));
+    ds4_gpu_tensor *mid =
+        ds4_gpu_tensor_alloc(
+            n_tokens * n_expert * dim * sizeof(float));
+    CHECK(x && selected && weights && out && mid,
+          "NVFP4 MoE tensor allocation");
+    CHECK(ds4_gpu_tensor_write(x, 0, x_host, sizeof(x_host)) &&
+          ds4_gpu_tensor_write(selected, 0, selected_host,
+                               sizeof(selected_host)) &&
+          ds4_gpu_tensor_write(weights, 0, weights_host,
+                               sizeof(weights_host)),
+          "write NVFP4 MoE tensors");
+
+    float portable[n_tokens * dim];
+    float selected_path[n_tokens * dim];
+    CHECK(setenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4", "1", 1) == 0,
+          "select portable NVFP4 schedule");
+    CHECK(ds4_gpu_laguna_routed_moe_tensor(
+              out, mid, blob->data, blob->size, routed,
+              dim, dim, dim, selected, weights, n_expert, n_expert,
+              x, n_tokens) &&
+          ds4_gpu_tensor_read(out, 0, portable, sizeof(portable)),
+          "portable Laguna NVFP4 MoE");
+    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4") == 0,
+          "select default NVFP4 schedule");
+    CHECK(ds4_gpu_laguna_routed_moe_tensor(
+              out, mid, blob->data, blob->size, routed,
+              dim, dim, dim, selected, weights, n_expert, n_expert,
+              x, n_tokens) &&
+          ds4_gpu_tensor_read(out, 0, selected_path, sizeof(selected_path)),
+          "default Laguna NVFP4 MoE");
+    for (uint32_t token = 0u; token < n_tokens; token++) {
+        const float expected = nvfp4_moe_expected(
+            2.56f * (float)(token + 1u),
+            selected_host + token * n_expert,
+            weights_host + token * n_expert,
+            gate_scales, up_scales, down_scales, dim);
+        for (uint32_t i = 0u; i < dim; i++) {
+            const uint64_t index = (uint64_t)token * dim + i;
+            const float rtol = native_w4a4 ? 0.15f : 3e-3f;
+            CHECK(close_enough(portable[index], expected, 0.30f, rtol),
+                  "portable Laguna NVFP4 MoE numeric");
+            CHECK(close_enough(selected_path[index], expected,
+                               0.30f, rtol),
+                  "default Laguna NVFP4 MoE numeric");
+            CHECK(close_enough(selected_path[index], portable[index],
+                               0.05f, 1e-4f),
+                  "Laguna NVFP4 schedule agreement");
+        }
+    }
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(x);
+    return 0;
+}
+
+static int check_native_nvfp4_moe(model_blob *blob) {
+    enum { n_expert = 2 };
+    const uint32_t dim = QK_K;
+    const uint64_t packed_bytes = (uint64_t)dim * dim / 2u;
+    const uint64_t scale_bytes = (uint64_t)dim * dim / 16u;
+    uint64_t packed[3][n_expert];
+    uint64_t scale[3][n_expert];
+    uint64_t weight_global[3][n_expert];
+    uint64_t input_global[3][n_expert];
+    const float output_scale[3][n_expert] = {
+        {0.5f, 1.5f}, {2.0f, 0.75f}, {1.25f, 0.25f}
+    };
+    for (uint32_t p = 0u; p < 3u; p++) {
+        for (uint32_t e = 0u; e < n_expert; e++) {
+            packed[p][e] = blob_alloc(blob, packed_bytes);
+            scale[p][e] = blob_alloc(blob, scale_bytes);
+            weight_global[p][e] = blob_alloc(blob, sizeof(float));
+            input_global[p][e] = blob_alloc(blob, sizeof(float));
+            CHECK(packed[p][e] != UINT64_MAX &&
+                  scale[p][e] != UINT64_MAX &&
+                  weight_global[p][e] != UINT64_MAX &&
+                  input_global[p][e] != UINT64_MAX,
+                  "allocate native NVFP4 tensors");
+            /* Adjacent low/even, high/odd E2M1 code 2 = 1.0. */
+            memset(blob->data + packed[p][e], 0x22, packed_bytes);
+            /* Positive E4M3 0x38 = 1.0 before global dequantization. */
+            memset(blob->data + scale[p][e], 0x38, scale_bytes);
+            const float raw_weight_global = 1.0f / output_scale[p][e];
+            const float raw_input_global = p < 2u ? 600.0f : 256.0f;
+            memcpy(blob->data + weight_global[p][e],
+                   &raw_weight_global, sizeof(raw_weight_global));
+            memcpy(blob->data + input_global[p][e],
+                   &raw_input_global, sizeof(raw_input_global));
+        }
+    }
+
+    ds4_gpu_laguna_moe_desc routed = {0};
+    routed.gate_type = 40u;
+    routed.up_type = 40u;
+    routed.down_type = 40u;
+    routed.gate_row_bytes =
+        routed.up_row_bytes =
+        routed.down_row_bytes =
+            (uint64_t)(dim / 64u) * sizeof(block_nvfp4);
+    routed.gate_expert_bytes =
+        routed.up_expert_bytes =
+        routed.down_expert_bytes =
+            (uint64_t)dim * routed.gate_row_bytes;
+    ds4_gpu_nvfp4_matrix_desc *matrix[3] = {
+        &routed.gate_nvfp4, &routed.up_nvfp4, &routed.down_nvfp4
+    };
+    for (uint32_t p = 0u; p < 3u; p++) {
+        matrix[p]->packed_offsets = packed[p];
+        matrix[p]->scale_offsets = scale[p];
+        matrix[p]->weight_global_scale_offsets = weight_global[p];
+        matrix[p]->input_global_scale_offsets = input_global[p];
+        matrix[p]->packed_bytes = packed_bytes;
+        matrix[p]->scale_bytes = scale_bytes;
+    }
+    return check_nvfp4_moe(blob, &routed, 1);
+}
+
 int main(void) {
     CHECK(ds4_gpu_init(), "ds4_gpu_init");
     const uint64_t blob_size = 2u * 1024u * 1024u;
@@ -1127,14 +1351,23 @@ int main(void) {
         blob_alloc(&blob, 2u * sizeof(block_q6_K));
     const uint64_t embed_offset =
         blob_alloc(&blob, 2u * sizeof(block_q4_K));
+    const uint64_t f16_embed_offset =
+        blob_alloc(&blob, 2u * QK_K * sizeof(uint16_t));
     const uint64_t norm_offset =
         blob_alloc(&blob, HEAD_DIM * sizeof(float));
     CHECK(q4_offset != UINT64_MAX && q6_offset != UINT64_MAX &&
-          embed_offset != UINT64_MAX && norm_offset != UINT64_MAX,
+          embed_offset != UINT64_MAX &&
+          f16_embed_offset != UINT64_MAX &&
+          norm_offset != UINT64_MAX,
           "allocate basic model ranges");
     fill_q4_pattern(blob.data + q4_offset, 2u);
     fill_q6_pattern(blob.data + q6_offset, 2u);
     fill_q4_ones(blob.data + embed_offset, 2u);
+    uint16_t *f16_embed = (uint16_t *)(blob.data + f16_embed_offset);
+    for (uint32_t i = 0u; i < QK_K; i++) {
+        f16_embed[i] = 0x3c00u;
+        f16_embed[QK_K + i] = 0x4000u;
+    }
     float *norm = (float *)(blob.data + norm_offset);
     for (uint32_t i = 0; i < HEAD_DIM; i++) {
         norm[i] = 0.75f + (float)(i % 7u) * 0.03125f;
@@ -1210,6 +1443,32 @@ int main(void) {
     q3_shared.gate_offset = blob_alloc(&blob, q3_matrix_bytes);
     q3_shared.up_offset = blob_alloc(&blob, q3_matrix_bytes);
     q3_shared.down_offset = blob_alloc(&blob, q3_matrix_bytes);
+    const uint64_t nvfp4_row_bytes =
+        (uint64_t)(dim / 64u) * sizeof(block_nvfp4);
+    const uint64_t nvfp4_matrix_bytes =
+        (uint64_t)dim * nvfp4_row_bytes;
+    ds4_gpu_laguna_moe_desc nvfp4_routed = {0};
+    nvfp4_routed.gate_offset =
+        blob_alloc(&blob, 2u * nvfp4_matrix_bytes);
+    nvfp4_routed.up_offset =
+        blob_alloc(&blob, 2u * nvfp4_matrix_bytes);
+    nvfp4_routed.down_offset =
+        blob_alloc(&blob, 2u * nvfp4_matrix_bytes);
+    nvfp4_routed.gate_scale_offset =
+        blob_alloc(&blob, 2u * sizeof(float));
+    nvfp4_routed.up_scale_offset =
+        blob_alloc(&blob, 2u * sizeof(float));
+    nvfp4_routed.down_scale_offset =
+        blob_alloc(&blob, 2u * sizeof(float));
+    nvfp4_routed.gate_type = 40u;
+    nvfp4_routed.up_type = 40u;
+    nvfp4_routed.down_type = 40u;
+    nvfp4_routed.gate_expert_bytes = nvfp4_matrix_bytes;
+    nvfp4_routed.gate_row_bytes = nvfp4_row_bytes;
+    nvfp4_routed.up_expert_bytes = nvfp4_matrix_bytes;
+    nvfp4_routed.up_row_bytes = nvfp4_row_bytes;
+    nvfp4_routed.down_expert_bytes = nvfp4_matrix_bytes;
+    nvfp4_routed.down_row_bytes = nvfp4_row_bytes;
     CHECK(routed.gate_offset != UINT64_MAX &&
           routed.up_offset != UINT64_MAX &&
           routed.down_offset != UINT64_MAX &&
@@ -1232,6 +1491,12 @@ int main(void) {
           q3_shared.gate_offset != UINT64_MAX &&
           q3_shared.up_offset != UINT64_MAX &&
           q3_shared.down_offset != UINT64_MAX,
+          nvfp4_routed.gate_offset != UINT64_MAX &&
+          nvfp4_routed.up_offset != UINT64_MAX &&
+          nvfp4_routed.down_offset != UINT64_MAX &&
+          nvfp4_routed.gate_scale_offset != UINT64_MAX &&
+          nvfp4_routed.up_scale_offset != UINT64_MAX &&
+          nvfp4_routed.down_scale_offset != UINT64_MAX,
           "allocate MoE model ranges");
     fill_q4_ones(blob.data + routed.gate_offset,
                  2u * dim);
@@ -1265,9 +1530,25 @@ int main(void) {
     for (uint32_t i = 0u; i < dim; i++) {
         q3_row_sum += q3_value_ref(q3_row, i);
     }
+    fill_nvfp4_ones(blob.data + nvfp4_routed.gate_offset,
+                    2u * dim * (dim / 64u));
+    fill_nvfp4_ones(blob.data + nvfp4_routed.up_offset,
+                    2u * dim * (dim / 64u));
+    fill_nvfp4_ones(blob.data + nvfp4_routed.down_offset,
+                    2u * dim * (dim / 64u));
+    const float nvfp4_gate_scales[2] = {0.5f, 1.5f};
+    const float nvfp4_up_scales[2] = {2.0f, 0.75f};
+    const float nvfp4_down_scales[2] = {1.25f, 0.25f};
+    memcpy(blob.data + nvfp4_routed.gate_scale_offset,
+           nvfp4_gate_scales, sizeof(nvfp4_gate_scales));
+    memcpy(blob.data + nvfp4_routed.up_scale_offset,
+           nvfp4_up_scales, sizeof(nvfp4_up_scales));
+    memcpy(blob.data + nvfp4_routed.down_scale_offset,
+           nvfp4_down_scales, sizeof(nvfp4_down_scales));
 
     CHECK(ds4_gpu_set_model_map(blob.data, blob.size), "set synthetic model map");
-    int rc = check_quant_ops(&blob, q4_offset, q6_offset, embed_offset);
+    int rc = check_quant_ops(
+        &blob, q4_offset, q6_offset, embed_offset, f16_embed_offset);
     if (rc == 0) rc = check_norm_rope(&blob, norm_offset);
     if (rc == 0) rc = check_attention();
     if (rc == 0) rc = check_dflash_blackwell_attention();
@@ -1283,6 +1564,8 @@ int main(void) {
     if (rc == 0) {
         rc = check_moe(&blob, &q3_routed, &q3_shared, q3_row_sum);
     }
+    if (rc == 0) rc = check_nvfp4_moe(&blob, &nvfp4_routed, 0);
+    if (rc == 0) rc = check_native_nvfp4_moe(&blob);
     ds4_gpu_cleanup();
     (void)cudaFreeHost(host);
     if (rc == 0) puts("cuda Laguna regression: OK");

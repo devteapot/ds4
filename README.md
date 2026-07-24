@@ -109,6 +109,7 @@ Download one main model. **Prefer the imatrix versions.**
 ./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ./download_model.sh laguna-q4  # >= 96 GB Apple Silicon, official Poolside Q4_K_M
+./download_model.sh laguna-nvfp4  # >= 96 GB CUDA, official native NVFP4
 ```
 
 For the full PRO Q4 distributed run, download one half on each machine:
@@ -229,6 +230,29 @@ stages one K/V row at a time, while
 `DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16=1` retains the eight-pair tensor-core MoE
 tile for both projections. To isolate only the down projection,
 `DS4_CUDA_LAGUNA_NO_Q4_MMA_DOWN_TILE16=1` retains its eight-pair tile.
+
+CUDA also loads Poolside's official `Laguna-S-2.1-NVFP4` checkpoint directly
+from its sharded safetensors directory—there is no GGUF conversion or
+repacking step. Routed expert gate/up/down matrices remain in the checkpoint's
+adjacent-nibble E2M1 layout with E4M3 block scales and per-expert global
+scales. Attention, the dense first layer, shared experts, embeddings, and the
+output head stay BF16:
+
+```sh
+./download_model.sh laguna-nvfp4
+make cuda-spark       # GB10 / compute capability 12.x
+# make cuda-generic   # portable CUDA path
+./ds4 --cuda -m gguf/Laguna-S-2.1-NVFP4 -c 32768 \
+  -p "Explain this repository"
+```
+
+The CUDA implementation dynamically quantizes routed-expert activations to
+E2M1 in groups of 16, applies the checkpoint's calibrated E4M3 and global
+scales, and uses NVFP4-specific DP4A gate/up and down kernels. Compute
+capability 12.x selects a wider Blackwell schedule; set
+`DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4=1` to force the portable schedule for
+comparison. NVFP4 support is raw-model only: DFlash, SSD
+streaming, distributed inference, Metal, and ROCm are not part of this path.
 
 The shipped GGUF is configured for a 262144-token context. Laguna defaults to
 temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options
