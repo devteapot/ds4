@@ -750,6 +750,7 @@ int ds4_gpu_dflash_pack_features_tensor(
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              aux_norm_offset,
+        int                   aux_norm_bf16,
         uint32_t              n_embd,
         uint32_t              n_aux,
         uint32_t              n_rows,

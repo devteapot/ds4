@@ -193,6 +193,12 @@ static float f16_ref(uint16_t value) {
                          (int)exponent - 25);
 }
 
+static uint16_t bf16_from_f32(float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return (uint16_t)(bits >> 16u);
+}
+
 static float q4_value_ref(const block_q4_K *block, uint32_t k) {
     const uint32_t group = k >> 5u;
     const uint32_t lane = k & 31u;
@@ -853,6 +859,60 @@ static int check_dflash_blackwell_attention(void) {
     ds4_gpu_tensor_free(value_cache);
     ds4_gpu_tensor_free(key_cache);
     ds4_gpu_tensor_free(heads);
+    return 0;
+}
+
+static int check_dflash_bf16_features(model_blob *blob) {
+    enum { n_embd = 256, n_aux = 2, n_rows = 2 };
+    const uint64_t values = (uint64_t)n_embd * n_aux * n_rows;
+    const uint64_t norm_values = (uint64_t)n_embd * n_aux;
+    float features[values], norm_f32[norm_values];
+    uint16_t norm_bf16[norm_values];
+    float got_f32[values], got_bf16[values];
+    for (uint64_t i = 0; i < values; i++) {
+        features[i] = 0.125f * (float)(1u + i % 7u);
+    }
+    for (uint32_t aux = 0; aux < n_aux; aux++) {
+        const float scale = aux ? 1.0f : 0.5f;
+        for (uint32_t i = 0; i < n_embd; i++) {
+            const uint64_t at = (uint64_t)aux * n_embd + i;
+            norm_f32[at] = scale;
+            norm_bf16[at] = bf16_from_f32(scale);
+        }
+    }
+    const uint64_t f32_offset =
+        blob_alloc(blob, norm_values * sizeof(float));
+    const uint64_t bf16_offset =
+        blob_alloc(blob, norm_values * sizeof(uint16_t));
+    CHECK(f32_offset != UINT64_MAX && bf16_offset != UINT64_MAX,
+          "allocate DFlash auxiliary norms");
+    memcpy(blob->data + f32_offset, norm_f32, sizeof(norm_f32));
+    memcpy(blob->data + bf16_offset, norm_bf16, sizeof(norm_bf16));
+
+    ds4_gpu_tensor *in = ds4_gpu_tensor_alloc(sizeof(features));
+    ds4_gpu_tensor *out_f32 = ds4_gpu_tensor_alloc(sizeof(got_f32));
+    ds4_gpu_tensor *out_bf16 = ds4_gpu_tensor_alloc(sizeof(got_bf16));
+    CHECK(in && out_f32 && out_bf16,
+          "DFlash feature-pack tensor allocation");
+    CHECK(ds4_gpu_tensor_write(in, 0, features, sizeof(features)),
+          "write DFlash feature-pack input");
+    CHECK(ds4_gpu_dflash_pack_features_tensor(
+              out_f32, in, blob->data, blob->size, f32_offset, 0,
+              n_embd, n_aux, n_rows, 1e-6f) &&
+          ds4_gpu_dflash_pack_features_tensor(
+              out_bf16, in, blob->data, blob->size, bf16_offset, 1,
+              n_embd, n_aux, n_rows, 1e-6f),
+          "DFlash F32/BF16 feature packing");
+    CHECK(ds4_gpu_tensor_read(out_f32, 0, got_f32, sizeof(got_f32)) &&
+          ds4_gpu_tensor_read(out_bf16, 0, got_bf16, sizeof(got_bf16)),
+          "read DFlash F32/BF16 feature packing");
+    for (uint64_t i = 0; i < values; i++) {
+        CHECK(close_enough(got_bf16[i], got_f32[i], 1e-6f, 1e-6f),
+              "DFlash BF16 feature packing equivalence");
+    }
+    ds4_gpu_tensor_free(out_bf16);
+    ds4_gpu_tensor_free(out_f32);
+    ds4_gpu_tensor_free(in);
     return 0;
 }
 
@@ -1690,6 +1750,7 @@ int main(void) {
     if (rc == 0) rc = check_norm_rope(&blob, norm_offset);
     if (rc == 0) rc = check_attention();
     if (rc == 0) rc = check_dflash_blackwell_attention();
+    if (rc == 0) rc = check_dflash_bf16_features(&blob);
     if (rc == 0) rc = check_long_decode_attention();
     if (rc == 0) rc = check_moe(&blob, &routed, &shared, (float)dim);
     if (rc == 0) {

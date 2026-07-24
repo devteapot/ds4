@@ -9,6 +9,8 @@ LAGUNA_REVISION="706fa69799926b6afde1af9e24ca2a4923f110a1"
 LAGUNA_DFLASH_REVISION="92b968eeba0fbb790ef4216e2a70ef079ed19b07"
 LAGUNA_NVFP4_REPO="poolside/Laguna-S-2.1-NVFP4"
 LAGUNA_NVFP4_REVISION="07614121b31898586430f189d27a25a0be310843"
+LAGUNA_NVFP4_DFLASH_REPO="poolside/Laguna-S-2.1-DFlash-NVFP4"
+LAGUNA_NVFP4_DFLASH_REVISION="723794750422b3efbf3a7b3af76dffb4ba035943"
 REPO="antirez/deepseek-v4-gguf"
 Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
@@ -28,6 +30,7 @@ LAGUNA_Q4_FILE="laguna-s-2.1-Q4_K_M.gguf"
 LAGUNA_Q2_Q3_FILE="laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf"
 LAGUNA_DFLASH_FILE="gguf/laguna-s-2.1-DFlash-BF16.gguf"
 LAGUNA_NVFP4_DIR="Laguna-S-2.1-NVFP4"
+LAGUNA_NVFP4_DFLASH_DIR="Laguna-S-2.1-DFlash-NVFP4"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -60,6 +63,7 @@ Usage:
   ./download_model.sh laguna-q2-q3 [--token TOKEN]
   ./download_model.sh laguna-dflash [--token TOKEN]
   ./download_model.sh laguna-nvfp4 [--token TOKEN]
+  ./download_model.sh laguna-nvfp4-dflash [--token TOKEN]
 
 Targets:
 
@@ -135,6 +139,11 @@ Targets:
        Official native Laguna S 2.1 NVFP4 sharded safetensors checkpoint
        from Poolside. About 67 GB on disk; supported directly by CUDA
        without GGUF conversion.
+
+  laguna-nvfp4-dflash
+       Official BF16 DFlash drafter trained specifically for the native
+       Laguna S 2.1 NVFP4 checkpoint. About 2.1 GB; loaded directly from
+       safetensors and supported with --mtp on CUDA.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -241,6 +250,14 @@ case "$MODEL" in
         DOWNLOAD_REPO_DIR=1
         LINK_MODEL=0
         HF_REVISION=$LAGUNA_NVFP4_REVISION
+        ;;
+    laguna-nvfp4-dflash)
+        REPO=$LAGUNA_NVFP4_DFLASH_REPO
+        MODEL_FILE=$LAGUNA_NVFP4_DFLASH_DIR
+        FORCE_HF_DOWNLOAD=1
+        DOWNLOAD_REPO_DIR=1
+        LINK_MODEL=0
+        HF_REVISION=$LAGUNA_NVFP4_DFLASH_REVISION
         ;;
     -h|--help|help)
         usage
@@ -374,7 +391,7 @@ download_repo_hf() {
     out="$OUT_DIR/$MODEL_FILE"
     HF_CMD=$(find_hf_command || true)
     if [ -z "$HF_CMD" ]; then
-        echo "Native NVFP4 downloads require the official Hugging Face CLI." >&2
+        echo "Native checkpoint downloads require the official Hugging Face CLI." >&2
         echo "Install it with:" >&2
         echo "  python3 -m pip install -U huggingface_hub hf_xet" >&2
         exit 1
@@ -395,10 +412,18 @@ download_repo_hf() {
     else
         "$HF_CMD" download "$REPO" --repo-type model --local-dir "$out"
     fi
-    if [ ! -s "$out/model.safetensors.index.json" ] ||
-       [ ! -s "$out/tokenizer.json" ]; then
-        echo "Hugging Face download finished but the checkpoint is incomplete: $out" >&2
-        exit 1
+    if [ "$MODEL" = "laguna-nvfp4" ]; then
+        if [ ! -s "$out/model.safetensors.index.json" ] ||
+           [ ! -s "$out/tokenizer.json" ]; then
+            echo "Hugging Face download finished but the checkpoint is incomplete: $out" >&2
+            exit 1
+        fi
+    elif [ "$MODEL" = "laguna-nvfp4-dflash" ]; then
+        if [ ! -s "$out/model.safetensors" ] ||
+           [ ! -s "$out/config.json" ]; then
+            echo "Hugging Face download finished but the DFlash checkpoint is incomplete: $out" >&2
+            exit 1
+        fi
     fi
 }
 
@@ -473,6 +498,11 @@ elif [ "$MODEL" = "laguna-nvfp4" ]; then
     echo "Native Laguna NVFP4 checkpoint downloaded."
     echo "Run it directly with:"
     echo "  ./ds4 --cuda -m $OUT_DIR/$LAGUNA_NVFP4_DIR -p \"Hello\""
+elif [ "$MODEL" = "laguna-nvfp4-dflash" ]; then
+    echo
+    echo "Native Laguna NVFP4 DFlash checkpoint downloaded."
+    echo "Enable it for greedy CUDA generation:"
+    echo "  ./ds4 --cuda -m $OUT_DIR/$LAGUNA_NVFP4_DIR --mtp $OUT_DIR/$LAGUNA_NVFP4_DFLASH_DIR --mtp-draft 7 --temp 0 -p \"Hello\""
 elif [ "$LINK_MODEL" -eq 1 ]; then
     cd "$ROOT"
     ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf

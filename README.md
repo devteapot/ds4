@@ -256,9 +256,30 @@ output columns and is slower in practice.
 
 The official NVFP4 checkpoint is Blackwell-only in this backend and requires
 the family-specific `cuda-spark` build. Use the official Q4_K_M model with
-`cuda-generic` on pre-Blackwell cards. NVFP4 support is raw-model only:
-DFlash, SSD streaming, distributed inference, Metal, and ROCm are not part of
-this path.
+`cuda-generic` on pre-Blackwell cards.
+
+Poolside publishes a separate DFlash checkpoint trained specifically against
+the NVFP4 target. Despite the target-qualified name, the 1B-parameter drafter
+itself is BF16; DwarfStar loads its safetensors directory directly and reuses
+the Blackwell-optimized Laguna DFlash attention and BF16 Tensor Core paths:
+
+```sh
+./download_model.sh laguna-nvfp4-dflash
+./ds4 --cuda -m gguf/Laguna-S-2.1-NVFP4 \
+  --mtp gguf/Laguna-S-2.1-DFlash-NVFP4 --mtp-draft 7 --temp 0 \
+  -p "Explain this repository"
+```
+
+The native NVFP4 drafter defaults to Poolside's recommended seven proposals;
+`--mtp-draft 15` selects the longer block used in Poolside's published
+throughput comparison. Target verification still determines every committed
+token. On GB10, the 2K/256 `ds4.c` workload measures 14.50 generation tok/s
+raw, 21.45 tok/s at depth 7, and 17.99 tok/s at depth 15. Depth 7 accepts
+62.84% of proposals and is the default. The full result is in
+`speed-bench/laguna_s21_nvfp4_dflash_gb10.csv`.
+
+SSD streaming, distributed inference, Metal, and ROCm are not part of the
+native NVFP4 path.
 
 The shipped GGUF is configured for a 262144-token context. Laguna defaults to
 temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options

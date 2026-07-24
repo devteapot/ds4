@@ -1,0 +1,21 @@
+format: patchmd-set-lock/v0.1
+patchset: laguna-s21-nvfp4-stack
+patchset_revision: sha256:afb26030066438dcf9044b09b334e15271d3c45f2ba9ba916dd980d2c9993dbd
+upstream_commit: 7e3dbef7e336433f487c172a3308e26b39fa75a3
+patches:
+    - patch: laguna-s21-cuda
+      revision: sha256:d889a244de59519b5d9e1448738a90fbc198f449e742f8aa1fa41dec445178bc
+    - patch: laguna-s21-nvfp4-cuda
+      revision: sha256:5821677728b138f6d8125c8d1a218716c94b0a7d0d2d45ce25fbc0e83ba81710
+result_tree: bb4c28a722b722bf6b4ed894c9387d81ccb35732
+outcome: adapted
+verification:
+    combined_acceptance: passed
+    cpu_build: passed
+    cuda_regression: passed
+    cuda_sm121_build: passed
+    gb10_benchmark: passed
+    memcheck: passed
+    native_dflash_live: passed
+toolchain:
+    patchmd: 0.1.0-dev

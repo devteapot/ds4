@@ -4302,10 +4302,11 @@ __global__ static void f32_to_bf16_kernel(
     if (i < n) out[i] = __float2bfloat16(x[i]);
 }
 
+template <typename NormT>
 __global__ static void dflash_pack_features_kernel(
         float *out,
         const float *features,
-        const float *norm,
+        const NormT *norm,
         uint32_t n_embd,
         uint32_t n_aux,
         uint32_t n_rows,
@@ -4332,13 +4333,13 @@ __global__ static void dflash_pack_features_kernel(
     }
     const float inv = rsqrtf(partial[0] / (float)n_embd + eps);
     float *dst = out + ((uint64_t)row * n_aux + aux) * n_embd;
-    const float *scale = norm + (uint64_t)aux * n_embd;
+    const NormT *scale = norm + (uint64_t)aux * n_embd;
     for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
         float v = src[i];
         if (!isfinite(v)) {
             v = isnan(v) ? 0.0f : copysignf(65504.0f, v);
         }
-        dst[i] = v * inv * scale[i];
+        dst[i] = v * inv * (float)scale[i];
     }
 }
 
@@ -13485,6 +13486,7 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(
 extern "C" int ds4_gpu_dflash_pack_features_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *features,
         const void *model_map, uint64_t model_size, uint64_t aux_norm_offset,
+        int aux_norm_bf16,
         uint32_t n_embd, uint32_t n_aux, uint32_t n_rows, float eps) {
     if (!out || !features || !model_map || n_embd == 0u || n_aux == 0u ||
         n_rows == 0u || !isfinite(eps) || eps <= 0.0f) {
@@ -13492,23 +13494,33 @@ extern "C" int ds4_gpu_dflash_pack_features_tensor(
     }
     const uint64_t values = (uint64_t)n_rows * n_aux * n_embd;
     const uint64_t norm_values = (uint64_t)n_aux * n_embd;
+    const uint64_t norm_bytes =
+        norm_values * (aux_norm_bf16 ? sizeof(__nv_bfloat16) : sizeof(float));
     if (features->bytes < values * sizeof(float) ||
         out->bytes < values * sizeof(float) ||
         aux_norm_offset > model_size ||
-        norm_values * sizeof(float) > model_size - aux_norm_offset) {
+        norm_bytes > model_size - aux_norm_offset) {
         return 0;
     }
     const int tier = ds4_tensor_device_idx(out);
     if (ds4_tensor_device_idx(features) != tier) return 0;
     const char *norm = cuda_resolve_weight_ptr(
-            model_map, aux_norm_offset, norm_values * sizeof(float),
+            model_map, aux_norm_offset, norm_bytes,
             tier, "DFlash aux norm");
     if (!norm) return 0;
-    dflash_pack_features_kernel<<<dim3(n_aux, n_rows, 1u), 256>>>(
-            (float *)out->ptr,
-            (const float *)features->ptr,
-            (const float *)norm,
-            n_embd, n_aux, n_rows, eps);
+    if (aux_norm_bf16) {
+        dflash_pack_features_kernel<<<dim3(n_aux, n_rows, 1u), 256>>>(
+                (float *)out->ptr,
+                (const float *)features->ptr,
+                (const __nv_bfloat16 *)norm,
+                n_embd, n_aux, n_rows, eps);
+    } else {
+        dflash_pack_features_kernel<<<dim3(n_aux, n_rows, 1u), 256>>>(
+                (float *)out->ptr,
+                (const float *)features->ptr,
+                (const float *)norm,
+                n_embd, n_aux, n_rows, eps);
+    }
     return cuda_ok(cudaGetLastError(), "DFlash pack features");
 }
 

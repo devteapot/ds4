@@ -16,7 +16,8 @@ license: MIT
 # Intent
 
 Extend the Laguna S 2.1 CUDA backend with native loading and execution of
-Poolside's official `Laguna-S-2.1-NVFP4` checkpoint.
+Poolside's official `Laguna-S-2.1-NVFP4` checkpoint and its target-specific
+`Laguna-S-2.1-DFlash-NVFP4` drafter.
 
 # Motivation
 
@@ -26,6 +27,11 @@ its routed experts use packed E2M1 weights, E4M3 per-group scales, and
 per-expert global scales, while the remaining model tensors are BF16. Loading
 that representation directly avoids a conversion step and preserves its
 calibrated W4A4 execution contract.
+
+Poolside also publishes a separate 1B-parameter DFlash checkpoint trained for
+this exact NVFP4 target. The target qualifier describes the training pairing;
+the drafter weights themselves are BF16 and should reuse the existing Laguna
+DFlash Tensor Core and Blackwell attention kernels.
 
 # Required behavior
 
@@ -49,6 +55,12 @@ calibrated W4A4 execution contract.
   fragments are reused across up to 16 routes.
 - Use the native W4A4 integer-dot kernel for decode, where the only SM121 FP4
   MMA shape would otherwise discard seven of eight result columns.
+- Accept the official NVFP4 DFlash safetensors directory through `--mtp`
+  without converting it to GGUF, including its fused QKV tensors, BF16 norms,
+  six target residual streams, and checkpoint-specific RoPE configuration.
+- Preserve target-verified greedy semantics and default the NVFP4-specific
+  drafter to Poolside's recommended seven proposals while retaining an
+  explicit `--mtp-draft 15` comparison mode.
 - Preserve existing Laguna Q4_K_M and unrelated backend behavior.
 
 # Invariants
@@ -62,12 +74,14 @@ calibrated W4A4 execution contract.
 - Correct scale conventions and stable logits are preserved across both the
   grouped FP4 MMA prefill kernel and the decode-specialized W4A4 kernel.
 - Native safetensors support is CUDA-only for this patch.
+- The NVFP4 target remains W4A4/BF16 mixed precision; its paired DFlash
+  checkpoint is BF16 and must not be mislabeled or executed as NVFP4 weights.
 
 # Non-goals
 
-- Laguna DFlash or any speculative drafter.
 - Converting the NVFP4 checkpoint to GGUF.
 - A general-purpose safetensors or Transformers runtime.
+- DFlash checkpoints trained for other Laguna targets or precisions.
 - SSD streaming, distributed inference, Metal, or ROCm support for this
   checkpoint.
 - Pre-Blackwell native NVFP4 execution.
@@ -77,6 +91,9 @@ calibrated W4A4 execution contract.
 - The supported checkpoint is revision
   `07614121b31898586430f189d27a25a0be310843` of
   `poolside/Laguna-S-2.1-NVFP4`.
+- The paired drafter is revision
+  `723794750422b3efbf3a7b3af76dffb4ba035943` of
+  `poolside/Laguna-S-2.1-DFlash-NVFP4`.
 - Gate and up input-global scales match for a given expert, allowing one
   quantized activation to feed both projections. Loader preparation rejects a
   checkpoint that violates this.
@@ -100,6 +117,10 @@ None.
   routed-expert schedules at Laguna's production dimensions.
 - Run the CUDA long-context and Laguna regression tests.
 - Run deterministic full-model inference from the official directory on GB10.
+- Inspect and load the official native DFlash directory as one BF16
+  safetensors file, then run a deterministic target-verified generation.
+- Compare raw decode with DFlash depths 7 and 15 on the same 2K/256 workload,
+  recording proposal acceptance and verifier-block timing.
 
 # Adaptation guidance
 
@@ -117,6 +138,12 @@ the even element and its high nibble is the odd element. Both weights and
 activations use E2M1 groups of 16. E4M3 block scales are serialized after
 multiplication by their global scale, so dequantization applies the reciprocal
 stored in the CUDA descriptor cache.
+
+Keep native DFlash parsing equally narrow: detect Poolside's
+`DFlashLagunaForCausalLM` config, expose the fused QKV payload as three
+zero-copy tensor views, and synthesize the contiguous six-row auxiliary norm
+view. Dispatch BF16 norms through the same mixed-precision helpers used by the
+native target, including the batched target verifier's output norm.
 
 # Decisions
 
@@ -145,6 +172,13 @@ stored in the CUDA descriptor cache.
   into CUDA's range cache so 32-bit packed/scale fragment loads remain aligned.
 - Add `download_model.sh laguna-nvfp4`; it uses the official Hugging Face
   client to download the complete pinned checkpoint directory.
+- Add `download_model.sh laguna-nvfp4-dflash` for the pinned paired drafter.
+  Load its unsharded safetensors file directly and use its 262K-context,
+  theta-10000 sliding-attention RoPE rather than the Q4 drafter's 1M-context,
+  theta-500000 configuration.
+- Keep the existing Blackwell DFlash grouped-GQA kernel and BF16 cuBLAS path;
+  the new work is checkpoint-native loading and mixed-precision correctness,
+  not an invented FP4 drafter kernel for weights that are actually BF16.
 
 # Validation
 
@@ -167,6 +201,19 @@ stored in the CUDA descriptor cache.
   integer-dot prompt kernel, and steady decode of 14.26/14.10/13.55 token/s.
   The raw run is stored in
   `speed-bench/laguna_s21_nvfp4_gb10.csv`.
+- The official native drafter maps as one 2.08 GiB file and 76 logical BF16
+  tensors. A deterministic `Reply with OK.` smoke produces exactly `OK`
+  through target verification.
+- On the repeated 2,048-token `ds4.c` / 256-token greedy workload, raw NVFP4
+  measures 439.63/14.50 prefill/generation tok/s. DFlash depth 7 measures
+  302.24/21.45 tok/s with 62.84% proposal acceptance and 5.33 committed
+  tokens per verifier block; depth 15 measures 390.14/17.99 tok/s with 36.82%
+  proposal acceptance and 6.24 committed tokens per block. Results are stored
+  in `speed-bench/laguna_s21_nvfp4_dflash_gb10.csv`.
+- `make cuda-regression` passes the long-context and Laguna suites, including
+  F32/BF16 DFlash auxiliary feature-pack equivalence.
+- Compute Sanitizer memcheck reports zero errors with expected unsupported
+  host-registration API diagnostics suppressed.
 
 # Provenance
 
@@ -178,9 +225,13 @@ Explicitly requested:
   Blackwell/GB10.
 - Use existing Metal and CUDA kernels as implementation references where
   appropriate.
-- Support only the raw model, without DFlash.
+- Initially support only the raw model, then add the official target-specific
+  DFlash checkpoint after rebasing the dependent patch through PatchMD.
 - Use the repository download script and open a PR targeting the original
   Laguna CUDA patch branch.
+- Reapply the CUDA and NVFP4 patch stack through PatchMD after the source
+  branch's DFlash commits, adapt dependent patch references where necessary,
+  benchmark the paired official drafter, and update the PR.
 
 Observed from the official checkpoint:
 
@@ -193,5 +244,5 @@ Observed from the official checkpoint:
 
 # Reference realization
 
-The reference realization is based on upstream
-7e3dbef7e336433f487c172a3308e26b39fa75a3 and stored in `reference.patch`.
+The reference realization is an incremental delta on top of the
+`laguna-s21-cuda` dependency realization and is stored in `reference.patch`.
