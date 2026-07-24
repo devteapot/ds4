@@ -146,7 +146,8 @@ static const char *tool_summary(ds4_help_tool tool) {
 static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
-    opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+    opt(fp, c, "-m, --model PATH",
+        "GGUF file or native checkpoint directory. Default: ds4flash.gguf");
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
@@ -176,10 +177,10 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO 8192; Laguna 16384; others 4096.");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
-            opt(fp, c, "--mtp FILE", "Optional MTP, DSpark, or Laguna DFlash support GGUF.");
+            opt(fp, c, "--mtp FILE|DIR", "Optional MTP, DSpark, or Laguna DFlash support checkpoint.");
         }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
-            opt(fp, c, "--mtp-draft N", "Maximum draft tokens. Default: 1 (15 for Laguna DFlash)");
+            opt(fp, c, "--mtp-draft N", "Maximum draft tokens. Default: 1 (15 for Q4 DFlash, 7 for NVFP4 DFlash)");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
             opt(fp, c, "--glm-mtp-timing", "Enable GLM MTP and print acceptance/timing counters.");

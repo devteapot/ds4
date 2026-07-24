@@ -28,6 +28,8 @@ cannot run end-to-end on NVIDIA GPUs through ds4's CUDA backend.
   model-specific forward path on NVIDIA GPUs.
 - CUDA inference must implement the same Laguna S 2.1 model mechanics and
   tensor semantics as the existing Metal reference path.
+- The official Laguna S 2.1 BF16 DFlash support model must remain available
+  as an optional CUDA speculative-decoding path for the Q4_K_M target.
 - Existing CUDA model backends must continue to compile and retain their
   existing dispatch behavior.
 
@@ -45,8 +47,6 @@ cannot run end-to-end on NVIDIA GPUs through ds4's CUDA backend.
 - Redesigning Laguna S 2.1 architecture or its GGUF layout.
 - Introducing a generic model runtime or C++.
 - Optimizing unrelated model backends.
-- Adding DFlash or another speculative decoder before raw Laguna prefill and
-  decode performance are competitive.
 
 # Assumptions
 
@@ -70,6 +70,8 @@ None.
 - Run focused CUDA unit/regression tests that do not require the full model.
 - With a Laguna S 2.1 GGUF, run a deterministic prompt or logits comparison
   against a trusted backend and exercise decode plus multi-token prefill.
+- Load the official BF16 DFlash GGUF, preserve target-verified greedy output,
+  and compare its portable and Blackwell attention schedules.
 - Report sustained performance with at least 2K, 4K, and 8K prompt contexts
   and 256 generated tokens per point. Short smoke/profile runs are diagnostic
   evidence only, not representative throughput claims.
@@ -160,6 +162,9 @@ coverage.
   shape-gated, retain a rollback switch and portable fallback, preserve the
   validated logits contract, and demonstrate a measured win on supported
   hardware.
+- Keep DFlash optional and target-verified. On Blackwell, group the nine query
+  heads that share each KV head so a sliding-window K/V row is loaded once per
+  group; `DS4_CUDA_DFLASH_NO_BLACKWELL=1` retains the portable schedule.
 
 # Provenance
 
@@ -251,6 +256,11 @@ Verification evidence:
   recorded as a validation exception rather than hidden.
 - Full-model revised-weight prefill and generation complete successfully at
   all three sustained benchmark frontiers.
+- The official Q4 DFlash drafter preserves coherent target-verified output.
+  On the 2K/256 code workload, the Blackwell schedule measures 41.61
+  generation tok/s versus 38.46 for the portable schedule and 22.45 for raw
+  decoding; results are stored in
+  `speed-bench/laguna_s21_dflash_gb10.csv`.
 
 # Reference realization
 

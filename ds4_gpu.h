@@ -750,6 +750,7 @@ int ds4_gpu_dflash_pack_features_tensor(
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              aux_norm_offset,
+        int                   aux_norm_bf16,
         uint32_t              n_embd,
         uint32_t              n_aux,
         uint32_t              n_rows,
@@ -860,6 +861,16 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps);
+
+int ds4_gpu_rms_norm_bf16_weight_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n,
+        uint32_t              rows,
+        float                 eps);
 
 int ds4_gpu_add_rms_norm_weight_tensor(
         ds4_gpu_tensor       *norm_out,
@@ -1021,6 +1032,25 @@ int ds4_gpu_laguna_head_rms_norm_rope_tensor(
         float           beta_slow,
         float           eps);
 
+int ds4_gpu_laguna_head_rms_norm_rope_bf16_tensor(
+        ds4_gpu_tensor *x,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        weight_offset,
+        uint32_t        n_tokens,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint32_t        pos0,
+        uint32_t        n_ctx_orig,
+        float           freq_base,
+        float           freq_scale,
+        float           ext_factor,
+        float           attn_factor,
+        float           beta_fast,
+        float           beta_slow,
+        float           eps);
+
 int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
         ds4_gpu_tensor *q,
         ds4_gpu_tensor *k,
@@ -1043,7 +1073,46 @@ int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
         float           beta_slow,
         float           eps);
 
+int ds4_gpu_laguna_qk_head_rms_norm_rope_bf16_tensor(
+        ds4_gpu_tensor *q,
+        ds4_gpu_tensor *k,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        q_weight_offset,
+        uint64_t        k_weight_offset,
+        uint32_t        n_tokens,
+        uint32_t        n_q_head,
+        uint32_t        n_k_head,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint32_t        pos0,
+        uint32_t        n_ctx_orig,
+        float           freq_base,
+        float           freq_scale,
+        float           ext_factor,
+        float           attn_factor,
+        float           beta_fast,
+        float           beta_slow,
+        float           eps);
+
 int ds4_gpu_laguna_qkvg_f16_tensor(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_weight_offset,
+        uint64_t              k_weight_offset,
+        uint64_t              v_weight_offset,
+        uint64_t              gate_weight_offset,
+        uint32_t              in_dim,
+        uint32_t              q_dim,
+        uint32_t              kv_dim,
+        uint32_t              gate_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_laguna_qkvg_bf16_tensor(
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *k,
         ds4_gpu_tensor       *v,
@@ -2287,9 +2356,21 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         bool                    force_resident);
 
 typedef struct {
+    const uint64_t *packed_offsets;
+    const uint64_t *scale_offsets;
+    const uint64_t *weight_global_scale_offsets;
+    const uint64_t *input_global_scale_offsets;
+    uint64_t packed_bytes;
+    uint64_t scale_bytes;
+} ds4_gpu_nvfp4_matrix_desc;
+
+typedef struct {
     uint64_t gate_offset;
     uint64_t up_offset;
     uint64_t down_offset;
+    uint64_t gate_scale_offset;
+    uint64_t up_scale_offset;
+    uint64_t down_scale_offset;
     uint32_t gate_type;
     uint32_t up_type;
     uint32_t down_type;
@@ -2299,7 +2380,29 @@ typedef struct {
     uint64_t up_row_bytes;
     uint64_t down_expert_bytes;
     uint64_t down_row_bytes;
+    ds4_gpu_nvfp4_matrix_desc gate_nvfp4;
+    ds4_gpu_nvfp4_matrix_desc up_nvfp4;
+    ds4_gpu_nvfp4_matrix_desc down_nvfp4;
 } ds4_gpu_laguna_moe_desc;
+
+/* Laguna-routed MoE for both decode and prefill. Native NVFP4 descriptors
+ * point to the packed E2M1, E4M3 scale, and F32 global-scale tensors in the
+ * official sharded checkpoint. */
+int ds4_gpu_laguna_routed_moe_tensor(
+        ds4_gpu_tensor                   *out,
+        ds4_gpu_tensor                   *mid,
+        const void                       *model_map,
+        uint64_t                          model_size,
+        const ds4_gpu_laguna_moe_desc    *routed,
+        uint32_t                          expert_in_dim,
+        uint32_t                          expert_mid_dim,
+        uint32_t                          out_dim,
+        const ds4_gpu_tensor             *selected,
+        const ds4_gpu_tensor             *weights,
+        uint32_t                          n_total_expert,
+        uint32_t                          n_expert,
+        const ds4_gpu_tensor             *x,
+        uint32_t                          n_tokens);
 
 /* Decode-only Laguna path. Routed and shared experts use independent thread
  * groups in two common dispatches, preserving each projection's arithmetic. */

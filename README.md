@@ -109,6 +109,7 @@ Download one main model. **Prefer the imatrix versions.**
 ./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ./download_model.sh laguna-q4  # >= 96 GB Apple Silicon, official Poolside Q4_K_M
+./download_model.sh laguna-nvfp4  # >= 96 GB CUDA, official native NVFP4
 ```
 
 For the full PRO Q4 distributed run, download one half on each machine:
@@ -229,6 +230,76 @@ stages one K/V row at a time, while
 `DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16=1` retains the eight-pair tensor-core MoE
 tile for both projections. To isolate only the down projection,
 `DS4_CUDA_LAGUNA_NO_Q4_MMA_DOWN_TILE16=1` retains its eight-pair tile.
+
+CUDA also loads Poolside's official `Laguna-S-2.1-NVFP4` checkpoint directly
+from its sharded safetensors directory—there is no GGUF conversion or
+repacking step. Routed expert gate/up/down matrices remain in the checkpoint's
+adjacent-nibble E2M1 layout with E4M3 block scales and per-expert global
+scales. Attention, the dense first layer, shared experts, embeddings, and the
+output head stay BF16:
+
+```sh
+./download_model.sh laguna-nvfp4
+make cuda-spark       # GB10 / sm_121 Blackwell family target
+./ds4 --cuda -m gguf/Laguna-S-2.1-NVFP4 -c 32768 \
+  -p "Explain this repository"
+```
+
+The CUDA implementation dynamically quantizes routed-expert activations to
+E2M1 in groups of 16 and applies the checkpoint's calibrated E4M3 and global
+scales. On prompt batches it sorts routes by expert and packs up to 16 routes
+by eight output channels into Blackwell's block-scaled
+`mma.sync.m16n8k64` FP4 instruction, reusing each expert weight tile across
+the batch. Decode and DFlash verification use the native W4A4 integer-dot
+kernel: GB10's FP4 MMA has no GEMV-sized form, so these narrow routed batches
+would discard most of its result columns and are slower in practice. The CUDA
+quantizer predecodes dynamic E2M1 activations to signed bytes once per group.
+The supported checkpoint has one routed gate/up input-global scale per layer,
+so decode quantizes each token once and shares it across all ten selected
+experts; loader preparation verifies this invariant. Gate and up consume each
+activation group together, and down reuses the quantized routed intermediate
+directly in DP4A.
+
+The official NVFP4 checkpoint is Blackwell-only in this backend and requires
+the family-specific `cuda-spark` build. Use the official Q4_K_M model with
+`cuda-generic` on pre-Blackwell cards.
+
+Poolside publishes a separate DFlash checkpoint trained specifically against
+the NVFP4 target. Despite the target-qualified name, the 1B-parameter drafter
+itself is BF16; DwarfStar loads its safetensors directory directly and reuses
+the Blackwell-optimized Laguna DFlash attention and BF16 Tensor Core paths:
+
+```sh
+./download_model.sh laguna-nvfp4-dflash
+./ds4 --cuda -m gguf/Laguna-S-2.1-NVFP4 \
+  --mtp gguf/Laguna-S-2.1-DFlash-NVFP4 --mtp-draft 7 --temp 0 \
+  -p "Explain this repository"
+```
+
+The native NVFP4 drafter defaults to Poolside's recommended seven proposals;
+`--mtp-draft 15` selects the longer block used in Poolside's published
+throughput comparison. Target verification still determines every committed
+token. Laguna's Blackwell verifier uses a fixed head-dimension-128 split-K
+attention kernel for its at-most-16-token staged block, distributing the long
+history over 16 warps instead of walking it serially. On GB10, the 2K/256
+`ds4.c` workload measures 14.74 generation tok/s raw, 28.15 tok/s at depth 5,
+and 31.73 tok/s at depth 7. Depth 7 accepts 64.31% of proposals, commits 5.45
+tokens per verifier block, and is the default. The full result is in
+`speed-bench/laguna_s21_nvfp4_dflash_gb10.csv`.
+
+An apples-to-apples rerun on one immutable 2,048-token prompt used each
+target's official drafter and generated 256 greedy tokens. Q4_K_M with
+`Laguna-S-2.1-DFlash-BF16` at depth 15 reached 27.81 token/s; NVFP4 with
+`Laguna-S-2.1-DFlash-NVFP4` at depth 7 reached 31.73 token/s. The Q4 run
+committed 8.00 tokens per 287.38 ms block, while NVFP4 committed 5.45 tokens
+per 171.66 ms block. The full verifier accounting is in
+`speed-bench/laguna_s21_dflash_quant_comparison_gb10.csv`. These figures are
+prompt-sensitive: high-acceptance Q4 workloads still reach roughly 42
+token/s, while NVFP4's shorter verifier block wins this particular workload
+through substantially lower cycle latency.
+
+SSD streaming, distributed inference, Metal, and ROCm are not part of the
+native NVFP4 path.
 
 The shipped GGUF is configured for a 262144-token context. Laguna defaults to
 temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options

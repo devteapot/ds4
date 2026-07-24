@@ -7,6 +7,10 @@ LAGUNA_REPO="poolside/Laguna-S-2.1-GGUF"
 LAGUNA_ANTIREZ_REPO="antirez/Laguna-S-2.1-GGUF"
 LAGUNA_REVISION="706fa69799926b6afde1af9e24ca2a4923f110a1"
 LAGUNA_DFLASH_REVISION="92b968eeba0fbb790ef4216e2a70ef079ed19b07"
+LAGUNA_NVFP4_REPO="poolside/Laguna-S-2.1-NVFP4"
+LAGUNA_NVFP4_REVISION="07614121b31898586430f189d27a25a0be310843"
+LAGUNA_NVFP4_DFLASH_REPO="poolside/Laguna-S-2.1-DFlash-NVFP4"
+LAGUNA_NVFP4_DFLASH_REVISION="723794750422b3efbf3a7b3af76dffb4ba035943"
 REPO="antirez/deepseek-v4-gguf"
 Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
@@ -24,7 +28,9 @@ GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
 LAGUNA_Q4_FILE="laguna-s-2.1-Q4_K_M.gguf"
 LAGUNA_Q2_Q3_FILE="laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf"
-LAGUNA_DFLASH_FILE="gguf/laguna-s-2.1-DFlash-BF16.gguf"
+LAGUNA_DFLASH_FILE="laguna-s-2.1-DFlash-BF16.gguf"
+LAGUNA_NVFP4_DIR="Laguna-S-2.1-NVFP4"
+LAGUNA_NVFP4_DFLASH_DIR="Laguna-S-2.1-DFlash-NVFP4"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -56,6 +62,8 @@ Usage:
   ./download_model.sh laguna-q4 [--token TOKEN]
   ./download_model.sh laguna-q2-q3 [--token TOKEN]
   ./download_model.sh laguna-dflash [--token TOKEN]
+  ./download_model.sh laguna-nvfp4 [--token TOKEN]
+  ./download_model.sh laguna-nvfp4-dflash [--token TOKEN]
 
 Targets:
 
@@ -127,6 +135,16 @@ Targets:
        layers 1..20 use Q2_K and layers 21..47 use Q3_K; all other tensors
        retain the official Q4_K_M layout. 44.95 GiB on disk.
 
+  laguna-nvfp4
+       Official native Laguna S 2.1 NVFP4 sharded safetensors checkpoint
+       from Poolside. About 67 GB on disk; supported directly by CUDA
+       without GGUF conversion.
+
+  laguna-nvfp4-dflash
+       Official BF16 DFlash drafter trained specifically for the native
+       Laguna S 2.1 NVFP4 checkpoint. About 2.1 GB; loaded directly from
+       safetensors and supported with --mtp on CUDA.
+
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -150,7 +168,8 @@ After downloading DSpark support, enable it explicitly in greedy mode:
 
 Large PRO, GLM, and Laguna files use the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
-smaller DeepSeek Flash GGUF files.
+smaller DeepSeek Flash GGUF files. Native Laguna NVFP4 is also downloaded
+with that client so all checkpoint and tokenizer files stay together.
 EOF
 }
 
@@ -165,6 +184,7 @@ MODEL_FILES=
 LINK_MODEL=1
 FORCE_HF_DOWNLOAD=0
 FLATTEN_DOWNLOADS=0
+DOWNLOAD_REPO_DIR=0
 
 case "$MODEL" in
     q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
@@ -222,6 +242,22 @@ case "$MODEL" in
         FLATTEN_DOWNLOADS=1
         LINK_MODEL=0
         HF_REVISION=$LAGUNA_DFLASH_REVISION
+        ;;
+    laguna-nvfp4)
+        REPO=$LAGUNA_NVFP4_REPO
+        MODEL_FILE=$LAGUNA_NVFP4_DIR
+        FORCE_HF_DOWNLOAD=1
+        DOWNLOAD_REPO_DIR=1
+        LINK_MODEL=0
+        HF_REVISION=$LAGUNA_NVFP4_REVISION
+        ;;
+    laguna-nvfp4-dflash)
+        REPO=$LAGUNA_NVFP4_DFLASH_REPO
+        MODEL_FILE=$LAGUNA_NVFP4_DFLASH_DIR
+        FORCE_HF_DOWNLOAD=1
+        DOWNLOAD_REPO_DIR=1
+        LINK_MODEL=0
+        HF_REVISION=$LAGUNA_NVFP4_DFLASH_REVISION
         ;;
     -h|--help|help)
         usage
@@ -351,6 +387,46 @@ download_one_hf() {
     fi
 }
 
+download_repo_hf() {
+    out="$OUT_DIR/$MODEL_FILE"
+    HF_CMD=$(find_hf_command || true)
+    if [ -z "$HF_CMD" ]; then
+        echo "Native checkpoint downloads require the official Hugging Face CLI." >&2
+        echo "Install it with:" >&2
+        echo "  python3 -m pip install -U huggingface_hub hf_xet" >&2
+        exit 1
+    fi
+    mkdir -p "$out"
+    echo "Downloading native checkpoint from https://huggingface.co/$REPO"
+    echo "into $out"
+    echo "If the download stops, run the same command again to resume it."
+    if [ -n "$TOKEN" ] && [ -n "$HF_REVISION" ]; then
+        "$HF_CMD" download "$REPO" --revision "$HF_REVISION" \
+            --repo-type model --local-dir "$out" --token "$TOKEN"
+    elif [ -n "$TOKEN" ]; then
+        "$HF_CMD" download "$REPO" --repo-type model \
+            --local-dir "$out" --token "$TOKEN"
+    elif [ -n "$HF_REVISION" ]; then
+        "$HF_CMD" download "$REPO" --revision "$HF_REVISION" \
+            --repo-type model --local-dir "$out"
+    else
+        "$HF_CMD" download "$REPO" --repo-type model --local-dir "$out"
+    fi
+    if [ "$MODEL" = "laguna-nvfp4" ]; then
+        if [ ! -s "$out/model.safetensors.index.json" ] ||
+           [ ! -s "$out/tokenizer.json" ]; then
+            echo "Hugging Face download finished but the checkpoint is incomplete: $out" >&2
+            exit 1
+        fi
+    elif [ "$MODEL" = "laguna-nvfp4-dflash" ]; then
+        if [ ! -s "$out/model.safetensors" ] ||
+           [ ! -s "$out/config.json" ]; then
+            echo "Hugging Face download finished but the DFlash checkpoint is incomplete: $out" >&2
+            exit 1
+        fi
+    fi
+}
+
 download_one() {
     file=$1
     local_file=$(local_download_name "$file")
@@ -390,7 +466,9 @@ download_one() {
     mv "$part" "$out"
 }
 
-if [ -n "$MODEL_FILES" ]; then
+if [ "$DOWNLOAD_REPO_DIR" -eq 1 ]; then
+    download_repo_hf
+elif [ -n "$MODEL_FILES" ]; then
     for file in $MODEL_FILES; do
         download_one "$file"
     done
@@ -415,6 +493,16 @@ elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"
     echo "for example coordinator layers 0:30 and worker layers 31:output."
+elif [ "$MODEL" = "laguna-nvfp4" ]; then
+    echo
+    echo "Native Laguna NVFP4 checkpoint downloaded."
+    echo "Run it directly with:"
+    echo "  ./ds4 --cuda -m $OUT_DIR/$LAGUNA_NVFP4_DIR -p \"Hello\""
+elif [ "$MODEL" = "laguna-nvfp4-dflash" ]; then
+    echo
+    echo "Native Laguna NVFP4 DFlash checkpoint downloaded."
+    echo "Enable it for greedy CUDA generation:"
+    echo "  ./ds4 --cuda -m $OUT_DIR/$LAGUNA_NVFP4_DIR --mtp $OUT_DIR/$LAGUNA_NVFP4_DFLASH_DIR --mtp-draft 7 --temp 0 -p \"Hello\""
 elif [ "$LINK_MODEL" -eq 1 ]; then
     cd "$ROOT"
     ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
