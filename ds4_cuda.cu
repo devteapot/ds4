@@ -29391,7 +29391,8 @@ __global__ static void quantize_nvfp4_selected_f32_kernel(
         uint32_t n_pair,
         uint32_t n_selected,
         uint32_t pair_base,
-        bool source_is_pair) {
+        bool source_is_pair,
+        bool output_int8) {
     const uint32_t group = blockIdx.x;
     const uint32_t pair = pair_base + blockIdx.y;
     if (group >= groups || pair >= n_pair) return;
@@ -29431,7 +29432,11 @@ __global__ static void quantize_nvfp4_selected_f32_kernel(
     if (lane < 16u)
         code[lane] = dev_nvfp4_f32_to_e2m1(value, inverse_scale);
     __syncthreads();
-    if (lane < 8u) {
+    if (output_int8 && lane < 16u) {
+        ((int8_t *)packed)[
+            ((uint64_t)pair * groups + group) * 16u + lane] =
+                dev_nvfp4_e2m1_i8(code[lane]);
+    } else if (!output_int8 && lane < 8u) {
         packed[((uint64_t)pair * groups + group) * 8u + lane] =
             code[lane * 2u] | (uint8_t)(code[lane * 2u + 1u] << 4u);
     }
@@ -29469,13 +29474,13 @@ __device__ __forceinline__ static float dev_dot_nvfp4_q8_0_block(
 __device__ __forceinline__ static float dev_dot_nvfp4_native_w4a4_group(
         const uint8_t *weight_packed,
         uint8_t weight_scale,
-        const uint8_t *activation_packed,
+        const int8_t *activation_i8,
         uint8_t activation_scale) {
     int32_t dot = 0;
 #pragma unroll
-    for (uint32_t i = 0u; i < 8u; i += 2u) {
-        dot = __dp4a(dev_nvfp4_pack4_adjacent(weight_packed + i),
-                     dev_nvfp4_pack4_adjacent(activation_packed + i),
+    for (uint32_t i = 0u; i < 16u; i += 4u) {
+        dot = __dp4a(dev_nvfp4_pack4_adjacent(weight_packed + i / 2u),
+                     *(const int32_t *)(activation_i8 + i),
                      dot);
     }
     /* dev_nvfp4_ue4m3_to_f32 includes the 1/2 factor for the
@@ -30117,17 +30122,17 @@ __global__ static void laguna_moe_gate_up_nvfp4_kernel(
     float up_value = 0.0f;
     if (native) {
         const uint32_t groups = xq_blocks * 2u;
-        const uint8_t *x4_row =
-            x4 + pair * (uint64_t)groups * 8u;
+        const int8_t *x4_row =
+            (const int8_t *)x4 + pair * (uint64_t)groups * 16u;
         const uint8_t *x4scale_row =
             x4scale + pair * (uint64_t)groups;
         for (uint32_t b = lane; b < groups; b += LANES) {
             gate_value += dev_dot_nvfp4_native_w4a4_group(
                 gate_packed + b * 8u, gate_scale[b],
-                x4_row + b * 8u, x4scale_row[b]);
+                x4_row + b * 16u, x4scale_row[b]);
             up_value += dev_dot_nvfp4_native_w4a4_group(
                 up_packed + b * 8u, up_scale[b],
-                x4_row + b * 8u, x4scale_row[b]);
+                x4_row + b * 16u, x4scale_row[b]);
         }
     } else {
         const uint32_t nv_blocks = xq_blocks / 2u;
@@ -30207,14 +30212,14 @@ __global__ static void laguna_moe_down_nvfp4_kernel(
         float part = 0.0f;
         if (native) {
             const uint32_t groups = midq_blocks * 2u;
-            const uint8_t *mid4_row =
-                mid4 + pair * (uint64_t)groups * 8u;
+            const int8_t *mid4_row =
+                (const int8_t *)mid4 + pair * (uint64_t)groups * 16u;
             const uint8_t *mid4scale_row =
                 mid4scale + pair * (uint64_t)groups;
             for (uint32_t b = lane; b < groups; b += LANES) {
                 part += dev_dot_nvfp4_native_w4a4_group(
                     packed + b * 8u, block_scale[b],
-                    mid4_row + b * 8u, mid4scale_row[b]);
+                    mid4_row + b * 16u, mid4scale_row[b]);
             }
         } else {
             const uint32_t nv_blocks = midq_blocks / 2u;
@@ -31219,8 +31224,10 @@ static int cuda_laguna_nvfp4_routed_moe(
 
     const uint32_t xq_blocks = expert_in_dim / 32u;
     const uint32_t midq_blocks = expert_mid_dim / 32u;
+    const bool grouped_native =
+        native && n_tokens >= 256u && pairs <= UINT32_MAX;
     const uint64_t xq_bytes =
-        native ? pairs * expert_in_dim / 2u :
+        native ? pairs * expert_in_dim / (grouped_native ? 2u : 1u) :
                  (uint64_t)n_tokens * expert_in_dim * sizeof(int8_t);
     const uint64_t xscale_offset = (xq_bytes + 255u) & ~255ull;
     const uint64_t xscale_bytes =
@@ -31230,7 +31237,7 @@ static int cuda_laguna_nvfp4_routed_moe(
     const uint64_t midq_offset =
         (xscale_offset + xscale_bytes + 255u) & ~255ull;
     const uint64_t midq_bytes =
-        native ? pairs * expert_mid_dim / 2u :
+        native ? pairs * expert_mid_dim / (grouped_native ? 2u : 1u) :
                  pairs * expert_mid_dim * sizeof(int8_t);
     if (midq_offset > UINT64_MAX - midq_bytes) return 0;
     const uint64_t midscale_offset =
@@ -31239,8 +31246,6 @@ static int cuda_laguna_nvfp4_routed_moe(
         native ? pairs * expert_mid_dim / 16u :
                  pairs * midq_blocks * sizeof(float);
     if (midscale_offset > UINT64_MAX - midscale_bytes) return 0;
-    const bool grouped_native =
-        native && n_tokens >= 256u && pairs <= UINT32_MAX;
     const uint64_t sorted_base =
         (midscale_offset + midscale_bytes + 255u) & ~255ull;
     const uint64_t counts_bytes = grouped_native ?
@@ -31299,7 +31304,7 @@ static int cuda_laguna_nvfp4_routed_moe(
                     native_cache->gate_input_global,
                     expert_in_dim, expert_in_dim / 16u,
                     n_total_expert, (uint32_t)pairs, n_expert,
-                    pair0, false);
+                    pair0, false, !grouped_native);
             if (!cuda_ok(cudaGetLastError(),
                          "Laguna native NVFP4 input quantize launch")) {
                 return 0;
@@ -31435,7 +31440,7 @@ static int cuda_laguna_nvfp4_routed_moe(
                         native_cache->down_input_global,
                         expert_mid_dim, expert_mid_dim / 16u,
                         n_total_expert, (uint32_t)pairs, n_expert,
-                        pair0, true);
+                        pair0, true, false);
                 if (!cuda_ok(cudaGetLastError(),
                              "Laguna Blackwell NVFP4 mid quantize launch")) {
                     return 0;
@@ -31560,7 +31565,7 @@ static int cuda_laguna_nvfp4_routed_moe(
                     native_cache->down_input_global,
                     expert_mid_dim, expert_mid_dim / 16u,
                     n_total_expert, (uint32_t)pairs, n_expert,
-                    pair0, true);
+                    pair0, true, true);
         } else {
             quantize_q8_0_f32_kernel<<<dim3(midq_blocks, chunk, 1u), 32>>>(
                 midq + (uint64_t)pair0 * expert_mid_dim,

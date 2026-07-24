@@ -53,8 +53,11 @@ DFlash Tensor Core and Blackwell attention kernels.
 - Use GB10's block-scaled NVFP4 MMA for Laguna prompt batches, grouping routes
   by expert so each `m16n8k64` result tile is fully occupied and its weight
   fragments are reused across up to 16 routes.
-- Use the native W4A4 integer-dot kernel for decode, where the only SM121 FP4
-  MMA shape would otherwise discard seven of eight result columns.
+- Use the native W4A4 integer-dot kernel for decode and narrow DFlash verifier
+  batches, where the only SM121 FP4 MMA shape would otherwise leave most of
+  its result tile empty.
+- Predecode each dynamically quantized E2M1 activation group once for the
+  integer-dot path so every output row can consume signed bytes directly.
 - Accept the official NVFP4 DFlash safetensors directory through `--mtp`
   without converting it to GGUF, including its fused QKV tensors, BF16 norms,
   six target residual streams, and checkpoint-specific RoPE configuration.
@@ -168,6 +171,10 @@ native target, including the batched target verifier's output norm.
 - Keep the 16-lane W4A4 integer-dot schedule for decode because SM121 offers
   no GEMV-sized NVFP4 MMA instruction and the direct one-column MMA path
   benchmarks slower.
+- Store dynamic activations as packed E2M1 only for grouped prompt MMA. For
+  decode and DFlash verification, expand E2M1 to signed bytes during
+  quantization and remove repeated activation-nibble decode from every gate,
+  up, and down dot product.
 - Preserve source-offset alignment when merged safetensors spans are copied
   into CUDA's range cache so 32-bit packed/scale fragment loads remain aligned.
 - Add `download_model.sh laguna-nvfp4`; it uses the official Hugging Face
@@ -210,6 +217,17 @@ native target, including the batched target verifier's output norm.
   tokens per verifier block; depth 15 measures 390.14/17.99 tok/s with 36.82%
   proposal acceptance and 6.24 committed tokens per block. Results are stored
   in `speed-bench/laguna_s21_nvfp4_dflash_gb10.csv`.
+- On an immutable common 2,048-token prompt, Q4_K_M with its official BF16
+  DFlash drafter at depth 15 measures 27.81 token/s (47.06% proposal
+  acceptance, 8.00 committed tokens per 287.38 ms block). Native NVFP4 with
+  its checkpoint-specific official drafter at depth 5 measures 20.79 token/s
+  (73.90% acceptance, 4.65 committed tokens per 223.66 ms block). The exact
+  comparison is stored in
+  `speed-bench/laguna_s21_dflash_quant_comparison_gb10.csv`.
+- The activation-predecode path measures 223.66 ms per verifier block on that
+  workload. A follow-up expert-sorted multi-route DP4A experiment preserved
+  the exact 201/272 acceptance result but regressed block latency to 224.77
+  ms, so it was rejected.
 - `make cuda-regression` passes the long-context and Laguna suites, including
   F32/BF16 DFlash auxiliary feature-pack equivalence.
 - Compute Sanitizer memcheck reports zero errors with expected unsupported

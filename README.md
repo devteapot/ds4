@@ -250,9 +250,12 @@ E2M1 in groups of 16 and applies the checkpoint's calibrated E4M3 and global
 scales. On prompt batches it sorts routes by expert and packs up to 16 routes
 by eight output channels into Blackwell's block-scaled
 `mma.sync.m16n8k64` FP4 instruction, reusing each expert weight tile across
-the batch. Decode uses the native W4A4 integer-dot kernel: GB10's FP4 MMA has
-no GEMV-sized form, so a single routed vector would discard seven of its eight
-output columns and is slower in practice.
+the batch. Decode and DFlash verification use the native W4A4 integer-dot
+kernel: GB10's FP4 MMA has no GEMV-sized form, so these narrow routed batches
+would discard most of its result columns and are slower in practice. The CUDA
+quantizer predecodes dynamic E2M1 activations to signed bytes once per group;
+gate, up, and down projections then reuse them directly in DP4A rather than
+decoding the same activation nibbles for every output row.
 
 The official NVFP4 checkpoint is Blackwell-only in this backend and requires
 the family-specific `cuda-spark` build. Use the official Q4_K_M model with
@@ -277,6 +280,17 @@ token. On GB10, the 2K/256 `ds4.c` workload measures 14.50 generation tok/s
 raw, 21.45 tok/s at depth 7, and 17.99 tok/s at depth 15. Depth 7 accepts
 62.84% of proposals and is the default. The full result is in
 `speed-bench/laguna_s21_nvfp4_dflash_gb10.csv`.
+
+An apples-to-apples rerun on one immutable 2,048-token prompt used each
+target's official drafter and generated 256 greedy tokens. Q4_K_M with
+`Laguna-S-2.1-DFlash-BF16` at depth 15 reached 27.81 token/s; NVFP4 with
+`Laguna-S-2.1-DFlash-NVFP4` at depth 5 reached 20.79 token/s. The Q4 run
+committed 8.00 tokens per 287.38 ms block, while NVFP4 committed 4.65 tokens
+per 223.66 ms block. The full verifier accounting is in
+`speed-bench/laguna_s21_dflash_quant_comparison_gb10.csv`. These figures are
+prompt-sensitive: high-acceptance Q4 workloads still reach roughly 42
+token/s, while this NVFP4 drafter's acceptance falls sharply at longer draft
+depths.
 
 SSD streaming, distributed inference, Metal, and ROCm are not part of the
 native NVFP4 path.

@@ -28,7 +28,7 @@ GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
 LAGUNA_Q4_FILE="laguna-s-2.1-Q4_K_M.gguf"
 LAGUNA_Q2_Q3_FILE="laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf"
-LAGUNA_DFLASH_FILE="gguf/laguna-s-2.1-DFlash-BF16.gguf"
+LAGUNA_DFLASH_FILE="laguna-s-2.1-DFlash-BF16.gguf"
 LAGUNA_NVFP4_DIR="Laguna-S-2.1-NVFP4"
 LAGUNA_NVFP4_DFLASH_DIR="Laguna-S-2.1-DFlash-NVFP4"
 
