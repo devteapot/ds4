@@ -113,6 +113,8 @@ DFlash Tensor Core and Blackwell attention kernels.
   checkpoint that violates this.
 - The attached CUDA host is a GB10 (`sm_121`) with CUDA 13 and is the primary
   Blackwell validation target.
+- The dependent Laguna CUDA source realization is commit
+  `cc321ba60594bccb1029ea1f1b3cde801e7b0910`.
 
 # Open questions
 
@@ -193,6 +195,11 @@ reproduce the portable reduction tree before the warp shuffle reduction.
   attention for both six-head target groups and nine-head DFlash groups. Gate
   it on production-size models and retain
   `DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1` as the direct portable comparison.
+- Inherit the source patch's exact INT8 tensor-core Q4_K gate/up and
+  chunked-down kernels for GGUF targets, but keep native type-40 dispatch on
+  its existing block-scaled FP4 MMA. The source kernels are format-specific,
+  while NVFP4 already applies the same expert grouping and compact chunked
+  term-buffer schedule directly to packed E2M1 weights.
 - Keep the 16-lane W4A4 integer-dot schedule for decode because SM121 offers
   no GEMV-sized NVFP4 MMA instruction and the direct one-column MMA path
   benchmarks slower.
@@ -229,7 +236,7 @@ reproduce the portable reduction tree before the warp shuffle reduction.
 - The Laguna CUDA regression passes on GB10, including a 256-token,
   256-expert, top-10 native W4A4 test at the production
   3072→1024→3072 dimensions, production 72-head/8-KV-head DFlash attention,
-  and the existing Q4_K/Q6_K coverage.
+  Q2_K/Q3_K routed experts, and exact Q4_K tensor-core rollback equivalence.
 - `./ds4 --inspect --cuda -m /srv/models/poolside/Laguna-S-2.1-NVFP4`:
   reports 15 shards, 66.98 GiB, 626 BF16 logical tensors, and 141 NVFP4
   logical tensors.
@@ -238,10 +245,11 @@ reproduce the portable reduction tree before the warp shuffle reduction.
   official sharded checkpoint through all 48 layers.
 - CUDA startup residency covers 66.96 GiB of physical dense, packed-weight,
   and block-scale tensor ranges before inference timing.
-- On the same 2,048-token `ds4.c` pure-prefill workload, warp-per-head
-  Blackwell attention measures 578.52 token/s versus 415.27 token/s with
-  `DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1`, a 39.3% improvement. The paired
-  result is stored in
+- After rebasing onto source commit `cc321ba`, the same 2,048-token `ds4.c`
+  pure-prefill workload measures 518.77 token/s with warp-per-head Blackwell
+  attention versus 374.67 token/s with
+  `DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1`, a 38.5% improvement. The earlier
+  tree measured 578.52 versus 415.27 token/s; both paired results are stored in
   `speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv`.
 - The grouped FP4 MMA benchmark at 2K/4K/8K reports prompt throughput of
   413.38/317.80/224.72 token/s, compared with 95.05/87.59/78.13 for the prior
@@ -301,6 +309,9 @@ Explicitly requested:
   benchmark the paired official drafter, and update the PR.
 - Reuse applicable prefill improvements from the updated source CUDA patch in
   the NVFP4 realization and update its PatchMD record.
+- Repeat the adaptation after the optimized source implementation was pushed:
+  rebase the NVFP4 commits onto it, retain applicable changes, benchmark the
+  combined tree, and update the branch.
 
 Observed from the official checkpoint:
 

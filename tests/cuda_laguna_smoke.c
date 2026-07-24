@@ -1821,7 +1821,7 @@ int main(void) {
           q3_routed.down_offset != UINT64_MAX &&
           q3_shared.gate_offset != UINT64_MAX &&
           q3_shared.up_offset != UINT64_MAX &&
-          q3_shared.down_offset != UINT64_MAX,
+          q3_shared.down_offset != UINT64_MAX &&
           nvfp4_routed.gate_offset != UINT64_MAX &&
           nvfp4_routed.up_offset != UINT64_MAX &&
           nvfp4_routed.down_offset != UINT64_MAX &&
