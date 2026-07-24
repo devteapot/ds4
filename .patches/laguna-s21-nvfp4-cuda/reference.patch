@@ -4000,7 +4000,7 @@ index 4b2b0d3..5217fa3 100644
                  "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                  frontier,
 diff --git a/ds4_cuda.cu b/ds4_cuda.cu
-index e66fa36..404375b 100644
+index e66fa36..6ab8b27 100644
 --- a/ds4_cuda.cu
 +++ b/ds4_cuda.cu
 @@ -1,5 +1,7 @@
@@ -5228,7 +5228,7 @@ index e66fa36..404375b 100644
  extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
      g_ssd_streaming_mode = enabled ? 1 : 0;
      cuda_stream_selected_cache_invalidate();
-@@ -27668,103 +28597,3307 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+@@ -27668,103 +28597,3434 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
      return 0;
  }
  
@@ -5941,6 +5941,133 @@ index e66fa36..404375b 100644
 +            (score_sum[h] > 0.0f ? 1.0f / score_sum[h] : 0.0f) *
 +            gate_scale;
 +    }
++}
++
++/* Blackwell prefill variant: assign one warp to every query head in a GQA
++ * group.  The portable kernel assigns one thread to every head dimension,
++ * which makes all heads share each K/V load but also serializes the heads'
++ * reductions behind eight block-wide barriers per key.  Here the warps run
++ * those reductions concurrently.  K/V still enters shared memory only once
++ * per group and key, so the extra parallelism does not multiply global-memory
++ * traffic.
++ *
++ * Build the first two reduction levels explicitly in the same order as the
++ * 128-thread tree:
++ *
++ *   (d + d+64) + (d+32 + d+96)
++ *
++ * The remaining warp shuffle tree corresponds to strides 16..1.  The explicit
++ * round-to-nearest intrinsics prevent contraction from changing that order,
++ * retaining the established prefill arithmetic. */
++template <uint32_t HEADS_PER_KV>
++__global__ static void laguna_attention_prefill_warp_gqa_kernel(
++        float *out,
++        const float *q,
++        const float *gate,
++        const __half *key_cache,
++        const __half *value_cache,
++        const __half *staged_key,
++        const __half *staged_value,
++        uint32_t pos0,
++        uint32_t n_tokens,
++        uint32_t cache_cap,
++        uint32_t n_head,
++        uint32_t n_head_kv,
++        uint32_t head_dim,
++        float scale) {
++    const uint32_t kv_head = blockIdx.x;
++    const uint32_t token = blockIdx.y;
++    const uint32_t tid = threadIdx.x;
++    const uint32_t head_in_group = tid >> 5u;
++    const uint32_t lane = tid & 31u;
++    const uint32_t head0 = kv_head * HEADS_PER_KV;
++    if (kv_head >= n_head_kv || token >= n_tokens ||
++        head0 + HEADS_PER_KV > n_head || head_dim != 128u) {
++        return;
++    }
++
++    const uint32_t width = n_head_kv * head_dim;
++    const uint32_t query_pos = pos0 + token;
++    const uint32_t key_count =
++        query_pos + 1u < cache_cap ? query_pos + 1u : cache_cap;
++    const uint32_t key_start = query_pos + 1u - key_count;
++    const uint32_t head = head0 + head_in_group;
++    const float *qh =
++        q + ((uint64_t)token * n_head + head) * head_dim;
++    __shared__ __half shared_key[128];
++    __shared__ __half shared_value[128];
++
++    float acc0 = 0.0f;
++    float acc1 = 0.0f;
++    float acc2 = 0.0f;
++    float acc3 = 0.0f;
++    float score_sum = 0.0f;
++    float max_score = -INFINITY;
++    for (uint32_t key_pos = key_start; key_pos <= query_pos; key_pos++) {
++        const bool current = key_pos >= pos0;
++        const uint32_t source_row =
++            current ? key_pos - pos0 : key_pos % cache_cap;
++        const uint64_t kv_base =
++            (uint64_t)source_row * width +
++            (uint64_t)kv_head * head_dim;
++        for (uint32_t d = tid; d < 128u;
++             d += HEADS_PER_KV * 32u) {
++            shared_key[d] = current ?
++                staged_key[kv_base + d] : key_cache[kv_base + d];
++            shared_value[d] = current ?
++                staged_value[kv_base + d] : value_cache[kv_base + d];
++        }
++        __syncthreads();
++
++        const float key0 = __half2float(shared_key[lane]);
++        const float key1 = __half2float(shared_key[lane + 32u]);
++        const float key2 = __half2float(shared_key[lane + 64u]);
++        const float key3 = __half2float(shared_key[lane + 96u]);
++        const float pair0 = __fadd_rn(
++                __fmul_rn(qh[lane], key0),
++                __fmul_rn(qh[lane + 64u], key2));
++        const float pair1 = __fadd_rn(
++                __fmul_rn(qh[lane + 32u], key1),
++                __fmul_rn(qh[lane + 96u], key3));
++        float score = warp_sum_f32(__fadd_rn(pair0, pair1));
++
++        float old_scale = 0.0f;
++        float value_scale = 0.0f;
++        if (lane == 0u) {
++            score *= scale;
++            const float next_max = fmaxf(max_score, score);
++            old_scale = isinf(max_score) ?
++                0.0f : expf(max_score - next_max);
++            value_scale = expf(score - next_max);
++            score_sum = score_sum * old_scale + value_scale;
++            max_score = next_max;
++        }
++        old_scale = __shfl_sync(0xffffffffu, old_scale, 0);
++        value_scale = __shfl_sync(0xffffffffu, value_scale, 0);
++        acc0 = acc0 * old_scale +
++            __half2float(shared_value[lane]) * value_scale;
++        acc1 = acc1 * old_scale +
++            __half2float(shared_value[lane + 32u]) * value_scale;
++        acc2 = acc2 * old_scale +
++            __half2float(shared_value[lane + 64u]) * value_scale;
++        acc3 = acc3 * old_scale +
++            __half2float(shared_value[lane + 96u]) * value_scale;
++        __syncthreads();
++    }
++
++    score_sum = __shfl_sync(0xffffffffu, score_sum, 0);
++    const float gate_value =
++        gate[(uint64_t)token * n_head + head];
++    const float gate_scale = gate_value > 20.0f ?
++        gate_value : log1pf(expf(gate_value));
++    const float inv_sum =
++        score_sum > 0.0f ? 1.0f / score_sum : 0.0f;
++    float *oh = out +
++        ((uint64_t)token * n_head + head) * head_dim;
++    oh[lane] = acc0 * inv_sum * gate_scale;
++    oh[lane + 32u] = acc1 * inv_sum * gate_scale;
++    oh[lane + 64u] = acc2 * inv_sum * gate_scale;
++    oh[lane + 96u] = acc3 * inv_sum * gate_scale;
 +}
 +
 +__device__ __forceinline__ static float dev_nvfp4_ue4m3_to_f32(
@@ -8624,7 +8751,7 @@ index e66fa36..404375b 100644
          ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
          ds4_gpu_tensor *value_cache, ds4_gpu_tensor *staged_key,
          ds4_gpu_tensor *staged_value, const ds4_gpu_tensor *q,
-@@ -27772,10 +31905,127 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
+@@ -27772,10 +32032,157 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
          const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
          uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
          uint32_t head_dim, float scale) {
@@ -8675,9 +8802,39 @@ index e66fa36..404375b 100644
 +        n_tokens <= 16u && pos0 >= 256u &&
 +        cuda_laguna_blackwell_ok() &&
 +        getenv("DS4_CUDA_LAGUNA_NO_VERIFY_SPLIT") == NULL;
++    const bool use_warp_gqa =
++        cuda_laguna_blackwell_ok() &&
++        n_head >= 48u &&
++        getenv("DS4_CUDA_LAGUNA_NO_GQA_PREFILL") == NULL &&
++        getenv("DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL") == NULL;
 +    if (blackwell_verify_split) {
 +        laguna_attention_verify_split_kernel<16><<<
 +                dim3(n_head, n_tokens, 1u), 512>>>(
++                (float *)heads->ptr,
++                (const float *)q->ptr,
++                (const float *)gate->ptr,
++                (const __half *)key_cache->ptr,
++                (const __half *)value_cache->ptr,
++                (const __half *)staged_key->ptr,
++                (const __half *)staged_value->ptr,
++                pos0, n_tokens, cache_cap,
++                n_head, n_head_kv, head_dim, scale);
++    } else if (heads_per_kv == 6u && use_warp_gqa) {
++        laguna_attention_prefill_warp_gqa_kernel<6><<<
++                dim3(n_head_kv, n_tokens, 1u), 6u * 32u>>>(
++                (float *)heads->ptr,
++                (const float *)q->ptr,
++                (const float *)gate->ptr,
++                (const __half *)key_cache->ptr,
++                (const __half *)value_cache->ptr,
++                (const __half *)staged_key->ptr,
++                (const __half *)staged_value->ptr,
++                pos0, n_tokens, cache_cap,
++                n_head, n_head_kv, head_dim, scale);
++    } else if (heads_per_kv == 9u && use_warp_gqa &&
++               getenv("DS4_CUDA_DFLASH_NO_BLACKWELL") == NULL) {
++        laguna_attention_prefill_warp_gqa_kernel<9><<<
++                dim3(n_head_kv, n_tokens, 1u), 9u * 32u>>>(
 +                (float *)heads->ptr,
 +                (const float *)q->ptr,
 +                (const float *)gate->ptr,
@@ -9329,12 +9486,21 @@ index 0000000..fe5e4ce
 +2048,2048,413.38,256,14.18,98.904,255,14.26,176570420
 +4096,2048,317.80,256,14.05,71.725,255,14.10,277241908
 +8192,4096,224.72,256,13.49,76.631,255,13.55,0
+diff --git a/speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv b/speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv
+new file mode 100644
+index 0000000..ec43f96
+--- /dev/null
++++ b/speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv
+@@ -0,0 +1,3 @@
++mode,ctx_tokens,prefill_tokens,prefill_tps,environment
++blackwell-warp-gqa,2048,2048,578.52,-
++portable-grouped-gqa,2048,2048,415.27,DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1
 diff --git a/tests/cuda_laguna_smoke.c b/tests/cuda_laguna_smoke.c
 new file mode 100644
-index 0000000..c3cd391
+index 0000000..64e7bca
 --- /dev/null
 +++ b/tests/cuda_laguna_smoke.c
-@@ -0,0 +1,1607 @@
+@@ -0,0 +1,1690 @@
 +#include "ds4_gpu.h"
 +
 +#include <cuda_runtime_api.h>
@@ -10010,11 +10176,11 @@ index 0000000..c3cd391
 +    return 0;
 +}
 +
-+static int check_dflash_blackwell_attention(void) {
++static int check_blackwell_target_prefill_attention(void) {
 +    enum {
 +        n_tokens = 3,
-+        n_head = 9,
-+        n_head_kv = 1,
++        n_head = 48,
++        n_head_kv = 8,
 +        cache_cap = 4
 +    };
 +    const uint64_t q_values = (uint64_t)n_tokens * n_head * HEAD_DIM;
@@ -10036,11 +10202,93 @@ index 0000000..c3cd391
 +
 +    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(sizeof(portable));
 +    ds4_gpu_tensor *key_cache =
-+        ds4_gpu_tensor_alloc((uint64_t)cache_cap * HEAD_DIM *
-+                             sizeof(uint16_t));
++        ds4_gpu_tensor_alloc((uint64_t)cache_cap * n_head_kv *
++                             HEAD_DIM * sizeof(uint16_t));
 +    ds4_gpu_tensor *value_cache =
-+        ds4_gpu_tensor_alloc((uint64_t)cache_cap * HEAD_DIM *
-+                             sizeof(uint16_t));
++        ds4_gpu_tensor_alloc((uint64_t)cache_cap * n_head_kv *
++                             HEAD_DIM * sizeof(uint16_t));
++    ds4_gpu_tensor *staged_key =
++        ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
++    ds4_gpu_tensor *staged_value =
++        ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
++    ds4_gpu_tensor *q_t = ds4_gpu_tensor_alloc(sizeof(q));
++    ds4_gpu_tensor *k_t = ds4_gpu_tensor_alloc(sizeof(k));
++    ds4_gpu_tensor *v_t = ds4_gpu_tensor_alloc(sizeof(v));
++    ds4_gpu_tensor *gate_t = ds4_gpu_tensor_alloc(sizeof(gate));
++    CHECK(heads && key_cache && value_cache && staged_key && staged_value &&
++          q_t && k_t && v_t && gate_t,
++          "target prefill attention tensor allocation");
++    CHECK(ds4_gpu_tensor_write(q_t, 0, q, sizeof(q)) &&
++          ds4_gpu_tensor_write(k_t, 0, k, sizeof(k)) &&
++          ds4_gpu_tensor_write(v_t, 0, v, sizeof(v)) &&
++          ds4_gpu_tensor_write(gate_t, 0, gate, sizeof(gate)),
++          "write target prefill attention tensors");
++    CHECK(setenv("DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL", "1", 1) == 0,
++          "select portable target prefill attention");
++    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
++              heads, key_cache, value_cache, staged_key, staged_value,
++              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
++              n_head, n_head_kv, HEAD_DIM,
++              1.0f / sqrtf((float)HEAD_DIM)) &&
++          ds4_gpu_tensor_read(heads, 0, portable, sizeof(portable)),
++          "portable target prefill attention");
++    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL") == 0,
++          "select Blackwell target prefill attention");
++    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
++              heads, key_cache, value_cache, staged_key, staged_value,
++              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
++              n_head, n_head_kv, HEAD_DIM,
++              1.0f / sqrtf((float)HEAD_DIM)) &&
++          ds4_gpu_tensor_read(heads, 0, blackwell, sizeof(blackwell)),
++          "Blackwell target prefill attention");
++    for (uint64_t i = 0; i < q_values; i++) {
++        CHECK(close_enough(blackwell[i], portable[i], 1e-6f, 1e-6f),
++              "Blackwell target prefill attention equivalence");
++    }
++
++    ds4_gpu_tensor_free(gate_t);
++    ds4_gpu_tensor_free(v_t);
++    ds4_gpu_tensor_free(k_t);
++    ds4_gpu_tensor_free(q_t);
++    ds4_gpu_tensor_free(staged_value);
++    ds4_gpu_tensor_free(staged_key);
++    ds4_gpu_tensor_free(value_cache);
++    ds4_gpu_tensor_free(key_cache);
++    ds4_gpu_tensor_free(heads);
++    return 0;
++}
++
++static int check_dflash_blackwell_attention(void) {
++    enum {
++        n_tokens = 3,
++        n_head = 72,
++        n_head_kv = 8,
++        cache_cap = 4
++    };
++    const uint64_t q_values = (uint64_t)n_tokens * n_head * HEAD_DIM;
++    const uint64_t kv_values =
++        (uint64_t)n_tokens * n_head_kv * HEAD_DIM;
++    float q[q_values], k[kv_values], v[kv_values];
++    float gate[n_tokens * n_head];
++    float portable[q_values], blackwell[q_values];
++    for (uint64_t i = 0; i < q_values; i++) {
++        q[i] = 0.015625f * (float)(1u + i % 13u);
++    }
++    for (uint64_t i = 0; i < kv_values; i++) {
++        k[i] = 0.03125f * (float)(1u + i % 7u);
++        v[i] = 0.0625f * (float)(1u + i % 11u);
++    }
++    for (uint32_t i = 0; i < n_tokens * n_head; i++) {
++        gate[i] = 0.05f * (float)(i % n_head);
++    }
++
++    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(sizeof(portable));
++    ds4_gpu_tensor *key_cache =
++        ds4_gpu_tensor_alloc((uint64_t)cache_cap * n_head_kv *
++                             HEAD_DIM * sizeof(uint16_t));
++    ds4_gpu_tensor *value_cache =
++        ds4_gpu_tensor_alloc((uint64_t)cache_cap * n_head_kv *
++                             HEAD_DIM * sizeof(uint16_t));
 +    ds4_gpu_tensor *staged_key =
 +        ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
 +    ds4_gpu_tensor *staged_value =
@@ -10927,6 +11175,7 @@ index 0000000..c3cd391
 +        &blob, q4_offset, q6_offset, embed_offset, f16_embed_offset);
 +    if (rc == 0) rc = check_norm_rope(&blob, norm_offset);
 +    if (rc == 0) rc = check_attention();
++    if (rc == 0) rc = check_blackwell_target_prefill_attention();
 +    if (rc == 0) rc = check_dflash_blackwell_attention();
 +    if (rc == 0) rc = check_dflash_bf16_features(&blob);
 +    if (rc == 0) rc = check_long_decode_attention();

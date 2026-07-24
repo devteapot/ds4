@@ -53,6 +53,9 @@ DFlash Tensor Core and Blackwell attention kernels.
 - Use GB10's block-scaled NVFP4 MMA for Laguna prompt batches, grouping routes
   by expert so each `m16n8k64` result tile is fully occupied and its weight
   fragments are reused across up to 16 routes.
+- On Blackwell, evaluate each grouped-query prompt-attention head in its own
+  warp while retaining one shared K/V load per group for both the 48-head
+  target and 72-head DFlash drafter.
 - Use the native W4A4 integer-dot kernel for decode and narrow DFlash verifier
   batches, where the only SM121 FP4 MMA shape would otherwise leave most of
   its result tile empty.
@@ -82,6 +85,8 @@ DFlash Tensor Core and Blackwell attention kernels.
   not pretend their per-expert shard ranges are physically contiguous.
 - Correct scale conventions and stable logits are preserved across both the
   grouped FP4 MMA prefill kernel and the decode-specialized W4A4 kernel.
+- Blackwell prompt attention preserves the portable grouped-query kernel's
+  reduction order and causal online-softmax semantics.
 - Native safetensors support is CUDA-only for this patch.
 - The NVFP4 target remains W4A4/BF16 mixed precision; its paired DFlash
   checkpoint is BF16 and must not be mislabeled or executed as NVFP4 weights.
@@ -124,6 +129,8 @@ None.
   representation and the official split/adjacent native representation.
 - Validate both grouped prompt-batch FP4 MMA and decode-specialized W4A4
   routed-expert schedules at Laguna's production dimensions.
+- Compare the Blackwell warp-per-head and portable grouped-query prefill
+  attention schedules at the target and drafter's production head counts.
 - Run the CUDA long-context and Laguna regression tests.
 - Run deterministic full-model inference from the official directory on GB10.
 - Inspect and load the official native DFlash directory as one BF16
@@ -154,6 +161,12 @@ zero-copy tensor views, and synthesize the contiguous six-row auxiliary norm
 view. Dispatch BF16 norms through the same mixed-precision helpers used by the
 native target, including the batched target verifier's output norm.
 
+Attention remains BF16 for native NVFP4, so source-patch attention
+optimizations can be reused without changing quantization. Keep the portable
+128-thread grouped-query kernel as the fallback. On Blackwell, use one warp
+per query head, load each K/V row once into shared memory, and explicitly
+reproduce the portable reduction tree before the warp shuffle reduction.
+
 # Decisions
 
 - Detect a model directory before GGUF parsing and initialize the fixed Laguna
@@ -176,6 +189,10 @@ native target, including the batched target verifier's output norm.
 - Group prompt routes into 16-route expert tiles, place routes in MMA's M
   dimension and eight output channels in N, and process down-projection output
   in 1024-row chunks using the existing routed-mid buffer for terms.
+- Reuse the source CUDA patch's Blackwell warp-per-query-head prefill
+  attention for both six-head target groups and nine-head DFlash groups. Gate
+  it on production-size models and retain
+  `DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1` as the direct portable comparison.
 - Keep the 16-lane W4A4 integer-dot schedule for decode because SM121 offers
   no GEMV-sized NVFP4 MMA instruction and the direct one-column MMA path
   benchmarks slower.
@@ -211,7 +228,8 @@ native target, including the batched target verifier's output norm.
   target required by block-scaled MMA.
 - The Laguna CUDA regression passes on GB10, including a 256-token,
   256-expert, top-10 native W4A4 test at the production
-  3072→1024→3072 dimensions and the existing Q4_K/Q6_K coverage.
+  3072→1024→3072 dimensions, production 72-head/8-KV-head DFlash attention,
+  and the existing Q4_K/Q6_K coverage.
 - `./ds4 --inspect --cuda -m /srv/models/poolside/Laguna-S-2.1-NVFP4`:
   reports 15 shards, 66.98 GiB, 626 BF16 logical tensors, and 141 NVFP4
   logical tensors.
@@ -220,6 +238,11 @@ native target, including the batched target verifier's output norm.
   official sharded checkpoint through all 48 layers.
 - CUDA startup residency covers 66.96 GiB of physical dense, packed-weight,
   and block-scale tensor ranges before inference timing.
+- On the same 2,048-token `ds4.c` pure-prefill workload, warp-per-head
+  Blackwell attention measures 578.52 token/s versus 415.27 token/s with
+  `DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1`, a 39.3% improvement. The paired
+  result is stored in
+  `speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv`.
 - The grouped FP4 MMA benchmark at 2K/4K/8K reports prompt throughput of
   413.38/317.80/224.72 token/s, compared with 95.05/87.59/78.13 for the prior
   integer-dot prompt kernel, and steady decode of 14.26/14.10/13.55 token/s.
@@ -276,6 +299,8 @@ Explicitly requested:
 - Reapply the CUDA and NVFP4 patch stack through PatchMD after the source
   branch's DFlash commits, adapt dependent patch references where necessary,
   benchmark the paired official drafter, and update the PR.
+- Reuse applicable prefill improvements from the updated source CUDA patch in
+  the NVFP4 realization and update its PatchMD record.
 
 Observed from the official checkpoint:
 
