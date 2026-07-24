@@ -42,8 +42,13 @@ calibrated W4A4 execution contract.
 - Execute routed experts as W4A4: dynamically quantize selected activations to
   adjacent-nibble E2M1 in groups of 16, store E4M3 block scales, and apply both
   activation and weight global reciprocals in fused gate/up and down kernels.
-- Provide a portable DP4A schedule and a compute-capability-12.x wider schedule
-  for Blackwell/GB10, with an environment switch to force the portable path.
+- Require a Blackwell family-specific CUDA build for the official native
+  checkpoint; direct users of older cards to the official Q4_K_M model.
+- Use GB10's block-scaled NVFP4 MMA for Laguna prompt batches, grouping routes
+  by expert so each `m16n8k64` result tile is fully occupied and its weight
+  fragments are reused across up to 16 routes.
+- Use the native W4A4 integer-dot kernel for decode, where the only SM121 FP4
+  MMA shape would otherwise discard seven of eight result columns.
 - Preserve existing Laguna Q4_K_M and unrelated backend behavior.
 
 # Invariants
@@ -54,8 +59,8 @@ calibrated W4A4 execution contract.
   dense FFN, routers, shared experts, embeddings, and output remain BF16.
 - Safetensors data stays file-backed and read-only; logical routed tensors do
   not pretend their per-expert shard ranges are physically contiguous.
-- Correct scale conventions and stable logits take priority over claiming
-  native FP4 tensor-core execution.
+- Correct scale conventions and stable logits are preserved across both the
+  grouped FP4 MMA prefill kernel and the decode-specialized W4A4 kernel.
 - Native safetensors support is CUDA-only for this patch.
 
 # Non-goals
@@ -65,8 +70,7 @@ calibrated W4A4 execution contract.
 - A general-purpose safetensors or Transformers runtime.
 - SSD streaming, distributed inference, Metal, or ROCm support for this
   checkpoint.
-- Blackwell FP4 tensor-core MMA; this patch specializes scheduling on
-  Blackwell but uses portable integer dot products.
+- Pre-Blackwell native NVFP4 execution.
 
 # Assumptions
 
@@ -92,7 +96,8 @@ None.
 - Load `tokenizer.json` and reproduce a known simple tokenization.
 - Add synthetic CUDA coverage for both the pre-existing interleaved NVFP4 test
   representation and the official split/adjacent native representation.
-- Compare portable and Blackwell-selected routed-expert schedules.
+- Validate both grouped prompt-batch FP4 MMA and decode-specialized W4A4
+  routed-expert schedules at Laguna's production dimensions.
 - Run the CUDA long-context and Laguna regression tests.
 - Run deterministic full-model inference from the official directory on GB10.
 
@@ -128,33 +133,40 @@ stored in the CUDA descriptor cache.
 - Quantize one activation per selected expert because input-global scales are
   expert-specific. Reuse that activation for gate and up, then quantize the
   routed intermediate with the selected down projection's scale.
-- Use eight-lane reductions as the portable schedule and 16-lane reductions
-  on compute capability 12.x. Set
-  `DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4=1` to force the portable schedule.
+- Compile GB10 with the family-specific `compute_121f` to `sm_121` target,
+  which is required for SM120-family block-scaled NVFP4 MMA.
+- Group prompt routes into 16-route expert tiles, place routes in MMA's M
+  dimension and eight output channels in N, and process down-projection output
+  in 1024-row chunks using the existing routed-mid buffer for terms.
+- Keep the 16-lane W4A4 integer-dot schedule for decode because SM121 offers
+  no GEMV-sized NVFP4 MMA instruction and the direct one-column MMA path
+  benchmarks slower.
+- Preserve source-offset alignment when merged safetensors spans are copied
+  into CUDA's range cache so 32-bit packed/scale fragment loads remain aligned.
 - Add `download_model.sh laguna-nvfp4`; it uses the official Hugging Face
   client to download the complete pinned checkpoint directory.
 
 # Validation
 
 - `make -j2 cpu`: passes.
-- `make -j2 ds4 CUDA_ARCH=sm_121`: passes.
-- `make cuda-regression CUDA_ARCH=sm_121`: passes on GB10, including the
-  native W4A4 synthetic test, portable/default schedule agreement, the
-  existing Q4_K/Q6_K Laguna coverage, and long-context CUDA smoke.
+- `make cuda-spark`: passes with the family-specific `compute_121f`/`sm_121`
+  target required by block-scaled MMA.
+- The Laguna CUDA regression passes on GB10, including a 256-token,
+  256-expert, top-10 native W4A4 test at the production
+  3072→1024→3072 dimensions and the existing Q4_K/Q6_K coverage.
 - `./ds4 --inspect --cuda -m /srv/models/poolside/Laguna-S-2.1-NVFP4`:
   reports 15 shards, 66.98 GiB, 626 BF16 logical tensors, and 141 NVFP4
   logical tensors.
 - Native tokenizer smoke: `Hello` maps to token 6352.
-- Deterministic live prompt `Reply with exactly: OK` produces `OK` directly
-  from the official sharded checkpoint. On rebased GB10 code the W4A4 path
-  reports about 11.3 token/s decode.
+- Deterministic live prompt `Reply with OK.` produces `OK` directly from the
+  official sharded checkpoint through all 48 layers.
 - CUDA startup residency covers 66.96 GiB of physical dense, packed-weight,
   and block-scale tensor ranges before inference timing.
-- `ds4-bench` with 2K/4K/8K frontiers and 256 decode tokens reports Blackwell
-  steady decode of 14.01/14.04/13.39 token/s and portable steady decode of
-  13.76/12.91/11.86 token/s. The raw runs are stored in
-  `speed-bench/laguna_s21_nvfp4_gb10.csv` and
-  `speed-bench/laguna_s21_nvfp4_gb10_portable.csv`.
+- The grouped FP4 MMA benchmark at 2K/4K/8K reports prompt throughput of
+  413.38/317.80/224.72 token/s, compared with 95.05/87.59/78.13 for the prior
+  integer-dot prompt kernel, and steady decode of 14.26/14.10/13.55 token/s.
+  The raw run is stored in
+  `speed-bench/laguna_s21_nvfp4_gb10.csv`.
 
 # Provenance
 

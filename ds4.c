@@ -3655,7 +3655,14 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     fflush(stderr);
 
     for (uint64_t i = 0; i < nspan;) {
-        uint64_t off = spans[i].off;
+        /*
+         * CUDA's range cache places each merged span at an aligned device
+         * address. Preserve the source offset's low bits as well: native
+         * NVFP4 fragment loads are 32-bit and a merged span can otherwise
+         * make an aligned safetensors payload appear unaligned on device.
+         */
+        const uint64_t preload_align = 256u;
+        uint64_t off = spans[i].off & ~(preload_align - 1u);
         uint64_t end = spans[i].end;
         i++;
         while (i < nspan &&

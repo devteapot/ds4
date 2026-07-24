@@ -31,8 +31,16 @@ CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
+CUDA_CODE ?=
+CUDA_NVFP4_MMA ?= 0
 ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
+endif
+ifneq ($(strip $(CUDA_CODE)),)
+NVCC_ARCH_FLAGS += -code=$(CUDA_CODE)
+endif
+ifeq ($(CUDA_NVFP4_MMA),1)
+NVCC_ARCH_FLAGS += -DDS4_CUDA_NVFP4_MMA=1
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o
@@ -114,7 +122,8 @@ help:
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+		CUDA_ARCH=compute_121f CUDA_CODE=sm_121 CUDA_NVFP4_MMA=1
 
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native

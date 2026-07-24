@@ -1229,24 +1229,14 @@ static int check_nvfp4_moe(model_blob *blob,
                                sizeof(weights_host)),
           "write NVFP4 MoE tensors");
 
-    float portable[n_tokens * dim];
-    float selected_path[n_tokens * dim];
-    CHECK(setenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4", "1", 1) == 0,
-          "select portable NVFP4 schedule");
+    float result[n_tokens * dim];
     CHECK(ds4_gpu_laguna_routed_moe_tensor(
               out, mid, blob->data, blob->size, routed,
               dim, dim, dim, selected, weights, n_expert, n_expert,
               x, n_tokens) &&
-          ds4_gpu_tensor_read(out, 0, portable, sizeof(portable)),
-          "portable Laguna NVFP4 MoE");
-    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4") == 0,
-          "select default NVFP4 schedule");
-    CHECK(ds4_gpu_laguna_routed_moe_tensor(
-              out, mid, blob->data, blob->size, routed,
-              dim, dim, dim, selected, weights, n_expert, n_expert,
-              x, n_tokens) &&
-          ds4_gpu_tensor_read(out, 0, selected_path, sizeof(selected_path)),
-          "default Laguna NVFP4 MoE");
+          ds4_gpu_tensor_read(out, 0, result, sizeof(result)),
+          native_w4a4 ? "Blackwell native Laguna NVFP4 MoE" :
+                        "GGUF Laguna NVFP4 MoE");
     for (uint32_t token = 0u; token < n_tokens; token++) {
         const float expected = nvfp4_moe_expected(
             2.56f * (float)(token + 1u),
@@ -1256,14 +1246,10 @@ static int check_nvfp4_moe(model_blob *blob,
         for (uint32_t i = 0u; i < dim; i++) {
             const uint64_t index = (uint64_t)token * dim + i;
             const float rtol = native_w4a4 ? 0.15f : 3e-3f;
-            CHECK(close_enough(portable[index], expected, 0.30f, rtol),
-                  "portable Laguna NVFP4 MoE numeric");
-            CHECK(close_enough(selected_path[index], expected,
-                               0.30f, rtol),
-                  "default Laguna NVFP4 MoE numeric");
-            CHECK(close_enough(selected_path[index], portable[index],
-                               0.05f, 1e-4f),
-                  "Laguna NVFP4 schedule agreement");
+            CHECK(close_enough(result[index], expected, 0.30f, rtol),
+                  native_w4a4 ?
+                      "Blackwell native Laguna NVFP4 MoE numeric" :
+                      "GGUF Laguna NVFP4 MoE numeric");
         }
     }
     ds4_gpu_tensor_free(mid);
@@ -1336,9 +1322,161 @@ static int check_native_nvfp4_moe(model_blob *blob) {
     return check_nvfp4_moe(blob, &routed, 1);
 }
 
+static int check_native_nvfp4_moe_real_shape(model_blob *blob) {
+    enum {
+        n_total_expert = 256,
+        n_expert = 10,
+        n_tokens = 256,
+        expert_in_dim = 3072,
+        expert_mid_dim = 1024,
+        out_dim = 3072
+    };
+    const uint32_t rows[3] = {
+        expert_mid_dim, expert_mid_dim, out_dim
+    };
+    const uint32_t cols[3] = {
+        expert_in_dim, expert_in_dim, expert_mid_dim
+    };
+    uint64_t packed[3][n_total_expert];
+    uint64_t scale[3][n_total_expert];
+    uint64_t weight_global[3][n_total_expert];
+    uint64_t input_global[3][n_total_expert];
+    const float output_scale[3] = {0.5f, 2.0f, 1.25f};
+    for (uint32_t p = 0u; p < 3u; p++) {
+        const uint64_t packed_bytes =
+            (uint64_t)rows[p] * cols[p] / 2u;
+        const uint64_t scale_bytes =
+            (uint64_t)rows[p] * cols[p] / 16u;
+        const uint64_t packed_offset = blob_alloc(blob, packed_bytes);
+        const uint64_t scale_offset = blob_alloc(blob, scale_bytes);
+        const uint64_t weight_global_offset =
+            blob_alloc(blob, sizeof(float));
+        const uint64_t input_global_offset =
+            blob_alloc(blob, sizeof(float));
+        CHECK(packed_offset != UINT64_MAX &&
+              scale_offset != UINT64_MAX &&
+              weight_global_offset != UINT64_MAX &&
+              input_global_offset != UINT64_MAX,
+              "allocate real-shape native NVFP4 tensors");
+        memset(blob->data + packed_offset, 0x22, packed_bytes);
+        memset(blob->data + scale_offset, 0x38, scale_bytes);
+        const float raw_weight_global = 1.0f / output_scale[p];
+        const float raw_input_global = p < 2u ? 600.0f : 256.0f;
+        memcpy(blob->data + weight_global_offset,
+               &raw_weight_global, sizeof(raw_weight_global));
+        memcpy(blob->data + input_global_offset,
+               &raw_input_global, sizeof(raw_input_global));
+        for (uint32_t e = 0u; e < n_total_expert; e++) {
+            packed[p][e] = packed_offset;
+            scale[p][e] = scale_offset;
+            weight_global[p][e] = weight_global_offset;
+            input_global[p][e] = input_global_offset;
+        }
+    }
+
+    ds4_gpu_laguna_moe_desc routed = {0};
+    routed.gate_type = 40u;
+    routed.up_type = 40u;
+    routed.down_type = 40u;
+    routed.gate_row_bytes =
+        routed.up_row_bytes =
+            (uint64_t)(expert_in_dim / 64u) * sizeof(block_nvfp4);
+    routed.down_row_bytes =
+        (uint64_t)(expert_mid_dim / 64u) * sizeof(block_nvfp4);
+    routed.gate_expert_bytes =
+        routed.up_expert_bytes =
+            (uint64_t)expert_mid_dim * routed.gate_row_bytes;
+    routed.down_expert_bytes =
+        (uint64_t)out_dim * routed.down_row_bytes;
+    ds4_gpu_nvfp4_matrix_desc *matrix[3] = {
+        &routed.gate_nvfp4, &routed.up_nvfp4, &routed.down_nvfp4
+    };
+    for (uint32_t p = 0u; p < 3u; p++) {
+        matrix[p]->packed_offsets = packed[p];
+        matrix[p]->scale_offsets = scale[p];
+        matrix[p]->weight_global_scale_offsets = weight_global[p];
+        matrix[p]->input_global_scale_offsets = input_global[p];
+        matrix[p]->packed_bytes = (uint64_t)rows[p] * cols[p] / 2u;
+        matrix[p]->scale_bytes = (uint64_t)rows[p] * cols[p] / 16u;
+    }
+
+    int32_t selected_host[n_tokens * n_expert];
+    float weights_host[n_tokens * n_expert];
+    for (uint32_t token = 0u; token < n_tokens; token++) {
+        for (uint32_t e = 0u; e < n_expert; e++) {
+            const uint64_t pair = (uint64_t)token * n_expert + e;
+            selected_host[pair] =
+                (int32_t)((token * 17u + e * 23u) % n_total_expert);
+            weights_host[pair] = 1.0f / (float)n_expert;
+        }
+    }
+    ds4_gpu_tensor *x =
+        ds4_gpu_tensor_alloc(
+            (uint64_t)n_tokens * expert_in_dim * sizeof(float));
+    ds4_gpu_tensor *selected =
+        ds4_gpu_tensor_alloc(sizeof(selected_host));
+    ds4_gpu_tensor *weights =
+        ds4_gpu_tensor_alloc(sizeof(weights_host));
+    ds4_gpu_tensor *out =
+        ds4_gpu_tensor_alloc(
+            (uint64_t)n_tokens * out_dim * sizeof(float));
+    ds4_gpu_tensor *mid =
+        ds4_gpu_tensor_alloc(
+            (uint64_t)n_tokens * n_expert *
+            expert_mid_dim * sizeof(float));
+    CHECK(x && selected && weights && out && mid,
+          "real-shape NVFP4 MoE tensor allocation");
+    CHECK(ds4_gpu_tensor_fill_f32(
+              x, 0.0001f, (uint64_t)n_tokens * expert_in_dim) &&
+          ds4_gpu_tensor_write(selected, 0, selected_host,
+                               sizeof(selected_host)) &&
+          ds4_gpu_tensor_write(weights, 0, weights_host,
+                               sizeof(weights_host)),
+          "write real-shape NVFP4 MoE tensors");
+    CHECK(ds4_gpu_laguna_routed_moe_tensor(
+              out, mid, blob->data, blob->size, &routed,
+              expert_in_dim, expert_mid_dim, out_dim,
+              selected, weights, n_total_expert, n_expert, x, n_tokens),
+          "real-shape Blackwell native Laguna NVFP4 MoE");
+    CHECK(cudaDeviceSynchronize() == cudaSuccess,
+          "synchronize real-shape Blackwell native Laguna NVFP4 MoE");
+
+    const uint64_t result_count = (uint64_t)n_tokens * out_dim;
+    float *result = (float *)malloc(
+        (size_t)result_count * sizeof(float));
+    CHECK(result != NULL, "allocate real-shape NVFP4 result");
+    CHECK(ds4_gpu_tensor_read(
+              out, 0, result, result_count * sizeof(float)),
+          "read real-shape NVFP4 result");
+    const float projection = 0.0001f * (float)expert_in_dim;
+    const float gate = projection * output_scale[0];
+    const float up = projection * output_scale[1];
+    const float one_mid =
+        (gate / (1.0f + expf(-gate))) * up / (float)n_expert;
+    const float expected =
+        one_mid * (float)n_expert * (float)expert_mid_dim *
+        output_scale[2];
+    for (uint64_t i = 0u; i < result_count; i++) {
+        if (!close_enough(result[i], expected, 1.0f, 0.20f)) {
+            fprintf(stderr,
+                    "cuda-laguna: real-shape NVFP4 result[%llu]=%.9g "
+                    "expected=%.9g\n",
+                    (unsigned long long)i, result[i], expected);
+            CHECK(0, "real-shape Blackwell native Laguna NVFP4 MoE numeric");
+        }
+    }
+    free(result);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(x);
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init(), "ds4_gpu_init");
-    const uint64_t blob_size = 2u * 1024u * 1024u;
+    const uint64_t blob_size = 64u * 1024u * 1024u;
     void *host = NULL;
     CHECK(cudaMallocHost(&host, blob_size) == cudaSuccess,
           "allocate pinned model blob");
@@ -1566,6 +1704,7 @@ int main(void) {
     }
     if (rc == 0) rc = check_nvfp4_moe(&blob, &nvfp4_routed, 0);
     if (rc == 0) rc = check_native_nvfp4_moe(&blob);
+    if (rc == 0) rc = check_native_nvfp4_moe_real_shape(&blob);
     ds4_gpu_cleanup();
     (void)cudaFreeHost(host);
     if (rc == 0) puts("cuda Laguna regression: OK");

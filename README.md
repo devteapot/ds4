@@ -240,19 +240,25 @@ output head stay BF16:
 
 ```sh
 ./download_model.sh laguna-nvfp4
-make cuda-spark       # GB10 / compute capability 12.x
-# make cuda-generic   # portable CUDA path
+make cuda-spark       # GB10 / sm_121 Blackwell family target
 ./ds4 --cuda -m gguf/Laguna-S-2.1-NVFP4 -c 32768 \
   -p "Explain this repository"
 ```
 
 The CUDA implementation dynamically quantizes routed-expert activations to
-E2M1 in groups of 16, applies the checkpoint's calibrated E4M3 and global
-scales, and uses NVFP4-specific DP4A gate/up and down kernels. Compute
-capability 12.x selects a wider Blackwell schedule; set
-`DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4=1` to force the portable schedule for
-comparison. NVFP4 support is raw-model only: DFlash, SSD
-streaming, distributed inference, Metal, and ROCm are not part of this path.
+E2M1 in groups of 16 and applies the checkpoint's calibrated E4M3 and global
+scales. On prompt batches it sorts routes by expert and packs up to 16 routes
+by eight output channels into Blackwell's block-scaled
+`mma.sync.m16n8k64` FP4 instruction, reusing each expert weight tile across
+the batch. Decode uses the native W4A4 integer-dot kernel: GB10's FP4 MMA has
+no GEMV-sized form, so a single routed vector would discard seven of its eight
+output columns and is slower in practice.
+
+The official NVFP4 checkpoint is Blackwell-only in this backend and requires
+the family-specific `cuda-spark` build. Use the official Q4_K_M model with
+`cuda-generic` on pre-Blackwell cards. NVFP4 support is raw-model only:
+DFlash, SSD streaming, distributed inference, Metal, and ROCm are not part of
+this path.
 
 The shipped GGUF is configured for a 262144-token context. Laguna defaults to
 temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options

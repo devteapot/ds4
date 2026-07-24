@@ -302,6 +302,21 @@ static int cuda_laguna_blackwell_ok(void) {
     return cached;
 }
 
+#if defined(DS4_CUDA_NVFP4_MMA)
+static int cuda_laguna_nvfp4_hw_ok(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        int dev = 0;
+        int major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(
+            &major, cudaDevAttrComputeCapabilityMajor, dev);
+        cached = major >= 12 ? 1 : 0;
+    }
+    return cached;
+}
+#endif
+
 
 
 
@@ -29459,6 +29474,553 @@ __device__ __forceinline__ static float dev_dot_nvfp4_native_w4a4_group(
            dev_nvfp4_ue4m3_to_f32(activation_scale);
 }
 
+/*
+ * Blackwell GeForce/GB10 exposes NVFP4 through the SM120-family warp MMA:
+ * 16 output rows x 8 routed columns x 64 reduction values.  Laguna's official
+ * weights and dynamically quantized activations already use the instruction's
+ * adjacent E2M1 packing and four UE4M3 scales per K=64 tile, so the operands
+ * can be loaded directly into fragments without dequantizing or repacking.
+ *
+ * The family-specific target is deliberate. Generic sm_12x code cannot issue
+ * block-scaled MMA and pre-Blackwell devices should use Laguna Q4_K_M.
+ */
+#if defined(DS4_CUDA_NVFP4_MMA)
+__device__ __forceinline__ static void laguna_nvfp4_mma_m16n8k64(
+        float &d0, float &d1, float &d2, float &d3,
+        uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+        uint32_t b0, uint32_t b1,
+        uint32_t scale_a, uint32_t scale_b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale."
+        "scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%0, %1, %2, %3}, "
+        "%10, {0, 0}, %11, {0, 0};\n"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+          "r"(b0), "r"(b1), "r"(scale_a), "r"(scale_b));
+}
+
+__device__ __forceinline__ static uint32_t laguna_nvfp4_load_u32(
+        const uint8_t *p) {
+    return *(const uint32_t *)p;
+}
+
+__device__ __forceinline__ static void laguna_nvfp4_load_weight_fragment(
+        const uint8_t *packed,
+        uint32_t row_stride,
+        uint32_t scale_stride,
+        const uint8_t *scales,
+        uint32_t row0,
+        uint32_t k0,
+        uint32_t lane,
+        uint32_t &a0,
+        uint32_t &a1,
+        uint32_t &a2,
+        uint32_t &a3,
+        uint32_t &scale_a) {
+    const uint32_t group = lane >> 2u;
+    const uint32_t tid = lane & 3u;
+    const uint32_t row_lo = row0 + group;
+    const uint32_t row_hi = row_lo + 8u;
+    const uint32_t byte0 = k0 / 2u + tid * 4u;
+    const uint32_t byte1 = byte0 + 16u;
+    a0 = laguna_nvfp4_load_u32(
+        packed + (uint64_t)row_lo * row_stride + byte0);
+    a1 = laguna_nvfp4_load_u32(
+        packed + (uint64_t)row_hi * row_stride + byte0);
+    a2 = laguna_nvfp4_load_u32(
+        packed + (uint64_t)row_lo * row_stride + byte1);
+    a3 = laguna_nvfp4_load_u32(
+        packed + (uint64_t)row_hi * row_stride + byte1);
+
+    /*
+     * Selector thread-id-a=0 consumes the lower thread pair in each quad:
+     * tid 0 supplies the four scales for row_lo and tid 1 for row_hi.
+     */
+    scale_a = 0u;
+    if (tid < 2u) {
+        const uint32_t row = tid == 0u ? row_lo : row_hi;
+        scale_a = laguna_nvfp4_load_u32(
+            scales + (uint64_t)row * scale_stride + k0 / 16u);
+    }
+}
+
+__device__ __forceinline__ static void laguna_nvfp4_load_vector_fragment(
+        const uint8_t *packed,
+        const uint8_t *scales,
+        uint32_t k0,
+        uint32_t lane,
+        uint32_t &b0,
+        uint32_t &b1,
+        uint32_t &scale_b) {
+    const uint32_t group = lane >> 2u;
+    const uint32_t tid = lane & 3u;
+    b0 = 0u;
+    b1 = 0u;
+    scale_b = 0u;
+    if (group == 0u) {
+        const uint32_t byte0 = k0 / 2u + tid * 4u;
+        b0 = laguna_nvfp4_load_u32(packed + byte0);
+        b1 = laguna_nvfp4_load_u32(packed + byte0 + 16u);
+        /* thread-id-b=0 consumes tid 0 from the column's quad. */
+        if (tid == 0u)
+            scale_b = laguna_nvfp4_load_u32(scales + k0 / 16u);
+    }
+}
+
+__device__ __forceinline__ static void laguna_nvfp4_load_grouped_activation(
+        const uint8_t *packed,
+        const uint8_t *scales,
+        const uint32_t *sorted_pairs,
+        uint32_t sorted_offset,
+        uint32_t local_start,
+        uint32_t pair_count,
+        uint32_t packed_row,
+        uint32_t scale_row,
+        uint32_t k0,
+        uint32_t lane,
+        uint32_t &a0,
+        uint32_t &a1,
+        uint32_t &a2,
+        uint32_t &a3,
+        uint32_t &scale_a) {
+    const uint32_t group = lane >> 2u;
+    const uint32_t tid = lane & 3u;
+    const uint32_t local_lo = local_start + group;
+    const uint32_t local_hi = local_lo + 8u;
+    const bool valid_lo = local_lo < pair_count;
+    const bool valid_hi = local_hi < pair_count;
+    const uint32_t pair_lo =
+        valid_lo ? sorted_pairs[sorted_offset + local_lo] : 0u;
+    const uint32_t pair_hi =
+        valid_hi ? sorted_pairs[sorted_offset + local_hi] : 0u;
+    const uint32_t byte0 = k0 / 2u + tid * 4u;
+    const uint32_t byte1 = byte0 + 16u;
+    a0 = valid_lo ? laguna_nvfp4_load_u32(
+        packed + (uint64_t)pair_lo * packed_row + byte0) : 0u;
+    a1 = valid_hi ? laguna_nvfp4_load_u32(
+        packed + (uint64_t)pair_hi * packed_row + byte0) : 0u;
+    a2 = valid_lo ? laguna_nvfp4_load_u32(
+        packed + (uint64_t)pair_lo * packed_row + byte1) : 0u;
+    a3 = valid_hi ? laguna_nvfp4_load_u32(
+        packed + (uint64_t)pair_hi * packed_row + byte1) : 0u;
+    scale_a = 0u;
+    if (tid == 0u && valid_lo) {
+        scale_a = laguna_nvfp4_load_u32(
+            scales + (uint64_t)pair_lo * scale_row + k0 / 16u);
+    } else if (tid == 1u && valid_hi) {
+        scale_a = laguna_nvfp4_load_u32(
+            scales + (uint64_t)pair_hi * scale_row + k0 / 16u);
+    }
+}
+
+__device__ __forceinline__ static void laguna_nvfp4_load_grouped_weight(
+        const uint8_t *packed,
+        const uint8_t *scales,
+        uint32_t packed_row,
+        uint32_t scale_row,
+        uint32_t col0,
+        uint32_t k0,
+        uint32_t lane,
+        uint32_t &b0,
+        uint32_t &b1,
+        uint32_t &scale_b) {
+    const uint32_t col = col0 + (lane >> 2u);
+    const uint32_t tid = lane & 3u;
+    const uint32_t byte0 = k0 / 2u + tid * 4u;
+    b0 = laguna_nvfp4_load_u32(
+        packed + (uint64_t)col * packed_row + byte0);
+    b1 = laguna_nvfp4_load_u32(
+        packed + (uint64_t)col * packed_row + byte0 + 16u);
+    scale_b = tid == 0u ? laguna_nvfp4_load_u32(
+        scales + (uint64_t)col * scale_row + k0 / 16u) : 0u;
+}
+
+/*
+ * Prefill groups up to sixteen routes for the same expert into MMA's M
+ * dimension and computes eight output channels in N.  Unlike the decode
+ * kernel's unavoidable GEMV shape, this consumes the complete 16x8 result
+ * tile and reuses each expert weight fragment across sixteen prompt tokens.
+ */
+__global__ static void laguna_grouped_nvfp4_gate_up_mma_kernel(
+        float *mid,
+        const uint8_t *const *gate_packed,
+        const uint8_t *const *gate_scale,
+        const uint8_t *const *up_packed,
+        const uint8_t *const *up_scale,
+        const float *gate_global,
+        const float *up_global,
+        const float *input_global,
+        const uint8_t *x4,
+        const uint8_t *x4scale,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *router_weights,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim) {
+    const uint32_t warp_in_block = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t warp =
+        (uint64_t)blockIdx.x * (blockDim.x / 32u) + warp_in_block;
+    const uint32_t col_tiles = expert_mid_dim / 8u;
+    const uint32_t tile = (uint32_t)(warp / col_tiles);
+    if (tile >= *tile_total) return;
+    const uint32_t col0 =
+        (uint32_t)(warp - (uint64_t)tile * col_tiles) * 8u;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    const uint32_t pair_count = counts[expert];
+    const uint32_t sorted_offset = offsets[expert];
+    const uint32_t packed_row = expert_in_dim / 2u;
+    const uint32_t scale_row = expert_in_dim / 16u;
+
+    float gd[4][4] = {};
+    float ud[4][4] = {};
+    for (uint32_t kbase = 0u; kbase < expert_in_dim; kbase += 256u) {
+#pragma unroll
+        for (uint32_t stage = 0u; stage < 4u; stage++) {
+            const uint32_t k0 = kbase + stage * 64u;
+            uint32_t a0, a1, a2, a3, sa;
+            uint32_t gb0, gb1, gsb;
+            uint32_t ub0, ub1, usb;
+            laguna_nvfp4_load_grouped_activation(
+                x4, x4scale, sorted_pairs, sorted_offset, local_start,
+                pair_count, packed_row, scale_row, k0, lane,
+                a0, a1, a2, a3, sa);
+            laguna_nvfp4_load_grouped_weight(
+                gate_packed[expert], gate_scale[expert],
+                packed_row, scale_row, col0, k0, lane,
+                gb0, gb1, gsb);
+            laguna_nvfp4_load_grouped_weight(
+                up_packed[expert], up_scale[expert],
+                packed_row, scale_row, col0, k0, lane,
+                ub0, ub1, usb);
+            laguna_nvfp4_mma_m16n8k64(
+                gd[stage][0], gd[stage][1],
+                gd[stage][2], gd[stage][3],
+                a0, a1, a2, a3, gb0, gb1, sa, gsb);
+            laguna_nvfp4_mma_m16n8k64(
+                ud[stage][0], ud[stage][1],
+                ud[stage][2], ud[stage][3],
+                a0, a1, a2, a3, ub0, ub1, sa, usb);
+        }
+    }
+#pragma unroll
+    for (uint32_t stage = 1u; stage < 4u; stage++) {
+#pragma unroll
+        for (uint32_t i = 0u; i < 4u; i++) {
+            gd[0][i] += gd[stage][i];
+            ud[0][i] += ud[stage][i];
+        }
+    }
+
+    const uint32_t group = lane >> 2u;
+    const uint32_t tid = lane & 3u;
+    const float gate_factor =
+        gate_global[expert] * input_global[expert];
+    const float up_factor =
+        up_global[expert] * input_global[expert];
+    const uint32_t local_lo = local_start + group;
+    const uint32_t local_hi = local_lo + 8u;
+    if (local_lo < pair_count) {
+        const uint32_t pair = sorted_pairs[sorted_offset + local_lo];
+        float gate_value = gd[0][0] * gate_factor;
+        float up_value = ud[0][0] * up_factor;
+        mid[(uint64_t)pair * expert_mid_dim + col0 + tid * 2u] =
+            (gate_value / (1.0f + expf(-gate_value))) *
+            up_value * router_weights[pair];
+        gate_value = gd[0][1] * gate_factor;
+        up_value = ud[0][1] * up_factor;
+        mid[(uint64_t)pair * expert_mid_dim + col0 + tid * 2u + 1u] =
+            (gate_value / (1.0f + expf(-gate_value))) *
+            up_value * router_weights[pair];
+    }
+    if (local_hi < pair_count) {
+        const uint32_t pair = sorted_pairs[sorted_offset + local_hi];
+        float gate_value = gd[0][2] * gate_factor;
+        float up_value = ud[0][2] * up_factor;
+        mid[(uint64_t)pair * expert_mid_dim + col0 + tid * 2u] =
+            (gate_value / (1.0f + expf(-gate_value))) *
+            up_value * router_weights[pair];
+        gate_value = gd[0][3] * gate_factor;
+        up_value = ud[0][3] * up_factor;
+        mid[(uint64_t)pair * expert_mid_dim + col0 + tid * 2u + 1u] =
+            (gate_value / (1.0f + expf(-gate_value))) *
+            up_value * router_weights[pair];
+    }
+}
+
+__global__ static void laguna_grouped_nvfp4_down_mma_kernel(
+        float *terms,
+        const uint8_t *const *down_packed,
+        const uint8_t *const *down_scale,
+        const float *down_global,
+        const float *input_global,
+        const uint8_t *mid4,
+        const uint8_t *mid4scale,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        uint32_t expert_mid_dim,
+        uint32_t term_stride,
+        uint32_t row0,
+        uint32_t chunk_rows) {
+    const uint32_t warp_in_block = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t warp =
+        (uint64_t)blockIdx.x * (blockDim.x / 32u) + warp_in_block;
+    const uint32_t col_tiles = chunk_rows / 8u;
+    const uint32_t tile = (uint32_t)(warp / col_tiles);
+    if (tile >= *tile_total) return;
+    const uint32_t local_col0 =
+        (uint32_t)(warp - (uint64_t)tile * col_tiles) * 8u;
+    const uint32_t col0 = row0 + local_col0;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    const uint32_t pair_count = counts[expert];
+    const uint32_t sorted_offset = offsets[expert];
+    const uint32_t packed_row = expert_mid_dim / 2u;
+    const uint32_t scale_row = expert_mid_dim / 16u;
+
+    float d[4][4] = {};
+    for (uint32_t kbase = 0u; kbase < expert_mid_dim; kbase += 256u) {
+#pragma unroll
+        for (uint32_t stage = 0u; stage < 4u; stage++) {
+            const uint32_t k0 = kbase + stage * 64u;
+            uint32_t a0, a1, a2, a3, sa;
+            uint32_t b0, b1, sb;
+            laguna_nvfp4_load_grouped_activation(
+                mid4, mid4scale, sorted_pairs, sorted_offset, local_start,
+                pair_count, packed_row, scale_row, k0, lane,
+                a0, a1, a2, a3, sa);
+            laguna_nvfp4_load_grouped_weight(
+                down_packed[expert], down_scale[expert],
+                packed_row, scale_row, col0, k0, lane,
+                b0, b1, sb);
+            laguna_nvfp4_mma_m16n8k64(
+                d[stage][0], d[stage][1],
+                d[stage][2], d[stage][3],
+                a0, a1, a2, a3, b0, b1, sa, sb);
+        }
+    }
+#pragma unroll
+    for (uint32_t stage = 1u; stage < 4u; stage++) {
+#pragma unroll
+        for (uint32_t i = 0u; i < 4u; i++)
+            d[0][i] += d[stage][i];
+    }
+
+    const uint32_t group = lane >> 2u;
+    const uint32_t tid = lane & 3u;
+    const float factor =
+        down_global[expert] * input_global[expert];
+    const uint32_t local_lo = local_start + group;
+    const uint32_t local_hi = local_lo + 8u;
+    if (local_lo < pair_count) {
+        const uint32_t pair = sorted_pairs[sorted_offset + local_lo];
+        terms[(uint64_t)pair * term_stride + local_col0 + tid * 2u] =
+            d[0][0] * factor;
+        terms[(uint64_t)pair * term_stride + local_col0 + tid * 2u + 1u] =
+            d[0][1] * factor;
+    }
+    if (local_hi < pair_count) {
+        const uint32_t pair = sorted_pairs[sorted_offset + local_hi];
+        terms[(uint64_t)pair * term_stride + local_col0 + tid * 2u] =
+            d[0][2] * factor;
+        terms[(uint64_t)pair * term_stride + local_col0 + tid * 2u + 1u] =
+            d[0][3] * factor;
+    }
+}
+
+__global__ static DS4_CUDA_UNUSED void laguna_native_nvfp4_gate_up_mma_kernel(
+        float *mid,
+        const uint8_t *const *gate_packed,
+        const uint8_t *const *gate_scale,
+        const uint8_t *const *up_packed,
+        const uint8_t *const *up_scale,
+        const float *gate_global,
+        const float *up_global,
+        const float *input_global,
+        const uint8_t *x4,
+        const uint8_t *x4scale,
+        const int32_t *selected,
+        const float *router_weights,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint64_t pairs) {
+    const uint32_t warp_in_block = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t warp =
+        (uint64_t)blockIdx.x * (blockDim.x / 32u) + warp_in_block;
+    const uint32_t row_tiles = expert_mid_dim / 16u;
+    const uint64_t pair = warp / row_tiles;
+    if (pair >= pairs) return;
+    const uint32_t row0 =
+        (uint32_t)(warp - pair * row_tiles) * 16u;
+    const int32_t expert_i = selected[pair];
+    if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) return;
+    const uint32_t expert = (uint32_t)expert_i;
+    const uint32_t packed_row = expert_in_dim / 2u;
+    const uint32_t scale_row = expert_in_dim / 16u;
+    const uint8_t *xrow = x4 + pair * packed_row;
+    const uint8_t *xsrow = x4scale + pair * scale_row;
+
+    /*
+     * Four independent accumulator chains cover each K=256 slice.  A single
+     * dependent OMMA chain leaves the Blackwell FP4 pipe waiting on its prior
+     * result; interleaving four chains exposes enough independent work for the
+     * scheduler while retaining direct checkpoint loads.
+     */
+    float gd[4][4] = {};
+    float ud[4][4] = {};
+    for (uint32_t kbase = 0u; kbase < expert_in_dim; kbase += 256u) {
+#pragma unroll
+        for (uint32_t stage = 0u; stage < 4u; stage++) {
+            const uint32_t k0 = kbase + stage * 64u;
+            if (k0 >= expert_in_dim) continue;
+            uint32_t ga0, ga1, ga2, ga3, gsa;
+            uint32_t ua0, ua1, ua2, ua3, usa;
+            uint32_t b0, b1, sb;
+            laguna_nvfp4_load_weight_fragment(
+                gate_packed[expert], packed_row, scale_row,
+                gate_scale[expert], row0, k0, lane,
+                ga0, ga1, ga2, ga3, gsa);
+            laguna_nvfp4_load_weight_fragment(
+                up_packed[expert], packed_row, scale_row,
+                up_scale[expert], row0, k0, lane,
+                ua0, ua1, ua2, ua3, usa);
+            laguna_nvfp4_load_vector_fragment(
+                xrow, xsrow, k0, lane, b0, b1, sb);
+            laguna_nvfp4_mma_m16n8k64(
+                gd[stage][0], gd[stage][1],
+                gd[stage][2], gd[stage][3],
+                ga0, ga1, ga2, ga3, b0, b1, gsa, sb);
+            laguna_nvfp4_mma_m16n8k64(
+                ud[stage][0], ud[stage][1],
+                ud[stage][2], ud[stage][3],
+                ua0, ua1, ua2, ua3, b0, b1, usa, sb);
+        }
+    }
+#pragma unroll
+    for (uint32_t stage = 1u; stage < 4u; stage++) {
+        gd[0][0] += gd[stage][0];
+        gd[0][1] += gd[stage][1];
+        gd[0][2] += gd[stage][2];
+        gd[0][3] += gd[stage][3];
+        ud[0][0] += ud[stage][0];
+        ud[0][1] += ud[stage][1];
+        ud[0][2] += ud[stage][2];
+        ud[0][3] += ud[stage][3];
+    }
+
+    if ((lane & 3u) == 0u) {
+        const uint32_t group = lane >> 2u;
+        const float gate_factor =
+            gate_global[expert] * input_global[expert];
+        const float up_factor =
+            up_global[expert] * input_global[expert];
+        const float router = router_weights[pair];
+        float gate_value = gd[0][0] * gate_factor;
+        float up_value = ud[0][0] * up_factor;
+        mid[pair * expert_mid_dim + row0 + group] =
+            (gate_value / (1.0f + expf(-gate_value))) *
+            up_value * router;
+        gate_value = gd[0][2] * gate_factor;
+        up_value = ud[0][2] * up_factor;
+        mid[pair * expert_mid_dim + row0 + group + 8u] =
+            (gate_value / (1.0f + expf(-gate_value))) *
+            up_value * router;
+    }
+}
+
+__global__ static DS4_CUDA_UNUSED void laguna_native_nvfp4_down_mma_kernel(
+        float *out,
+        const uint8_t *const *down_packed,
+        const uint8_t *const *down_scale,
+        const float *down_global,
+        const float *input_global,
+        const uint8_t *mid4,
+        const uint8_t *mid4scale,
+        const int32_t *selected,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    const uint32_t warp_in_block = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t warp =
+        (uint64_t)blockIdx.x * (blockDim.x / 32u) + warp_in_block;
+    const uint32_t row_tiles = out_dim / 16u;
+    const uint32_t token = (uint32_t)(warp / row_tiles);
+    if (token >= n_tokens) return;
+    const uint32_t row0 =
+        (uint32_t)(warp - (uint64_t)token * row_tiles) * 16u;
+    const uint32_t packed_row = expert_mid_dim / 2u;
+    const uint32_t scale_row = expert_mid_dim / 16u;
+    float total0 = 0.0f;
+    float total2 = 0.0f;
+
+    for (uint32_t slot = 0u; slot < n_expert; slot++) {
+        const uint64_t pair = (uint64_t)token * n_expert + slot;
+        const int32_t expert_i = selected[pair];
+        if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) continue;
+        const uint32_t expert = (uint32_t)expert_i;
+        const uint8_t *xrow = mid4 + pair * packed_row;
+        const uint8_t *xsrow = mid4scale + pair * scale_row;
+        float d[4][4] = {};
+        for (uint32_t kbase = 0u; kbase < expert_mid_dim; kbase += 256u) {
+#pragma unroll
+            for (uint32_t stage = 0u; stage < 4u; stage++) {
+                const uint32_t k0 = kbase + stage * 64u;
+                if (k0 >= expert_mid_dim) continue;
+                uint32_t a0, a1, a2, a3, sa;
+                uint32_t b0, b1, sb;
+                laguna_nvfp4_load_weight_fragment(
+                    down_packed[expert], packed_row, scale_row,
+                    down_scale[expert], row0, k0, lane,
+                    a0, a1, a2, a3, sa);
+                laguna_nvfp4_load_vector_fragment(
+                    xrow, xsrow, k0, lane, b0, b1, sb);
+                laguna_nvfp4_mma_m16n8k64(
+                    d[stage][0], d[stage][1],
+                    d[stage][2], d[stage][3],
+                    a0, a1, a2, a3, b0, b1, sa, sb);
+            }
+        }
+#pragma unroll
+        for (uint32_t stage = 1u; stage < 4u; stage++) {
+            d[0][0] += d[stage][0];
+            d[0][1] += d[stage][1];
+            d[0][2] += d[stage][2];
+            d[0][3] += d[stage][3];
+        }
+        const float factor =
+            down_global[expert] * input_global[expert];
+        total0 += d[0][0] * factor;
+        total2 += d[0][2] * factor;
+    }
+
+    if ((lane & 3u) == 0u) {
+        const uint32_t group = lane >> 2u;
+        out[(uint64_t)token * out_dim + row0 + group] = total0;
+        out[(uint64_t)token * out_dim + row0 + group + 8u] = total2;
+    }
+}
+#endif
+
 template <uint32_t LANES>
 __device__ __forceinline__ static float laguna_subwarp_sum_f32(float value) {
     static_assert(LANES == 8u || LANES == 16u,
@@ -30665,8 +31227,38 @@ static int cuda_laguna_nvfp4_routed_moe(
         native ? pairs * expert_mid_dim / 16u :
                  pairs * midq_blocks * sizeof(float);
     if (midscale_offset > UINT64_MAX - midscale_bytes) return 0;
+    const bool grouped_native =
+        native && n_tokens >= 256u && pairs <= UINT32_MAX;
+    const uint64_t sorted_base =
+        (midscale_offset + midscale_bytes + 255u) & ~255ull;
+    const uint64_t counts_bytes = grouped_native ?
+        (uint64_t)n_total_expert * sizeof(uint32_t) : 0u;
+    const uint64_t offsets_bytes = grouped_native ?
+        ((uint64_t)n_total_expert + 1u) * sizeof(uint32_t) : 0u;
+    const uint64_t cursors_bytes = counts_bytes;
+    const uint64_t sorted_pairs_bytes = grouped_native ?
+        pairs * sizeof(uint32_t) : 0u;
+    const uint64_t tile_offsets_bytes = offsets_bytes;
+    const uint64_t tile_capacity = grouped_native ?
+        (pairs + 15u) / 16u + n_total_expert : 0u;
+    const uint64_t tile_total_bytes = grouped_native ?
+        sizeof(uint32_t) : 0u;
+    const uint64_t tile_experts_bytes =
+        tile_capacity * sizeof(uint32_t);
+    const uint64_t tile_starts_bytes = tile_experts_bytes;
+    const uint64_t sorted_bytes =
+        counts_bytes + offsets_bytes + cursors_bytes +
+        sorted_pairs_bytes + tile_offsets_bytes + tile_total_bytes +
+        tile_experts_bytes + tile_starts_bytes;
+    if (grouped_native &&
+        (tile_capacity > UINT32_MAX ||
+         sorted_base > UINT64_MAX - sorted_bytes)) {
+        return 0;
+    }
+    const uint64_t scratch_bytes = grouped_native ?
+        sorted_base + sorted_bytes : midscale_offset + midscale_bytes;
     uint8_t *scratch = (uint8_t *)cuda_tmp_alloc_on(
-        logical_tier, midscale_offset + midscale_bytes,
+        logical_tier, scratch_bytes,
         "Laguna NVFP4 MoE");
     if (!scratch) return 0;
     int8_t *xq = (int8_t *)scratch;
@@ -30677,6 +31269,12 @@ static int cuda_laguna_nvfp4_routed_moe(
     uint8_t *x4scale = native ? scratch + xscale_offset : NULL;
     uint8_t *mid4 = native ? scratch + midq_offset : NULL;
     uint8_t *mid4scale = native ? scratch + midscale_offset : NULL;
+    uint32_t *sorted_counts = NULL;
+    uint32_t *sorted_offsets = NULL;
+    uint32_t *sorted_pairs = NULL;
+    uint32_t *tile_total = NULL;
+    uint32_t *tile_experts = NULL;
+    uint32_t *tile_starts = NULL;
 
     if (native) {
         for (uint32_t pair0 = 0u; pair0 < (uint32_t)pairs;) {
@@ -30714,9 +31312,197 @@ static int cuda_laguna_nvfp4_routed_moe(
         }
     }
 
-    const bool blackwell =
-        cuda_laguna_blackwell_ok() &&
-        getenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4") == NULL;
+    if (grouped_native) {
+        uint8_t *cursor = scratch + sorted_base;
+        sorted_counts = (uint32_t *)cursor;
+        cursor += counts_bytes;
+        sorted_offsets = (uint32_t *)cursor;
+        cursor += offsets_bytes;
+        uint32_t *cursors = (uint32_t *)cursor;
+        cursor += cursors_bytes;
+        sorted_pairs = (uint32_t *)cursor;
+        cursor += sorted_pairs_bytes;
+        uint32_t *tile_offsets = (uint32_t *)cursor;
+        cursor += tile_offsets_bytes;
+        tile_total = (uint32_t *)cursor;
+        cursor += tile_total_bytes;
+        tile_experts = (uint32_t *)cursor;
+        cursor += tile_experts_bytes;
+        tile_starts = (uint32_t *)cursor;
+        if (!cuda_ok(cudaMemsetAsync(
+                         sorted_counts, 0, (size_t)counts_bytes),
+                     "Laguna native NVFP4 sorted counts clear")) {
+            return 0;
+        }
+        moe_count_sorted_pairs_kernel<<<
+            ((uint32_t)pairs + 255u) / 256u, 256>>>(
+                sorted_counts, (const int32_t *)selected->ptr,
+                (uint32_t)pairs, n_total_expert);
+        if (!cuda_ok(cudaGetLastError(),
+                     "Laguna native NVFP4 sorted count launch")) {
+            return 0;
+        }
+        moe_prefix_sorted_pairs_kernel<<<1, 1>>>(
+            sorted_offsets, cursors, sorted_counts, n_total_expert);
+        if (!cuda_ok(cudaGetLastError(),
+                     "Laguna native NVFP4 sorted prefix launch")) {
+            return 0;
+        }
+        moe_scatter_sorted_pairs_kernel<<<
+            ((uint32_t)pairs + 255u) / 256u, 256>>>(
+                sorted_pairs, cursors,
+                (const int32_t *)selected->ptr,
+                (uint32_t)pairs, n_total_expert);
+        if (!cuda_ok(cudaGetLastError(),
+                     "Laguna native NVFP4 sorted scatter launch")) {
+            return 0;
+        }
+        moe_build_expert_tile_offsets_kernel<<<1, 1>>>(
+            tile_offsets, tile_total, sorted_counts, 16u,
+            n_total_expert);
+        if (!cuda_ok(cudaGetLastError(),
+                     "Laguna native NVFP4 sorted tile-offset launch")) {
+            return 0;
+        }
+        moe_build_expert_tiles_kernel<<<
+            (n_total_expert + 255u) / 256u, 256>>>(
+                tile_experts, tile_starts, tile_offsets,
+                sorted_counts, 16u, n_total_expert);
+        if (!cuda_ok(cudaGetLastError(),
+                     "Laguna native NVFP4 sorted tile launch")) {
+            return 0;
+        }
+    }
+
+    if (native) {
+#if defined(DS4_CUDA_NVFP4_MMA)
+        if (!cuda_laguna_nvfp4_hw_ok()) {
+            fprintf(stderr,
+                    "ds4: native Laguna NVFP4 requires a Blackwell GPU; "
+                    "use the official Q4_K_M model on older CUDA devices\n");
+            return 0;
+        }
+        if (grouped_native) {
+            const uint64_t gate_warps =
+                tile_capacity * (expert_mid_dim / 8u);
+            const uint64_t gate_blocks = (gate_warps + 7u) / 8u;
+            if (gate_blocks > UINT32_MAX) return 0;
+            laguna_grouped_nvfp4_gate_up_mma_kernel<<<
+                (uint32_t)gate_blocks, 256>>>(
+                    (float *)mid->ptr,
+                    native_cache->gate_packed,
+                    native_cache->gate_scale,
+                    native_cache->up_packed,
+                    native_cache->up_scale,
+                    gate_scales,
+                    up_scales,
+                    native_cache->gate_input_global,
+                    x4,
+                    x4scale,
+                    sorted_pairs,
+                    sorted_offsets,
+                    sorted_counts,
+                    tile_total,
+                    tile_experts,
+                    tile_starts,
+                    (const float *)weights->ptr,
+                    expert_in_dim,
+                    expert_mid_dim);
+            if (!cuda_ok(cudaGetLastError(),
+                         "Laguna Blackwell grouped NVFP4 gate/up MMA launch")) {
+                return 0;
+            }
+
+            for (uint32_t pair0 = 0u; pair0 < (uint32_t)pairs;) {
+                uint32_t chunk = (uint32_t)pairs - pair0;
+                if (chunk > 65535u) chunk = 65535u;
+                quantize_nvfp4_selected_f32_kernel
+                    <<<dim3(expert_mid_dim / 16u, chunk, 1u), 32>>>(
+                        mid4, mid4scale, (const float *)mid->ptr,
+                        (const int32_t *)selected->ptr,
+                        native_cache->down_input_global,
+                        expert_mid_dim, expert_mid_dim / 16u,
+                        n_total_expert, (uint32_t)pairs, n_expert,
+                        pair0, true);
+                if (!cuda_ok(cudaGetLastError(),
+                             "Laguna Blackwell NVFP4 mid quantize launch")) {
+                    return 0;
+                }
+                pair0 += chunk;
+            }
+
+            for (uint32_t row0 = 0u; row0 < out_dim;
+                 row0 += expert_mid_dim) {
+                uint32_t chunk_rows = out_dim - row0;
+                if (chunk_rows > expert_mid_dim)
+                    chunk_rows = expert_mid_dim;
+                const uint64_t down_warps =
+                    tile_capacity * (chunk_rows / 8u);
+                const uint64_t down_blocks =
+                    (down_warps + 7u) / 8u;
+                if (down_blocks > UINT32_MAX) return 0;
+                laguna_grouped_nvfp4_down_mma_kernel<<<
+                    (uint32_t)down_blocks, 256>>>(
+                        (float *)mid->ptr,
+                        native_cache->down_packed,
+                        native_cache->down_scale,
+                        down_scales,
+                        native_cache->down_input_global,
+                        mid4,
+                        mid4scale,
+                        sorted_pairs,
+                        sorted_offsets,
+                        sorted_counts,
+                        tile_total,
+                        tile_experts,
+                        tile_starts,
+                        expert_mid_dim,
+                        expert_mid_dim,
+                        row0,
+                        chunk_rows);
+                if (!cuda_ok(cudaGetLastError(),
+                             "Laguna Blackwell grouped NVFP4 down MMA launch")) {
+                    return 0;
+                }
+                const uint64_t reduce_values =
+                    (uint64_t)n_tokens * chunk_rows;
+                if (reduce_values >
+                    (uint64_t)UINT32_MAX * 256u) {
+                    return 0;
+                }
+                laguna_moe_down_chunk_reduce_kernel<<<
+                    (uint32_t)((reduce_values + 255u) / 256u), 256>>>(
+                        (float *)out->ptr,
+                        (const float *)mid->ptr,
+                        n_tokens,
+                        n_expert,
+                        out_dim,
+                        expert_mid_dim,
+                        row0,
+                        chunk_rows);
+                if (!cuda_ok(cudaGetLastError(),
+                             "Laguna Blackwell grouped NVFP4 down reduce launch")) {
+                    return 0;
+                }
+            }
+            return cuda_ok(cudaGetLastError(),
+                           "Laguna Blackwell grouped NVFP4 down MMA launch");
+        }
+#else
+        fprintf(stderr,
+                "ds4: this CUDA build has no native Blackwell NVFP4 MMA; "
+                "build with make cuda-spark\n");
+        return 0;
+#endif
+    }
+
+    /*
+     * SM120-family MMA has no GEMV-sized NVFP4 instruction: m16n8k64 would
+     * discard seven of eight columns for a single routed vector.  Keep the
+     * native integer-dot decode kernel for that shape; prompt batches above
+     * use the fully occupied grouped FP4 MMA path and have already returned.
+     */
+    const bool blackwell = native || cuda_laguna_blackwell_ok();
     const uint32_t lanes = blackwell ? 16u : 8u;
     const uint32_t rows_per_block = 256u / lanes;
     const uint64_t gate_blocks =

@@ -1,8 +1,36 @@
 diff --git a/Makefile b/Makefile
-index 81d4881..debc1e9 100644
+index 81d4881..e5cfda1 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -161,8 +161,9 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
+@@ -31,9 +31,17 @@ CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
+ CUDA_HOME ?= /usr/local/cuda
+ NVCC ?= $(CUDA_HOME)/bin/nvcc
+ CUDA_ARCH ?=
++CUDA_CODE ?=
++CUDA_NVFP4_MMA ?= 0
+ ifneq ($(strip $(CUDA_ARCH)),)
+ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
+ endif
++ifneq ($(strip $(CUDA_CODE)),)
++NVCC_ARCH_FLAGS += -code=$(CUDA_CODE)
++endif
++ifeq ($(CUDA_NVFP4_MMA),1)
++NVCC_ARCH_FLAGS += -DDS4_CUDA_NVFP4_MMA=1
++endif
+ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+ CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o
+ CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+@@ -114,7 +122,8 @@ help:
+ 	@echo "  make clean               Remove build outputs"
+ 
+ cuda-spark:
+-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
++	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
++		CUDA_ARCH=compute_121f CUDA_CODE=sm_121 CUDA_NVFP4_MMA=1
+ 
+ cuda-generic:
+ 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
+@@ -161,8 +170,9 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
  	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
  	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
  
@@ -13,7 +41,7 @@ index 81d4881..debc1e9 100644
  endif
  
  ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
-@@ -213,6 +214,9 @@ ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_ssd.h ds4_distrib
+@@ -213,6 +223,9 @@ ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_ssd.h ds4_distrib
  tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
  	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
  
@@ -23,7 +51,7 @@ index 81d4881..debc1e9 100644
  rax.o: rax.c rax.h rax_malloc.h
  	$(CC) $(CFLAGS) -c -o $@ rax.c
  
-@@ -258,6 +262,9 @@ ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
+@@ -258,6 +271,9 @@ ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
  tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
  	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
  
@@ -33,14 +61,14 @@ index 81d4881..debc1e9 100644
  tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
  	$(CC) $(CFLAGS) -I. -c -o $@ $<
  
-@@ -402,4 +409,4 @@ q4k-dot-test: tests/test_q4k_dot.c
+@@ -402,4 +418,4 @@ q4k-dot-test: tests/test_q4k_dot.c
  	./tests/test_q4k_dot
  
  clean:
 -	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 +	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_laguna_smoke
 diff --git a/README.md b/README.md
-index 7d9e5c7..d7fbc94 100644
+index 7d9e5c7..29f1ec7 100644
 --- a/README.md
 +++ b/README.md
 @@ -109,6 +109,7 @@ Download one main model. **Prefer the imatrix versions.**
@@ -68,7 +96,7 @@ index 7d9e5c7..d7fbc94 100644
  
  ```sh
  ./download_model.sh laguna-q4
-@@ -189,6 +190,51 @@ reasoning, and tagged tool-call formats:
+@@ -189,6 +190,57 @@ reasoning, and tagged tool-call formats:
  ./ds4-server -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
  ```
  
@@ -103,19 +131,25 @@ index 7d9e5c7..d7fbc94 100644
 +
 +```sh
 +./download_model.sh laguna-nvfp4
-+make cuda-spark       # GB10 / compute capability 12.x
-+# make cuda-generic   # portable CUDA path
++make cuda-spark       # GB10 / sm_121 Blackwell family target
 +./ds4 --cuda -m gguf/Laguna-S-2.1-NVFP4 -c 32768 \
 +  -p "Explain this repository"
 +```
 +
 +The CUDA implementation dynamically quantizes routed-expert activations to
-+E2M1 in groups of 16, applies the checkpoint's calibrated E4M3 and global
-+scales, and uses NVFP4-specific DP4A gate/up and down kernels. Compute
-+capability 12.x selects a wider Blackwell schedule; set
-+`DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4=1` to force the portable schedule for
-+comparison. NVFP4 support is raw-model only: DFlash, SSD
-+streaming, distributed inference, Metal, and ROCm are not part of this path.
++E2M1 in groups of 16 and applies the checkpoint's calibrated E4M3 and global
++scales. On prompt batches it sorts routes by expert and packs up to 16 routes
++by eight output channels into Blackwell's block-scaled
++`mma.sync.m16n8k64` FP4 instruction, reusing each expert weight tile across
++the batch. Decode uses the native W4A4 integer-dot kernel: GB10's FP4 MMA has
++no GEMV-sized form, so a single routed vector would discard seven of its eight
++output columns and is slower in practice.
++
++The official NVFP4 checkpoint is Blackwell-only in this backend and requires
++the family-specific `cuda-spark` build. Use the official Q4_K_M model with
++`cuda-generic` on pre-Blackwell cards. NVFP4 support is raw-model only:
++DFlash, SSD streaming, distributed inference, Metal, and ROCm are not part of
++this path.
 +
  The shipped GGUF is configured for a 262144-token context. Laguna defaults to
  temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options
@@ -283,7 +317,7 @@ index e52da5d..df0c619 100755
      cd "$ROOT"
      ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
 diff --git a/ds4.c b/ds4.c
-index 39b39be..a896caa 100644
+index 39b39be..18d97fd 100644
 --- a/ds4.c
 +++ b/ds4.c
 @@ -19,6 +19,7 @@
@@ -1072,7 +1106,23 @@ index 39b39be..a896caa 100644
      if (nspan == 0) {
          free(spans);
          if (prepared_out) *prepared_out = 0;
-@@ -3053,6 +3698,7 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
+@@ -3001,7 +3646,14 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
+     fflush(stderr);
+ 
+     for (uint64_t i = 0; i < nspan;) {
+-        uint64_t off = spans[i].off;
++        /*
++         * CUDA's range cache places each merged span at an aligned device
++         * address. Preserve the source offset's low bits as well: native
++         * NVFP4 fragment loads are 32-bit and a merged span can otherwise
++         * make an aligned safetensors payload appear unaligned on device.
++         */
++        const uint64_t preload_align = 256u;
++        uint64_t off = spans[i].off & ~(preload_align - 1u);
+         uint64_t end = spans[i].end;
+         i++;
+         while (i < nspan &&
+@@ -3053,6 +3705,7 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
                                           uint32_t span_count) {
      for (uint64_t i = 0; i < m->n_tensors; i++) {
          const ds4_tensor *t = &m->tensors[i];
@@ -1080,7 +1130,7 @@ index 39b39be..a896caa 100644
          if (t->bytes == 0) continue;
          if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
          if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
-@@ -4163,6 +4809,9 @@ typedef struct {
+@@ -4163,6 +4816,9 @@ typedef struct {
      ds4_tensor *ffn_gate_exps;
      ds4_tensor *ffn_up_exps;
      ds4_tensor *ffn_down_exps;
@@ -1090,7 +1140,7 @@ index 39b39be..a896caa 100644
      ds4_tensor *ffn_gate_shexp;
      ds4_tensor *ffn_up_shexp;
      ds4_tensor *ffn_down_shexp;
-@@ -4225,6 +4874,28 @@ typedef struct {
+@@ -4225,6 +4881,28 @@ typedef struct {
      ds4_dspark_stage_weights stage[DS4_DSPARK_MAX_STAGES];
  } ds4_dspark_weights;
  
@@ -1119,7 +1169,7 @@ index 39b39be..a896caa 100644
  /* =========================================================================
   * Fixed Weight Binding and Model Validation.
   * =========================================================================
-@@ -4449,7 +5120,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
+@@ -4449,7 +5127,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
             type == DS4_TENSOR_Q2_K ||
             type == DS4_TENSOR_Q4_K ||
             type == DS4_TENSOR_Q5_K ||
@@ -1129,7 +1179,7 @@ index 39b39be..a896caa 100644
  }
  
  static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
-@@ -4460,6 +5132,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
+@@ -4460,6 +5139,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
      case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
      case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
      case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
@@ -1137,7 +1187,7 @@ index 39b39be..a896caa 100644
      default:                 ds4_die("unsupported routed expert tensor type");
      }
      return 0;
-@@ -4850,14 +5523,20 @@ static bool weights_laguna_layer_has_required(const ds4_layer_weights *l, uint32
+@@ -4850,14 +5530,20 @@ static bool weights_laguna_layer_has_required(const ds4_layer_weights *l, uint32
      if (il < DS4_N_LEADING_DENSE) {
          return l->ffn_gate && l->ffn_up && l->ffn_down;
      }
@@ -1166,7 +1216,7 @@ index 39b39be..a896caa 100644
  }
  
  static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
-@@ -5035,22 +5714,41 @@ static void weights_validate_laguna_layout(
+@@ -5035,22 +5721,41 @@ static void weights_validate_laguna_layout(
          ds4_die("invalid layer range in Laguna weight layout validation");
      }
  
@@ -1213,7 +1263,7 @@ index 39b39be..a896caa 100644
                  tensor_type_name(layout_marker->type));
          exit(1);
      }
-@@ -5058,7 +5756,9 @@ static void weights_validate_laguna_layout(
+@@ -5058,7 +5763,9 @@ static void weights_validate_laguna_layout(
      if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
      if (w->token_embd) {
          tensor_expect_layout(w->token_embd,
@@ -1224,7 +1274,7 @@ index 39b39be..a896caa 100644
                               2, DS4_N_EMBD, DS4_N_VOCAB, 0);
      }
  
-@@ -5066,10 +5766,12 @@ static void weights_validate_laguna_layout(
+@@ -5066,10 +5773,12 @@ static void weights_validate_laguna_layout(
      if (require_output && !have_output) ds4_die("required output head tensors are missing");
      if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
      if (have_output) {
@@ -1239,7 +1289,7 @@ index 39b39be..a896caa 100644
                               2, DS4_N_EMBD, DS4_N_VOCAB, 0);
      }
  
-@@ -5083,10 +5785,10 @@ static void weights_validate_laguna_layout(
+@@ -5083,10 +5792,10 @@ static void weights_validate_laguna_layout(
          const uint64_t q_dim = (uint64_t)n_head * DS4_N_HEAD_DIM;
          const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
  
@@ -1252,7 +1302,7 @@ index 39b39be..a896caa 100644
          tensor_expect_layout(l->attn_q, attn_type,
                               2, DS4_N_EMBD, q_dim, 0);
          tensor_expect_layout(l->attn_k, attn_type,
-@@ -5095,54 +5797,83 @@ static void weights_validate_laguna_layout(
+@@ -5095,54 +5804,83 @@ static void weights_validate_laguna_layout(
                               2, DS4_N_EMBD, kv_dim, 0);
          tensor_expect_layout(l->attn_gate, attn_type,
                               2, DS4_N_EMBD, n_head, 0);
@@ -1352,7 +1402,7 @@ index 39b39be..a896caa 100644
              shared_down_type != DS4_TENSOR_Q4_K &&
              shared_down_type != DS4_TENSOR_Q6_K) {
              fprintf(stderr,
-@@ -5967,6 +6698,12 @@ static void config_validate_laguna_model(const ds4_model *m) {
+@@ -5967,6 +6705,12 @@ static void config_validate_laguna_model(const ds4_model *m) {
      memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
      memset(g_ds4_head_counts, 0, sizeof(g_ds4_head_counts));
  
@@ -1365,7 +1415,7 @@ index 39b39be..a896caa 100644
      const uint32_t n_layer = required_u32(m, "laguna.block_count");
      const uint64_t n_ctx = required_u64_compat(m, "laguna.context_length");
      const uint32_t n_embd = required_u32(m, "laguna.embedding_length");
-@@ -6069,6 +6806,10 @@ static void config_validate_laguna_model(const ds4_model *m) {
+@@ -6069,6 +6813,10 @@ static void config_validate_laguna_model(const ds4_model *m) {
  }
  
  static void config_validate_model(const ds4_model *m) {
@@ -1376,7 +1426,7 @@ index 39b39be..a896caa 100644
      ds4_str arch = {0};
      if (model_get_string(m, "general.architecture", &arch) && ds4_streq(arch, "glm-dsa")) {
          config_validate_glm_dsa_model(m);
-@@ -6123,6 +6864,12 @@ static void weights_bind_laguna_layer(ds4_layer_weights *l, const ds4_model *m,
+@@ -6123,6 +6871,12 @@ static void weights_bind_laguna_layer(ds4_layer_weights *l, const ds4_model *m,
      l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
      l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
      l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
@@ -1389,7 +1439,7 @@ index 39b39be..a896caa 100644
      l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
      l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
      l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
-@@ -6871,6 +7618,133 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
+@@ -6871,6 +7625,133 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
      mtp_weights_validate_layout(w);
  }
  
@@ -1523,7 +1573,7 @@ index 39b39be..a896caa 100644
  static ds4_tensor *dspark_bind_tensor(
          ds4_dspark_weights *dw,
          const ds4_model    *m,
-@@ -35686,6 +36560,9 @@ struct ds4_vocab {
+@@ -35686,6 +36567,9 @@ struct ds4_vocab {
      int dsml_id;
      str_i32_table token_to_id;
      str_i32_table merge_rank;
@@ -1533,7 +1583,7 @@ index 39b39be..a896caa 100644
  };
  
  /* Engine-side tensor-parallel state.  The transport context is owned by the
-@@ -35713,6 +36590,7 @@ struct ds4_engine {
+@@ -35713,6 +36597,7 @@ struct ds4_engine {
      ds4_weights weights;
      ds4_mtp_weights mtp_weights;
      ds4_dspark_weights dspark_weights;
@@ -1541,7 +1591,7 @@ index 39b39be..a896caa 100644
      ds4_backend backend;
      ds4_support_kind support_kind;
      int dspark_exec_tier;
-@@ -35748,6 +36626,7 @@ struct ds4_engine {
+@@ -35748,6 +36633,7 @@ struct ds4_engine {
      ds4_engine_tp_state tp;
      bool metal_ready;
      bool mtp_ready;
@@ -1549,7 +1599,7 @@ index 39b39be..a896caa 100644
      bool share_session_prefill_workspace;
  #ifndef DS4_NO_GPU
      bool shared_prefill_workspace_ready;
-@@ -36544,9 +37423,177 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
+@@ -36544,9 +37430,177 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
  
  /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
  
@@ -1727,7 +1777,7 @@ index 39b39be..a896caa 100644
      ds4_array_ref tokens;
      ds4_array_ref merges;
      if (!model_get_array(model, "tokenizer.ggml.tokens", &tokens) ||
-@@ -36653,6 +37700,13 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
+@@ -36653,6 +37707,13 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
  }
  
  static void vocab_free(ds4_vocab *vocab) {
@@ -1741,7 +1791,7 @@ index 39b39be..a896caa 100644
      free(vocab->token);
      table_free(&vocab->token_to_id);
      table_free(&vocab->merge_rank);
-@@ -47247,6 +48301,43 @@ static int generate_glm_metal_argmax(
+@@ -47247,6 +48308,43 @@ static int generate_glm_metal_argmax(
   * full-attention and sliding-window layers with different query geometry.
   * Keep this graph separate from DeepSeek's compressed-attention graph and
   * GLM's DSA graph so their mature scheduling paths remain untouched. */
@@ -1785,7 +1835,7 @@ index 39b39be..a896caa 100644
  typedef struct {
      uint32_t ctx_size;
      uint32_t prefill_cap;
-@@ -47284,6 +48375,10 @@ typedef struct {
+@@ -47284,6 +48382,10 @@ typedef struct {
      ds4_gpu_tensor *key_cache[DS4_MAX_LAYER];
      ds4_gpu_tensor *value_cache[DS4_MAX_LAYER];
      uint32_t cache_cap[DS4_MAX_LAYER];
@@ -1796,7 +1846,7 @@ index 39b39be..a896caa 100644
  } ds4_laguna_gpu_graph;
  
  static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
-@@ -47331,6 +48426,121 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
+@@ -47331,6 +48433,121 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
      memset(g, 0, sizeof(*g));
  }
  
@@ -1918,7 +1968,7 @@ index 39b39be..a896caa 100644
  static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
      if (!g || ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
          DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
-@@ -47414,7 +48624,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+@@ -47414,7 +48631,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
      }
  
      fprintf(stderr,
@@ -1927,7 +1977,7 @@ index 39b39be..a896caa 100644
              ctx_size,
              g->prefill_cap,
              (double)g->kv_bytes / 1073741824.0,
-@@ -47422,7 +48632,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+@@ -47422,7 +48639,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
      return true;
  
  fail:
@@ -1936,7 +1986,7 @@ index 39b39be..a896caa 100644
      laguna_graph_free(g);
      return false;
  }
-@@ -47444,6 +48654,26 @@ static bool laguna_graph_matmul(
+@@ -47444,6 +48661,26 @@ static bool laguna_graph_matmul(
                                           x,
                                           n_tokens) != 0;
      }
@@ -1963,7 +2013,7 @@ index 39b39be..a896caa 100644
      if (weight->type == DS4_TENSOR_Q6_K) {
          return ds4_gpu_matmul_q6_K_tensor(out,
                                            model->map,
-@@ -47465,10 +48695,90 @@ static bool laguna_graph_matmul(
+@@ -47465,10 +48702,90 @@ static bool laguna_graph_matmul(
                                         n_tokens) != 0;
  }
  
@@ -2054,7 +2104,7 @@ index 39b39be..a896caa 100644
          int                   token,
          uint32_t              pos,
          float                *logits_out) {
-@@ -47509,13 +48819,8 @@ static bool laguna_graph_forward_token(
+@@ -47509,13 +48826,8 @@ static bool laguna_graph_forward_token(
          const uint32_t rope_ctx = is_swa ?
              (uint32_t)DS4_CONTEXT_LENGTH : (uint32_t)DS4_ROPE_ORIG_CTX;
  
@@ -2070,7 +2120,7 @@ index 39b39be..a896caa 100644
          if (ok) {
              if (l->attn_q->type == DS4_TENSOR_F16) {
                  ok = ds4_gpu_laguna_qkvg_f16_tensor(
-@@ -47534,6 +48839,17 @@ static bool laguna_graph_forward_token(
+@@ -47534,6 +48846,17 @@ static bool laguna_graph_forward_token(
                          DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
                          n_head,
                          g->attn_norm) != 0;
@@ -2088,7 +2138,7 @@ index 39b39be..a896caa 100644
              } else {
                  ok = ds4_gpu_matmul_q8_0_pair_tensor(
                          g->q,
-@@ -47562,7 +48878,16 @@ static bool laguna_graph_forward_token(
+@@ -47562,7 +48885,16 @@ static bool laguna_graph_forward_token(
              }
          }
          if (ok) {
@@ -2106,7 +2156,7 @@ index 39b39be..a896caa 100644
                      g->q,
                      g->k,
                      model->map,
-@@ -47583,6 +48908,7 @@ static bool laguna_graph_forward_token(
+@@ -47583,6 +48915,7 @@ static bool laguna_graph_forward_token(
                      beta_fast,
                      beta_slow,
                      DS4_RMS_EPS) != 0;
@@ -2114,7 +2164,7 @@ index 39b39be..a896caa 100644
          }
          uint32_t key_count = pos + 1u;
          if (key_count > g->cache_cap[il]) key_count = g->cache_cap[il];
-@@ -47629,13 +48955,8 @@ static bool laguna_graph_forward_token(
+@@ -47629,13 +48962,8 @@ static bool laguna_graph_forward_token(
              }
          }
          if (ok) {
@@ -2130,7 +2180,7 @@ index 39b39be..a896caa 100644
          }
  
          if (ok && il < DS4_N_LEADING_DENSE) {
-@@ -47671,14 +48992,11 @@ static bool laguna_graph_forward_token(
+@@ -47671,14 +48999,11 @@ static bool laguna_graph_forward_token(
                                          DS4_N_EMBD) != 0;
              }
          } else if (ok) {
@@ -2150,7 +2200,7 @@ index 39b39be..a896caa 100644
              if (ok) {
                  ok = ds4_gpu_glm_router_select_tensor(
                          g->router_selected,
-@@ -47706,15 +49024,24 @@ static bool laguna_graph_forward_token(
+@@ -47706,15 +49031,24 @@ static bool laguna_graph_forward_token(
              const uint64_t down_expert_bytes =
                  l->ffn_down_exps->dim[1] * down_row_bytes;
              const uint64_t shared_gate_row_bytes =
@@ -2178,7 +2228,7 @@ index 39b39be..a896caa 100644
                  .gate_type = l->ffn_gate_exps->type,
                  .up_type = l->ffn_up_exps->type,
                  .down_type = l->ffn_down_exps->type,
-@@ -47724,11 +49051,20 @@ static bool laguna_graph_forward_token(
+@@ -47724,11 +49058,20 @@ static bool laguna_graph_forward_token(
                  .up_row_bytes = up_row_bytes,
                  .down_expert_bytes = down_expert_bytes,
                  .down_row_bytes = down_row_bytes,
@@ -2199,7 +2249,7 @@ index 39b39be..a896caa 100644
                  .gate_type = l->ffn_gate_shexp->type,
                  .up_type = l->ffn_up_shexp->type,
                  .down_type = l->ffn_down_shexp->type,
-@@ -47745,7 +49081,51 @@ static bool laguna_graph_forward_token(
+@@ -47745,7 +49088,51 @@ static bool laguna_graph_forward_token(
              /* The legacy recipe can co-dispatch routed and shared Q4 work.
               * The replacement keeps routed experts Q4 but makes the shared
               * expert Q8, so each uses its native fast kernel family. */
@@ -2252,7 +2302,7 @@ index 39b39be..a896caa 100644
                  ok = ds4_gpu_laguna_routed_shared_moe_one_tensor(
                          g->ffn_out,
                          g->routed_mid,
-@@ -47826,17 +49206,16 @@ static bool laguna_graph_forward_token(
+@@ -47826,17 +49213,16 @@ static bool laguna_graph_forward_token(
              ds4_gpu_tensor *tmp = g->cur;
              g->cur = g->next;
              g->next = tmp;
@@ -2276,7 +2326,7 @@ index 39b39be..a896caa 100644
          if (ok) {
              ok = laguna_graph_matmul(g->logits,
                                       model,
-@@ -47882,13 +49261,15 @@ static bool laguna_graph_forward_batch(
+@@ -47882,13 +49268,15 @@ static bool laguna_graph_forward_batch(
          ds4_laguna_gpu_graph *g,
          const ds4_model      *model,
          const ds4_weights    *weights,
@@ -2293,7 +2343,7 @@ index 39b39be..a896caa 100644
      if (!g || !model || !weights || !tokens || n_tokens == 0 ||
          n_tokens > g->prefill_cap || pos0 > g->ctx_size - n_tokens) {
          return false;
-@@ -47960,15 +49341,8 @@ static bool laguna_graph_forward_batch(
+@@ -47960,15 +49348,8 @@ static bool laguna_graph_forward_batch(
              (uint32_t)DS4_CONTEXT_LENGTH : (uint32_t)DS4_ROPE_ORIG_CTX;
  
          failed_stage = "attention norm";
@@ -2311,7 +2361,7 @@ index 39b39be..a896caa 100644
          if (ok) {
              failed_stage = "Q projection";
              ok = laguna_graph_matmul(g->q,
-@@ -48000,7 +49374,15 @@ static bool laguna_graph_forward_batch(
+@@ -48000,7 +49381,15 @@ static bool laguna_graph_forward_batch(
          }
          if (ok) {
              failed_stage = "Q norm/RoPE";
@@ -2328,7 +2378,7 @@ index 39b39be..a896caa 100644
                      g->q,
                      model->map,
                      model->size,
-@@ -48018,10 +49400,19 @@ static bool laguna_graph_forward_batch(
+@@ -48018,10 +49407,19 @@ static bool laguna_graph_forward_batch(
                      beta_fast,
                      beta_slow,
                      DS4_RMS_EPS) != 0;
@@ -2349,7 +2399,7 @@ index 39b39be..a896caa 100644
                      g->k,
                      model->map,
                      model->size,
-@@ -48039,6 +49430,7 @@ static bool laguna_graph_forward_batch(
+@@ -48039,6 +49437,7 @@ static bool laguna_graph_forward_batch(
                      beta_fast,
                      beta_slow,
                      DS4_RMS_EPS) != 0;
@@ -2357,7 +2407,7 @@ index 39b39be..a896caa 100644
          }
          if (ok) {
              failed_stage = "causal attention";
-@@ -48077,15 +49469,8 @@ static bool laguna_graph_forward_batch(
+@@ -48077,15 +49476,8 @@ static bool laguna_graph_forward_batch(
          }
          if (ok) {
              failed_stage = "FFN norm";
@@ -2375,7 +2425,7 @@ index 39b39be..a896caa 100644
          }
  
          if (ok && il < DS4_N_LEADING_DENSE) {
-@@ -48127,14 +49512,11 @@ static bool laguna_graph_forward_batch(
+@@ -48127,14 +49519,11 @@ static bool laguna_graph_forward_batch(
              }
          } else if (ok) {
              failed_stage = "router projection";
@@ -2395,7 +2445,7 @@ index 39b39be..a896caa 100644
              if (ok) {
                  failed_stage = "router selection";
                  ok = ds4_gpu_glm_router_select_batch_tensor(
-@@ -48165,35 +49547,79 @@ static bool laguna_graph_forward_batch(
+@@ -48165,35 +49554,79 @@ static bool laguna_graph_forward_batch(
                  l->ffn_down_exps->dim[1] * down_row_bytes;
              if (ok) {
                  failed_stage = "routed experts";
@@ -2504,7 +2554,7 @@ index 39b39be..a896caa 100644
              }
              if (ok) {
                  failed_stage = "shared expert gate/up";
-@@ -48242,6 +49668,10 @@ static bool laguna_graph_forward_batch(
+@@ -48242,6 +49675,10 @@ static bool laguna_graph_forward_batch(
              g->cur = g->next;
              g->next = tmp;
              completed_layers = il + 1u;
@@ -2515,7 +2565,7 @@ index 39b39be..a896caa 100644
          }
          if (ok && live_progress) {
              ok = ds4_gpu_end_commands() != 0;
-@@ -48274,6 +49704,39 @@ static bool laguna_graph_forward_batch(
+@@ -48274,6 +49711,39 @@ static bool laguna_graph_forward_batch(
      }
  
      ds4_gpu_tensor *last = NULL;
@@ -2555,7 +2605,7 @@ index 39b39be..a896caa 100644
      if (ok && logits_out) {
          last = ds4_gpu_tensor_view(
                  g->cur,
-@@ -48281,14 +49744,9 @@ static bool laguna_graph_forward_batch(
+@@ -48281,14 +49751,9 @@ static bool laguna_graph_forward_batch(
                  (uint64_t)DS4_N_EMBD * sizeof(float));
          ok = last != NULL;
          if (ok) {
@@ -2573,7 +2623,7 @@ index 39b39be..a896caa 100644
          }
          if (ok) {
              ok = laguna_graph_matmul(g->logits,
-@@ -48319,7 +49777,354 @@ static bool laguna_graph_forward_batch(
+@@ -48319,7 +49784,354 @@ static bool laguna_graph_forward_batch(
      return ok;
  }
  
@@ -2929,7 +2979,7 @@ index 39b39be..a896caa 100644
          const ds4_model   *model,
          const ds4_vocab   *vocab,
          const ds4_weights *weights,
-@@ -48346,6 +50151,7 @@ static int generate_laguna_metal_argmax(
+@@ -48346,6 +50158,7 @@ static int generate_laguna_metal_argmax(
          ok = laguna_graph_forward_batch(&g,
                                          model,
                                          weights,
@@ -2937,7 +2987,7 @@ index 39b39be..a896caa 100644
                                          prompt->v + i,
                                          n,
                                          (uint32_t)i,
-@@ -48353,7 +50159,8 @@ static int generate_laguna_metal_argmax(
+@@ -48353,7 +50166,8 @@ static int generate_laguna_metal_argmax(
                                              logits : NULL,
                                          NULL,
                                          NULL,
@@ -2947,7 +2997,7 @@ index 39b39be..a896caa 100644
          i += (int)n;
          if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
      }
-@@ -48373,7 +50180,8 @@ static int generate_laguna_metal_argmax(
+@@ -48373,7 +50187,8 @@ static int generate_laguna_metal_argmax(
          if (emit) emit(emit_ud, token);
          generated++;
          if (i + 1 == n_predict || pos + 1u >= (uint32_t)ctx_size) break;
@@ -2957,7 +3007,7 @@ index 39b39be..a896caa 100644
          pos++;
      }
      const double decode_t1 = now_sec();
-@@ -48459,17 +50267,17 @@ static int generate_metal_graph_raw_swa(
+@@ -48459,17 +50274,17 @@ static int generate_metal_graph_raw_swa(
                                           progress_ud);
      }
      if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
@@ -2986,7 +3036,7 @@ index 39b39be..a896caa 100644
      }
  
      const uint32_t prefill_cap =
-@@ -49274,6 +51082,8 @@ struct ds4_session {
+@@ -49274,6 +51089,8 @@ struct ds4_session {
      bool glm_graph_ready;
      ds4_laguna_gpu_graph laguna_graph;
      bool laguna_graph_ready;
@@ -2995,7 +3045,7 @@ index 39b39be..a896caa 100644
      uint32_t glm_dense_cache_len;
      /* GLM MTP speculative state (--glm-mtp, greedy only). */
      int glm_mtp_draft;
-@@ -51080,6 +52890,7 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
+@@ -51080,6 +52897,7 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
          return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
      }
      if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
@@ -3003,7 +3053,7 @@ index 39b39be..a896caa 100644
  #ifndef DS4_NO_GPU
      if (e &&
          e->backend != DS4_BACKEND_CPU &&
-@@ -57480,9 +59291,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57480,9 +59298,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
              *out = e;
              return 0;
          }
@@ -3016,7 +3066,7 @@ index 39b39be..a896caa 100644
              ds4_engine_close(e);
              *out = NULL;
              return 1;
-@@ -57509,12 +59321,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57509,12 +59328,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
              opt->directional_steering_ffn != 0.0f ||
              e->power_percent < 100 ||
              opt->prefill_chunk != 0 ||
@@ -3031,7 +3081,7 @@ index 39b39be..a896caa 100644
              ds4_engine_close(e);
              *out = NULL;
              return 1;
-@@ -57770,10 +59581,34 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57770,10 +59588,34 @@ static int ds4_engine_open_internal(ds4_engine **out,
                      e->dspark_weights.missing_tensors,
                      e->dspark_weights.invalid_tensors,
                      e->dspark_weights.metadata_errors);
@@ -3067,7 +3117,7 @@ index 39b39be..a896caa 100644
                      opt->mtp_path,
                      support_kind_name(e->support_kind));
              ds4_engine_close(e);
-@@ -57867,6 +59702,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57867,6 +59709,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
          }
          ds4_gpu_set_quality(e->quality);
          ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
@@ -3078,7 +3128,7 @@ index 39b39be..a896caa 100644
          ds4_gpu_set_ssd_streaming(e->ssd_streaming);
          if (!ds4_engine_configure_streaming_auto_cache(e)) {
              ds4_engine_close(e);
-@@ -58129,6 +59968,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -58129,6 +59975,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
          }
          const bool support_model_runtime_ready =
              e->mtp_ready ||
@@ -3086,7 +3136,7 @@ index 39b39be..a896caa 100644
              (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
          if (support_model_runtime_ready &&
              !ds4_gpu_set_model_map_range(e->mtp_model.map,
-@@ -58708,7 +60548,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+@@ -58708,7 +60555,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
              return 1;
          }
          s->laguna_graph_ready = true;
@@ -3110,7 +3160,7 @@ index 39b39be..a896caa 100644
          s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
          s->sample_probs =
              xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
-@@ -59001,6 +60856,7 @@ void ds4_session_free(ds4_session *s) {
+@@ -59001,6 +60863,7 @@ void ds4_session_free(ds4_session *s) {
  #ifndef DS4_NO_GPU
      else {
          if (ds4_session_is_laguna(s)) {
@@ -3118,7 +3168,7 @@ index 39b39be..a896caa 100644
              laguna_graph_free(&s->laguna_graph);
          } else if (ds4_session_is_glm(s)) {
              glm_graph_free(&s->glm_graph);
-@@ -60130,19 +61986,24 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
+@@ -60130,19 +61993,24 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                  laguna_graph_forward_token(&s->laguna_graph,
                                             &e->model,
                                             &e->weights,
@@ -3144,7 +3194,7 @@ index 39b39be..a896caa 100644
              if (!ok) {
                  snprintf(err, errlen,
                           "%s Laguna prefill failed at token %d",
-@@ -60151,6 +62012,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
+@@ -60151,6 +62019,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                  s->checkpoint_valid = false;
                  return 1;
              }
@@ -3164,7 +3214,7 @@ index 39b39be..a896caa 100644
              for (uint32_t j = 0; j < n; j++) {
                  token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
              }
-@@ -61698,6 +63572,8 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
+@@ -61698,6 +63579,8 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
      case DS4_SUPPORT_DSPARK:
          (void)ds4_session_prepare_dspark_draft(s, token, pos);
          break;
@@ -3173,7 +3223,7 @@ index 39b39be..a896caa 100644
      case DS4_SUPPORT_NONE:
      default:
          break;
-@@ -61758,13 +63634,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -61758,13 +63641,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
          }
          if ((uint32_t)s->checkpoint.len >= s->laguna_graph.ctx_size) {
              if (errlen) snprintf(err, errlen,
@@ -3190,7 +3240,7 @@ index 39b39be..a896caa 100644
                                          token,
                                          (uint32_t)s->checkpoint.len,
                                          s->logits)) {
-@@ -61773,6 +63651,18 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -61773,6 +63658,18 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
              s->checkpoint_valid = false;
              return 1;
          }
@@ -3209,7 +3259,7 @@ index 39b39be..a896caa 100644
          token_vec_push(&s->checkpoint, token);
          s->checkpoint_valid = true;
          s->mtp_draft_valid = false;
-@@ -66135,6 +68025,136 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
+@@ -66135,6 +68032,136 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
      return rc;
  }
  
@@ -3346,7 +3396,7 @@ index 39b39be..a896caa 100644
  int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                          int max_tokens, int eos_token,
                                          int *accepted, int accepted_cap,
-@@ -66191,6 +68211,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+@@ -66191,6 +68218,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      return -1;
  #else
      ds4_engine *e = s->engine;
@@ -3501,7 +3551,7 @@ index 4b2b0d3..5217fa3 100644
                  "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                  frontier,
 diff --git a/ds4_cuda.cu b/ds4_cuda.cu
-index e66fa36..889553f 100644
+index e66fa36..f524694 100644
 --- a/ds4_cuda.cu
 +++ b/ds4_cuda.cu
 @@ -1,5 +1,7 @@
@@ -3581,7 +3631,7 @@ index e66fa36..889553f 100644
  
  typedef struct {
      int valid;
-@@ -225,6 +275,24 @@ static int cuda_q4_mma_ok(void) {
+@@ -225,6 +275,39 @@ static int cuda_q4_mma_ok(void) {
      return cached;
  }
  
@@ -3603,10 +3653,25 @@ index e66fa36..889553f 100644
 +    return cached;
 +}
 +
++#if defined(DS4_CUDA_NVFP4_MMA)
++static int cuda_laguna_nvfp4_hw_ok(void) {
++    static int cached = -1;
++    if (cached < 0) {
++        int dev = 0;
++        int major = 0;
++        cudaGetDevice(&dev);
++        cudaDeviceGetAttribute(
++            &major, cudaDevAttrComputeCapabilityMajor, dev);
++        cached = major >= 12 ? 1 : 0;
++    }
++    return cached;
++}
++#endif
++
  
  
  
-@@ -413,6 +481,30 @@ static cudaEvent_t g_stream_selected_stage_event[4];
+@@ -413,6 +496,30 @@ static cudaEvent_t g_stream_selected_stage_event[4];
  static uint64_t g_stream_selected_stage_bytes;
  static cudaStream_t g_stream_selected_upload_stream;
  
@@ -3637,7 +3702,7 @@ index e66fa36..889553f 100644
  static int cuda_ok(cudaError_t err, const char *what);
  static const char *cuda_model_range_ptr_from_fd(
          const void *model_map,
-@@ -998,6 +1090,16 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
+@@ -998,6 +1105,16 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
      if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
      if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
      if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
@@ -3654,7 +3719,7 @@ index e66fa36..889553f 100644
      if (!label) return 0;
      if (strstr(label, "attn_output_a") != NULL ||
          strstr(label, "attn_output_b") != NULL ||
-@@ -2261,6 +2363,7 @@ extern "C" void ds4_gpu_cleanup(void) {
+@@ -2261,6 +2378,7 @@ extern "C" void ds4_gpu_cleanup(void) {
          }
      }
      cuda_stream_selected_cache_release();
@@ -3662,7 +3727,7 @@ index e66fa36..889553f 100644
      cuda_stream_selected_stage_release();
      g_n_gpus = 0;
      g_cublas_ready = 0;
-@@ -3125,6 +3228,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
+@@ -3125,6 +3243,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
      if (!model_map || model_size == 0) return 0;
      if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
      cuda_stream_selected_cache_release();
@@ -3670,7 +3735,7 @@ index e66fa36..889553f 100644
      cuda_model_range_release_all();
      cuda_q8_f16_cache_release_all();
      g_q8_f16_disabled_after_oom = 0;
-@@ -3222,6 +3326,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
+@@ -3222,6 +3341,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
      if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
  
      cuda_stream_selected_cache_release();
@@ -3678,7 +3743,7 @@ index e66fa36..889553f 100644
      cuda_model_range_release_all();
      cuda_q8_f16_cache_release_all();
      g_q8_f16_disabled_after_oom = 0;
-@@ -3900,6 +4005,33 @@ __global__ static void matmul_f16_kernel(
+@@ -3900,6 +4020,33 @@ __global__ static void matmul_f16_kernel(
      if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
  }
  
@@ -3712,7 +3777,7 @@ index e66fa36..889553f 100644
  __global__ static void matmul_f16_serial_kernel(
          float *out,
          const __half *w,
-@@ -4140,6 +4272,71 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
+@@ -4140,6 +4287,71 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
      if (i < n) out[i] = __float2half(x[i]);
  }
  
@@ -3784,7 +3849,7 @@ index e66fa36..889553f 100644
  __device__ static float warp_sum_f32(float v) {
      for (int offset = 16; offset > 0; offset >>= 1) {
          v += __shfl_down_sync(0xffffffffu, v, offset);
-@@ -5722,6 +5919,31 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const
+@@ -5722,6 +5934,31 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const
      }
  }
  
@@ -3816,7 +3881,7 @@ index e66fa36..889553f 100644
  __global__ static void dsv4_qkv_rms_norm_rows_kernel(
          float *q_out,
          const float *q,
-@@ -12159,8 +12381,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
+@@ -12159,8 +12396,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
               * operation through the native Q8 kernels below. */
          }
      }
@@ -3831,7 +3896,7 @@ index e66fa36..889553f 100644
          /* Streaming dequant + f16 GEMM: the exact-q8 batched kernels only
           * cover blocks <= 32 (DS4 TP shard widths); the per-token fallback
           * re-reads the full weight per token (~30x the bytes at GLM dims).
-@@ -13163,6 +13389,137 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
+@@ -13163,6 +13404,137 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
      return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
  }
  
@@ -3969,7 +4034,7 @@ index e66fa36..889553f 100644
  extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
          ds4_gpu_tensor *out,
          const void *model_map,
-@@ -13691,6 +14048,29 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
+@@ -13691,6 +14063,29 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
      rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
      return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
  }
@@ -3999,7 +4064,7 @@ index e66fa36..889553f 100644
  extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
          ds4_gpu_tensor       *q_out,
          const ds4_gpu_tensor *q,
-@@ -16387,6 +16767,58 @@ __device__ static void dev_q4_K_get_scale_min(
+@@ -16387,6 +16782,58 @@ __device__ static void dev_q4_K_get_scale_min(
      }
  }
  
@@ -4058,7 +4123,7 @@ index e66fa36..889553f 100644
  __device__ __forceinline__ static int32_t dev_dot_q4_32(const uint8_t *qs, const int8_t *q8, int shift) {
      int32_t sum = 0;
      #pragma unroll
-@@ -16414,6 +16846,17 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const
+@@ -16414,6 +16861,17 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const
      return y->d * xd * (float)isum - y->d * xmin * (float)summs;
  }
  
@@ -4076,7 +4141,7 @@ index e66fa36..889553f 100644
  /* Vector-load variant of dev_dot_q4_K_q8_K_block: loads the whole 144-byte
   * Q4_K block with nine 16B loads (requires a 16B-aligned tensor base; block
   * stride 144 and row strides are 16B multiples), then computes the exact same
-@@ -23237,6 +23680,36 @@ __global__ static void glm_embed_token_q8_0_kernel(
+@@ -23237,6 +23695,36 @@ __global__ static void glm_embed_token_q8_0_kernel(
      out[d] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
  }
  
@@ -4113,7 +4178,7 @@ index e66fa36..889553f 100644
  extern "C" int ds4_gpu_embed_token_quant_tensor(
          ds4_gpu_tensor *out,
          const void       *model_map,
-@@ -23250,12 +23723,19 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
+@@ -23250,12 +23738,19 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
          token >= n_vocab) {
          return 0;
      }
@@ -4135,7 +4200,7 @@ index e66fa36..889553f 100644
      if (weight_offset > model_size ||
          (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
          out->bytes < (uint64_t)n_embd * sizeof(float)) {
-@@ -23266,6 +23746,32 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
+@@ -23266,6 +23761,32 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
              model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
              logical_tier, "glm_token_embd");
      if (!w) return 0;
@@ -4168,7 +4233,7 @@ index e66fa36..889553f 100644
      glm_embed_token_q8_0_kernel<<<(n_embd + 255) / 256, 256>>>(
              (float *)out->ptr, w, token, n_embd);
      return cuda_ok(cudaGetLastError(), "glm embed token launch");
-@@ -23289,6 +23795,53 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
+@@ -23289,6 +23810,53 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
      out[gid] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
  }
  
@@ -4222,7 +4287,7 @@ index e66fa36..889553f 100644
  extern "C" int ds4_gpu_embed_tokens_quant_tensor(
          ds4_gpu_tensor       *out,
          const ds4_gpu_tensor *tokens,
-@@ -23303,12 +23856,19 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
+@@ -23303,12 +23871,19 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
          (n_embd & 31u) != 0u) {
          return 0;
      }
@@ -4244,7 +4309,7 @@ index e66fa36..889553f 100644
      if (weight_offset > model_size ||
          (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
          out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
-@@ -23321,10 +23881,40 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
+@@ -23321,10 +23896,40 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
              logical_tier, "glm_token_embd");
      if (!w) return 0;
      uint64_t n = (uint64_t)n_tokens * n_embd;
@@ -4288,7 +4353,7 @@ index e66fa36..889553f 100644
      return cuda_ok(cudaGetLastError(), "glm embed tokens launch");
  }
  
-@@ -25895,6 +26485,22 @@ static int glm_routed_moe_finish_batch(
+@@ -25895,6 +26500,22 @@ static int glm_routed_moe_finish_batch(
                     "glm routed moe local output copy");
  }
  
@@ -4311,7 +4376,7 @@ index e66fa36..889553f 100644
  extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
          ds4_gpu_tensor       *out,
          ds4_gpu_tensor       *mid,
-@@ -25922,8 +26528,38 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
+@@ -25922,8 +26543,38 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
          uint32_t                layer_index,
          const ds4_gpu_tensor *x,
          uint32_t                n_tokens,
@@ -4352,7 +4417,7 @@ index e66fa36..889553f 100644
      if (!out || !mid || !x || !selected || !weights || !model_map ||
          n_tokens == 0 || n_expert == 0 ||
          (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
-@@ -26285,7 +26921,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
+@@ -26285,7 +26936,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
              down_expert_bytes, down_row_bytes,
              expert_in_dim, expert_mid_dim, out_dim,
              selected, weights, n_total_expert, n_expert, layer_index,
@@ -4361,7 +4426,7 @@ index e66fa36..889553f 100644
  }
  
  /* Parallel router select: 256 threads compute sigmoid probs, then top-k
-@@ -26862,20 +27498,277 @@ extern "C" int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
+@@ -26862,36 +27513,293 @@ extern "C" int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
      return cuda_ok(cudaGetLastError(), "glm value project launch");
  }
  
@@ -4372,6 +4437,29 @@ index e66fa36..889553f 100644
 -        const void *model_map, uint64_t model_size, uint64_t weight_offset,
 -        uint32_t weight_type, uint64_t in_dim, uint64_t out_dim,
 -        const ds4_gpu_tensor *x, uint64_t n_tok);
+-
+-extern "C" int ds4_gpu_matmul_quant_decode_mpp_model_view_tensor(
+-        ds4_gpu_tensor       *out,
+-        const void             *model_map,
+-        uint64_t                model_size,
+-        uint64_t                weight_offset,
+-        uint32_t                weight_type,
+-        uint64_t                in_dim,
+-        uint64_t                out_dim,
+-        const ds4_gpu_tensor *x,
+-        uint64_t                n_tok) {
+-    return ds4_gpu_matmul_quant_tensor(out, model_map, model_size,
+-                                       weight_offset, weight_type,
+-                                       in_dim, out_dim, x, n_tok);
+-}
+-
+-extern "C" int ds4_gpu_matmul_quant_rows_scalar_tensor(
+-        ds4_gpu_tensor       *out,
+-        const void             *model_map,
+-        uint64_t                model_size,
+-        uint64_t                weight_offset,
+-        uint32_t                weight_type,
+-        uint64_t                in_dim,
 +template <uint32_t TOKEN_TILE>
 +__global__ static void laguna_matmul_q4_K_f32_kernel(
 +        float *out,
@@ -4420,13 +4508,7 @@ index e66fa36..889553f 100644
 +        }
 +    }
 +}
- 
--extern "C" int ds4_gpu_matmul_quant_decode_mpp_model_view_tensor(
--        ds4_gpu_tensor       *out,
--        const void             *model_map,
--        uint64_t                model_size,
--        uint64_t                weight_offset,
--        uint32_t                weight_type,
++
 +template <uint32_t TOKEN_TILE>
 +__global__ static void laguna_matmul_q6_K_f32_kernel(
 +        float *out,
@@ -4649,10 +4731,26 @@ index e66fa36..889553f 100644
 +        uint64_t                model_size,
 +        uint64_t                weight_offset,
 +        uint32_t                weight_type,
-         uint64_t                in_dim,
++        uint64_t                in_dim,
++        uint64_t                out_dim,
++        const ds4_gpu_tensor *x,
++        uint64_t                n_tok) {
++    return ds4_gpu_matmul_quant_tensor(out, model_map, model_size,
++                                       weight_offset, weight_type,
++                                       in_dim, out_dim, x, n_tok);
++}
++
++extern "C" int ds4_gpu_matmul_quant_rows_scalar_tensor(
++        ds4_gpu_tensor       *out,
++        const void             *model_map,
++        uint64_t                model_size,
++        uint64_t                weight_offset,
++        uint32_t                weight_type,
++        uint64_t                in_dim,
          uint64_t                out_dim,
          const ds4_gpu_tensor *x,
-@@ -26918,6 +27811,11 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
+         uint64_t                n_tok) {
+@@ -26918,6 +27826,11 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
          return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                           weight_offset, in_dim, out_dim,
                                           x, n_tok);
@@ -4664,7 +4762,7 @@ index e66fa36..889553f 100644
      default:
          fprintf(stderr, "ds4: matmul_quant: unsupported type %u\n",
                  weight_type);
-@@ -27375,6 +28273,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
+@@ -27375,6 +28288,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
      (void)enabled;
  }
  
@@ -4675,7 +4773,7 @@ index e66fa36..889553f 100644
  extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
      g_ssd_streaming_mode = enabled ? 1 : 0;
      cuda_stream_selected_cache_invalidate();
-@@ -27668,114 +28570,2454 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+@@ -27668,100 +28585,3110 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
      return 0;
  }
  
@@ -5143,21 +5241,8 @@ index e66fa36..889553f 100644
 +        gate_value : log1pf(expf(gate_value));
 +    out[((uint64_t)token * n_head + head) * head_dim + d] =
 +        acc * (score_sum > 0.0f ? 1.0f / score_sum : 0.0f) * gate_scale;
- }
- 
--extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
--        ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
--        ds4_gpu_tensor *value_cache, ds4_gpu_tensor *staged_key,
--        ds4_gpu_tensor *staged_value, const ds4_gpu_tensor *q,
--        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
--        const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
--        uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
--        uint32_t head_dim, float scale) {
--    (void)heads; (void)key_cache; (void)value_cache; (void)staged_key;
--    (void)staged_value; (void)q; (void)k; (void)v; (void)gate;
--    (void)pos0; (void)n_tokens; (void)cache_cap; (void)n_head;
--    (void)n_head_kv; (void)head_dim; (void)scale;
--    return 0;
++}
++
 +/* Evaluate every query head that shares one KV head in the same block. Each
 + * head keeps the original 128-thread reduction tree and causal key order, but
 + * the shared K/V row is fetched once instead of three or six times. */
@@ -5441,6 +5526,553 @@ index e66fa36..889553f 100644
 +           dev_nvfp4_ue4m3_to_f32(weight_scale) *
 +           dev_nvfp4_ue4m3_to_f32(activation_scale);
 +}
++
++/*
++ * Blackwell GeForce/GB10 exposes NVFP4 through the SM120-family warp MMA:
++ * 16 output rows x 8 routed columns x 64 reduction values.  Laguna's official
++ * weights and dynamically quantized activations already use the instruction's
++ * adjacent E2M1 packing and four UE4M3 scales per K=64 tile, so the operands
++ * can be loaded directly into fragments without dequantizing or repacking.
++ *
++ * The family-specific target is deliberate. Generic sm_12x code cannot issue
++ * block-scaled MMA and pre-Blackwell devices should use Laguna Q4_K_M.
++ */
++#if defined(DS4_CUDA_NVFP4_MMA)
++__device__ __forceinline__ static void laguna_nvfp4_mma_m16n8k64(
++        float &d0, float &d1, float &d2, float &d3,
++        uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++        uint32_t b0, uint32_t b1,
++        uint32_t scale_a, uint32_t scale_b) {
++    asm volatile(
++        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale."
++        "scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
++        "{%0, %1, %2, %3}, "
++        "{%4, %5, %6, %7}, "
++        "{%8, %9}, "
++        "{%0, %1, %2, %3}, "
++        "%10, {0, 0}, %11, {0, 0};\n"
++        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
++        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
++          "r"(b0), "r"(b1), "r"(scale_a), "r"(scale_b));
++}
++
++__device__ __forceinline__ static uint32_t laguna_nvfp4_load_u32(
++        const uint8_t *p) {
++    return *(const uint32_t *)p;
++}
++
++__device__ __forceinline__ static void laguna_nvfp4_load_weight_fragment(
++        const uint8_t *packed,
++        uint32_t row_stride,
++        uint32_t scale_stride,
++        const uint8_t *scales,
++        uint32_t row0,
++        uint32_t k0,
++        uint32_t lane,
++        uint32_t &a0,
++        uint32_t &a1,
++        uint32_t &a2,
++        uint32_t &a3,
++        uint32_t &scale_a) {
++    const uint32_t group = lane >> 2u;
++    const uint32_t tid = lane & 3u;
++    const uint32_t row_lo = row0 + group;
++    const uint32_t row_hi = row_lo + 8u;
++    const uint32_t byte0 = k0 / 2u + tid * 4u;
++    const uint32_t byte1 = byte0 + 16u;
++    a0 = laguna_nvfp4_load_u32(
++        packed + (uint64_t)row_lo * row_stride + byte0);
++    a1 = laguna_nvfp4_load_u32(
++        packed + (uint64_t)row_hi * row_stride + byte0);
++    a2 = laguna_nvfp4_load_u32(
++        packed + (uint64_t)row_lo * row_stride + byte1);
++    a3 = laguna_nvfp4_load_u32(
++        packed + (uint64_t)row_hi * row_stride + byte1);
++
++    /*
++     * Selector thread-id-a=0 consumes the lower thread pair in each quad:
++     * tid 0 supplies the four scales for row_lo and tid 1 for row_hi.
++     */
++    scale_a = 0u;
++    if (tid < 2u) {
++        const uint32_t row = tid == 0u ? row_lo : row_hi;
++        scale_a = laguna_nvfp4_load_u32(
++            scales + (uint64_t)row * scale_stride + k0 / 16u);
++    }
++}
++
++__device__ __forceinline__ static void laguna_nvfp4_load_vector_fragment(
++        const uint8_t *packed,
++        const uint8_t *scales,
++        uint32_t k0,
++        uint32_t lane,
++        uint32_t &b0,
++        uint32_t &b1,
++        uint32_t &scale_b) {
++    const uint32_t group = lane >> 2u;
++    const uint32_t tid = lane & 3u;
++    b0 = 0u;
++    b1 = 0u;
++    scale_b = 0u;
++    if (group == 0u) {
++        const uint32_t byte0 = k0 / 2u + tid * 4u;
++        b0 = laguna_nvfp4_load_u32(packed + byte0);
++        b1 = laguna_nvfp4_load_u32(packed + byte0 + 16u);
++        /* thread-id-b=0 consumes tid 0 from the column's quad. */
++        if (tid == 0u)
++            scale_b = laguna_nvfp4_load_u32(scales + k0 / 16u);
++    }
++}
++
++__device__ __forceinline__ static void laguna_nvfp4_load_grouped_activation(
++        const uint8_t *packed,
++        const uint8_t *scales,
++        const uint32_t *sorted_pairs,
++        uint32_t sorted_offset,
++        uint32_t local_start,
++        uint32_t pair_count,
++        uint32_t packed_row,
++        uint32_t scale_row,
++        uint32_t k0,
++        uint32_t lane,
++        uint32_t &a0,
++        uint32_t &a1,
++        uint32_t &a2,
++        uint32_t &a3,
++        uint32_t &scale_a) {
++    const uint32_t group = lane >> 2u;
++    const uint32_t tid = lane & 3u;
++    const uint32_t local_lo = local_start + group;
++    const uint32_t local_hi = local_lo + 8u;
++    const bool valid_lo = local_lo < pair_count;
++    const bool valid_hi = local_hi < pair_count;
++    const uint32_t pair_lo =
++        valid_lo ? sorted_pairs[sorted_offset + local_lo] : 0u;
++    const uint32_t pair_hi =
++        valid_hi ? sorted_pairs[sorted_offset + local_hi] : 0u;
++    const uint32_t byte0 = k0 / 2u + tid * 4u;
++    const uint32_t byte1 = byte0 + 16u;
++    a0 = valid_lo ? laguna_nvfp4_load_u32(
++        packed + (uint64_t)pair_lo * packed_row + byte0) : 0u;
++    a1 = valid_hi ? laguna_nvfp4_load_u32(
++        packed + (uint64_t)pair_hi * packed_row + byte0) : 0u;
++    a2 = valid_lo ? laguna_nvfp4_load_u32(
++        packed + (uint64_t)pair_lo * packed_row + byte1) : 0u;
++    a3 = valid_hi ? laguna_nvfp4_load_u32(
++        packed + (uint64_t)pair_hi * packed_row + byte1) : 0u;
++    scale_a = 0u;
++    if (tid == 0u && valid_lo) {
++        scale_a = laguna_nvfp4_load_u32(
++            scales + (uint64_t)pair_lo * scale_row + k0 / 16u);
++    } else if (tid == 1u && valid_hi) {
++        scale_a = laguna_nvfp4_load_u32(
++            scales + (uint64_t)pair_hi * scale_row + k0 / 16u);
++    }
++}
++
++__device__ __forceinline__ static void laguna_nvfp4_load_grouped_weight(
++        const uint8_t *packed,
++        const uint8_t *scales,
++        uint32_t packed_row,
++        uint32_t scale_row,
++        uint32_t col0,
++        uint32_t k0,
++        uint32_t lane,
++        uint32_t &b0,
++        uint32_t &b1,
++        uint32_t &scale_b) {
++    const uint32_t col = col0 + (lane >> 2u);
++    const uint32_t tid = lane & 3u;
++    const uint32_t byte0 = k0 / 2u + tid * 4u;
++    b0 = laguna_nvfp4_load_u32(
++        packed + (uint64_t)col * packed_row + byte0);
++    b1 = laguna_nvfp4_load_u32(
++        packed + (uint64_t)col * packed_row + byte0 + 16u);
++    scale_b = tid == 0u ? laguna_nvfp4_load_u32(
++        scales + (uint64_t)col * scale_row + k0 / 16u) : 0u;
++}
++
++/*
++ * Prefill groups up to sixteen routes for the same expert into MMA's M
++ * dimension and computes eight output channels in N.  Unlike the decode
++ * kernel's unavoidable GEMV shape, this consumes the complete 16x8 result
++ * tile and reuses each expert weight fragment across sixteen prompt tokens.
++ */
++__global__ static void laguna_grouped_nvfp4_gate_up_mma_kernel(
++        float *mid,
++        const uint8_t *const *gate_packed,
++        const uint8_t *const *gate_scale,
++        const uint8_t *const *up_packed,
++        const uint8_t *const *up_scale,
++        const float *gate_global,
++        const float *up_global,
++        const float *input_global,
++        const uint8_t *x4,
++        const uint8_t *x4scale,
++        const uint32_t *sorted_pairs,
++        const uint32_t *offsets,
++        const uint32_t *counts,
++        const uint32_t *tile_total,
++        const uint32_t *tile_experts,
++        const uint32_t *tile_starts,
++        const float *router_weights,
++        uint32_t expert_in_dim,
++        uint32_t expert_mid_dim) {
++    const uint32_t warp_in_block = threadIdx.x >> 5u;
++    const uint32_t lane = threadIdx.x & 31u;
++    const uint64_t warp =
++        (uint64_t)blockIdx.x * (blockDim.x / 32u) + warp_in_block;
++    const uint32_t col_tiles = expert_mid_dim / 8u;
++    const uint32_t tile = (uint32_t)(warp / col_tiles);
++    if (tile >= *tile_total) return;
++    const uint32_t col0 =
++        (uint32_t)(warp - (uint64_t)tile * col_tiles) * 8u;
++    const uint32_t expert = tile_experts[tile];
++    const uint32_t local_start = tile_starts[tile];
++    const uint32_t pair_count = counts[expert];
++    const uint32_t sorted_offset = offsets[expert];
++    const uint32_t packed_row = expert_in_dim / 2u;
++    const uint32_t scale_row = expert_in_dim / 16u;
++
++    float gd[4][4] = {};
++    float ud[4][4] = {};
++    for (uint32_t kbase = 0u; kbase < expert_in_dim; kbase += 256u) {
++#pragma unroll
++        for (uint32_t stage = 0u; stage < 4u; stage++) {
++            const uint32_t k0 = kbase + stage * 64u;
++            uint32_t a0, a1, a2, a3, sa;
++            uint32_t gb0, gb1, gsb;
++            uint32_t ub0, ub1, usb;
++            laguna_nvfp4_load_grouped_activation(
++                x4, x4scale, sorted_pairs, sorted_offset, local_start,
++                pair_count, packed_row, scale_row, k0, lane,
++                a0, a1, a2, a3, sa);
++            laguna_nvfp4_load_grouped_weight(
++                gate_packed[expert], gate_scale[expert],
++                packed_row, scale_row, col0, k0, lane,
++                gb0, gb1, gsb);
++            laguna_nvfp4_load_grouped_weight(
++                up_packed[expert], up_scale[expert],
++                packed_row, scale_row, col0, k0, lane,
++                ub0, ub1, usb);
++            laguna_nvfp4_mma_m16n8k64(
++                gd[stage][0], gd[stage][1],
++                gd[stage][2], gd[stage][3],
++                a0, a1, a2, a3, gb0, gb1, sa, gsb);
++            laguna_nvfp4_mma_m16n8k64(
++                ud[stage][0], ud[stage][1],
++                ud[stage][2], ud[stage][3],
++                a0, a1, a2, a3, ub0, ub1, sa, usb);
++        }
++    }
++#pragma unroll
++    for (uint32_t stage = 1u; stage < 4u; stage++) {
++#pragma unroll
++        for (uint32_t i = 0u; i < 4u; i++) {
++            gd[0][i] += gd[stage][i];
++            ud[0][i] += ud[stage][i];
++        }
++    }
++
++    const uint32_t group = lane >> 2u;
++    const uint32_t tid = lane & 3u;
++    const float gate_factor =
++        gate_global[expert] * input_global[expert];
++    const float up_factor =
++        up_global[expert] * input_global[expert];
++    const uint32_t local_lo = local_start + group;
++    const uint32_t local_hi = local_lo + 8u;
++    if (local_lo < pair_count) {
++        const uint32_t pair = sorted_pairs[sorted_offset + local_lo];
++        float gate_value = gd[0][0] * gate_factor;
++        float up_value = ud[0][0] * up_factor;
++        mid[(uint64_t)pair * expert_mid_dim + col0 + tid * 2u] =
++            (gate_value / (1.0f + expf(-gate_value))) *
++            up_value * router_weights[pair];
++        gate_value = gd[0][1] * gate_factor;
++        up_value = ud[0][1] * up_factor;
++        mid[(uint64_t)pair * expert_mid_dim + col0 + tid * 2u + 1u] =
++            (gate_value / (1.0f + expf(-gate_value))) *
++            up_value * router_weights[pair];
++    }
++    if (local_hi < pair_count) {
++        const uint32_t pair = sorted_pairs[sorted_offset + local_hi];
++        float gate_value = gd[0][2] * gate_factor;
++        float up_value = ud[0][2] * up_factor;
++        mid[(uint64_t)pair * expert_mid_dim + col0 + tid * 2u] =
++            (gate_value / (1.0f + expf(-gate_value))) *
++            up_value * router_weights[pair];
++        gate_value = gd[0][3] * gate_factor;
++        up_value = ud[0][3] * up_factor;
++        mid[(uint64_t)pair * expert_mid_dim + col0 + tid * 2u + 1u] =
++            (gate_value / (1.0f + expf(-gate_value))) *
++            up_value * router_weights[pair];
++    }
++}
++
++__global__ static void laguna_grouped_nvfp4_down_mma_kernel(
++        float *terms,
++        const uint8_t *const *down_packed,
++        const uint8_t *const *down_scale,
++        const float *down_global,
++        const float *input_global,
++        const uint8_t *mid4,
++        const uint8_t *mid4scale,
++        const uint32_t *sorted_pairs,
++        const uint32_t *offsets,
++        const uint32_t *counts,
++        const uint32_t *tile_total,
++        const uint32_t *tile_experts,
++        const uint32_t *tile_starts,
++        uint32_t expert_mid_dim,
++        uint32_t term_stride,
++        uint32_t row0,
++        uint32_t chunk_rows) {
++    const uint32_t warp_in_block = threadIdx.x >> 5u;
++    const uint32_t lane = threadIdx.x & 31u;
++    const uint64_t warp =
++        (uint64_t)blockIdx.x * (blockDim.x / 32u) + warp_in_block;
++    const uint32_t col_tiles = chunk_rows / 8u;
++    const uint32_t tile = (uint32_t)(warp / col_tiles);
++    if (tile >= *tile_total) return;
++    const uint32_t local_col0 =
++        (uint32_t)(warp - (uint64_t)tile * col_tiles) * 8u;
++    const uint32_t col0 = row0 + local_col0;
++    const uint32_t expert = tile_experts[tile];
++    const uint32_t local_start = tile_starts[tile];
++    const uint32_t pair_count = counts[expert];
++    const uint32_t sorted_offset = offsets[expert];
++    const uint32_t packed_row = expert_mid_dim / 2u;
++    const uint32_t scale_row = expert_mid_dim / 16u;
++
++    float d[4][4] = {};
++    for (uint32_t kbase = 0u; kbase < expert_mid_dim; kbase += 256u) {
++#pragma unroll
++        for (uint32_t stage = 0u; stage < 4u; stage++) {
++            const uint32_t k0 = kbase + stage * 64u;
++            uint32_t a0, a1, a2, a3, sa;
++            uint32_t b0, b1, sb;
++            laguna_nvfp4_load_grouped_activation(
++                mid4, mid4scale, sorted_pairs, sorted_offset, local_start,
++                pair_count, packed_row, scale_row, k0, lane,
++                a0, a1, a2, a3, sa);
++            laguna_nvfp4_load_grouped_weight(
++                down_packed[expert], down_scale[expert],
++                packed_row, scale_row, col0, k0, lane,
++                b0, b1, sb);
++            laguna_nvfp4_mma_m16n8k64(
++                d[stage][0], d[stage][1],
++                d[stage][2], d[stage][3],
++                a0, a1, a2, a3, b0, b1, sa, sb);
++        }
++    }
++#pragma unroll
++    for (uint32_t stage = 1u; stage < 4u; stage++) {
++#pragma unroll
++        for (uint32_t i = 0u; i < 4u; i++)
++            d[0][i] += d[stage][i];
++    }
++
++    const uint32_t group = lane >> 2u;
++    const uint32_t tid = lane & 3u;
++    const float factor =
++        down_global[expert] * input_global[expert];
++    const uint32_t local_lo = local_start + group;
++    const uint32_t local_hi = local_lo + 8u;
++    if (local_lo < pair_count) {
++        const uint32_t pair = sorted_pairs[sorted_offset + local_lo];
++        terms[(uint64_t)pair * term_stride + local_col0 + tid * 2u] =
++            d[0][0] * factor;
++        terms[(uint64_t)pair * term_stride + local_col0 + tid * 2u + 1u] =
++            d[0][1] * factor;
++    }
++    if (local_hi < pair_count) {
++        const uint32_t pair = sorted_pairs[sorted_offset + local_hi];
++        terms[(uint64_t)pair * term_stride + local_col0 + tid * 2u] =
++            d[0][2] * factor;
++        terms[(uint64_t)pair * term_stride + local_col0 + tid * 2u + 1u] =
++            d[0][3] * factor;
++    }
++}
++
++__global__ static DS4_CUDA_UNUSED void laguna_native_nvfp4_gate_up_mma_kernel(
++        float *mid,
++        const uint8_t *const *gate_packed,
++        const uint8_t *const *gate_scale,
++        const uint8_t *const *up_packed,
++        const uint8_t *const *up_scale,
++        const float *gate_global,
++        const float *up_global,
++        const float *input_global,
++        const uint8_t *x4,
++        const uint8_t *x4scale,
++        const int32_t *selected,
++        const float *router_weights,
++        uint32_t expert_in_dim,
++        uint32_t expert_mid_dim,
++        uint32_t n_total_expert,
++        uint32_t n_expert,
++        uint64_t pairs) {
++    const uint32_t warp_in_block = threadIdx.x >> 5u;
++    const uint32_t lane = threadIdx.x & 31u;
++    const uint64_t warp =
++        (uint64_t)blockIdx.x * (blockDim.x / 32u) + warp_in_block;
++    const uint32_t row_tiles = expert_mid_dim / 16u;
++    const uint64_t pair = warp / row_tiles;
++    if (pair >= pairs) return;
++    const uint32_t row0 =
++        (uint32_t)(warp - pair * row_tiles) * 16u;
++    const int32_t expert_i = selected[pair];
++    if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) return;
++    const uint32_t expert = (uint32_t)expert_i;
++    const uint32_t packed_row = expert_in_dim / 2u;
++    const uint32_t scale_row = expert_in_dim / 16u;
++    const uint8_t *xrow = x4 + pair * packed_row;
++    const uint8_t *xsrow = x4scale + pair * scale_row;
++
++    /*
++     * Four independent accumulator chains cover each K=256 slice.  A single
++     * dependent OMMA chain leaves the Blackwell FP4 pipe waiting on its prior
++     * result; interleaving four chains exposes enough independent work for the
++     * scheduler while retaining direct checkpoint loads.
++     */
++    float gd[4][4] = {};
++    float ud[4][4] = {};
++    for (uint32_t kbase = 0u; kbase < expert_in_dim; kbase += 256u) {
++#pragma unroll
++        for (uint32_t stage = 0u; stage < 4u; stage++) {
++            const uint32_t k0 = kbase + stage * 64u;
++            if (k0 >= expert_in_dim) continue;
++            uint32_t ga0, ga1, ga2, ga3, gsa;
++            uint32_t ua0, ua1, ua2, ua3, usa;
++            uint32_t b0, b1, sb;
++            laguna_nvfp4_load_weight_fragment(
++                gate_packed[expert], packed_row, scale_row,
++                gate_scale[expert], row0, k0, lane,
++                ga0, ga1, ga2, ga3, gsa);
++            laguna_nvfp4_load_weight_fragment(
++                up_packed[expert], packed_row, scale_row,
++                up_scale[expert], row0, k0, lane,
++                ua0, ua1, ua2, ua3, usa);
++            laguna_nvfp4_load_vector_fragment(
++                xrow, xsrow, k0, lane, b0, b1, sb);
++            laguna_nvfp4_mma_m16n8k64(
++                gd[stage][0], gd[stage][1],
++                gd[stage][2], gd[stage][3],
++                ga0, ga1, ga2, ga3, b0, b1, gsa, sb);
++            laguna_nvfp4_mma_m16n8k64(
++                ud[stage][0], ud[stage][1],
++                ud[stage][2], ud[stage][3],
++                ua0, ua1, ua2, ua3, b0, b1, usa, sb);
++        }
++    }
++#pragma unroll
++    for (uint32_t stage = 1u; stage < 4u; stage++) {
++        gd[0][0] += gd[stage][0];
++        gd[0][1] += gd[stage][1];
++        gd[0][2] += gd[stage][2];
++        gd[0][3] += gd[stage][3];
++        ud[0][0] += ud[stage][0];
++        ud[0][1] += ud[stage][1];
++        ud[0][2] += ud[stage][2];
++        ud[0][3] += ud[stage][3];
++    }
++
++    if ((lane & 3u) == 0u) {
++        const uint32_t group = lane >> 2u;
++        const float gate_factor =
++            gate_global[expert] * input_global[expert];
++        const float up_factor =
++            up_global[expert] * input_global[expert];
++        const float router = router_weights[pair];
++        float gate_value = gd[0][0] * gate_factor;
++        float up_value = ud[0][0] * up_factor;
++        mid[pair * expert_mid_dim + row0 + group] =
++            (gate_value / (1.0f + expf(-gate_value))) *
++            up_value * router;
++        gate_value = gd[0][2] * gate_factor;
++        up_value = ud[0][2] * up_factor;
++        mid[pair * expert_mid_dim + row0 + group + 8u] =
++            (gate_value / (1.0f + expf(-gate_value))) *
++            up_value * router;
++    }
++}
++
++__global__ static DS4_CUDA_UNUSED void laguna_native_nvfp4_down_mma_kernel(
++        float *out,
++        const uint8_t *const *down_packed,
++        const uint8_t *const *down_scale,
++        const float *down_global,
++        const float *input_global,
++        const uint8_t *mid4,
++        const uint8_t *mid4scale,
++        const int32_t *selected,
++        uint32_t expert_mid_dim,
++        uint32_t out_dim,
++        uint32_t n_total_expert,
++        uint32_t n_expert,
++        uint32_t n_tokens) {
++    const uint32_t warp_in_block = threadIdx.x >> 5u;
++    const uint32_t lane = threadIdx.x & 31u;
++    const uint64_t warp =
++        (uint64_t)blockIdx.x * (blockDim.x / 32u) + warp_in_block;
++    const uint32_t row_tiles = out_dim / 16u;
++    const uint32_t token = (uint32_t)(warp / row_tiles);
++    if (token >= n_tokens) return;
++    const uint32_t row0 =
++        (uint32_t)(warp - (uint64_t)token * row_tiles) * 16u;
++    const uint32_t packed_row = expert_mid_dim / 2u;
++    const uint32_t scale_row = expert_mid_dim / 16u;
++    float total0 = 0.0f;
++    float total2 = 0.0f;
++
++    for (uint32_t slot = 0u; slot < n_expert; slot++) {
++        const uint64_t pair = (uint64_t)token * n_expert + slot;
++        const int32_t expert_i = selected[pair];
++        if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) continue;
++        const uint32_t expert = (uint32_t)expert_i;
++        const uint8_t *xrow = mid4 + pair * packed_row;
++        const uint8_t *xsrow = mid4scale + pair * scale_row;
++        float d[4][4] = {};
++        for (uint32_t kbase = 0u; kbase < expert_mid_dim; kbase += 256u) {
++#pragma unroll
++            for (uint32_t stage = 0u; stage < 4u; stage++) {
++                const uint32_t k0 = kbase + stage * 64u;
++                if (k0 >= expert_mid_dim) continue;
++                uint32_t a0, a1, a2, a3, sa;
++                uint32_t b0, b1, sb;
++                laguna_nvfp4_load_weight_fragment(
++                    down_packed[expert], packed_row, scale_row,
++                    down_scale[expert], row0, k0, lane,
++                    a0, a1, a2, a3, sa);
++                laguna_nvfp4_load_vector_fragment(
++                    xrow, xsrow, k0, lane, b0, b1, sb);
++                laguna_nvfp4_mma_m16n8k64(
++                    d[stage][0], d[stage][1],
++                    d[stage][2], d[stage][3],
++                    a0, a1, a2, a3, b0, b1, sa, sb);
++            }
++        }
++#pragma unroll
++        for (uint32_t stage = 1u; stage < 4u; stage++) {
++            d[0][0] += d[stage][0];
++            d[0][1] += d[stage][1];
++            d[0][2] += d[stage][2];
++            d[0][3] += d[stage][3];
++        }
++        const float factor =
++            down_global[expert] * input_global[expert];
++        total0 += d[0][0] * factor;
++        total2 += d[0][2] * factor;
++    }
++
++    if ((lane & 3u) == 0u) {
++        const uint32_t group = lane >> 2u;
++        out[(uint64_t)token * out_dim + row0 + group] = total0;
++        out[(uint64_t)token * out_dim + row0 + group + 8u] = total2;
++    }
++}
++#endif
 +
 +template <uint32_t LANES>
 +__device__ __forceinline__ static float laguna_subwarp_sum_f32(float value) {
@@ -6185,8 +6817,38 @@ index e66fa36..889553f 100644
 +        native ? pairs * expert_mid_dim / 16u :
 +                 pairs * midq_blocks * sizeof(float);
 +    if (midscale_offset > UINT64_MAX - midscale_bytes) return 0;
++    const bool grouped_native =
++        native && n_tokens >= 256u && pairs <= UINT32_MAX;
++    const uint64_t sorted_base =
++        (midscale_offset + midscale_bytes + 255u) & ~255ull;
++    const uint64_t counts_bytes = grouped_native ?
++        (uint64_t)n_total_expert * sizeof(uint32_t) : 0u;
++    const uint64_t offsets_bytes = grouped_native ?
++        ((uint64_t)n_total_expert + 1u) * sizeof(uint32_t) : 0u;
++    const uint64_t cursors_bytes = counts_bytes;
++    const uint64_t sorted_pairs_bytes = grouped_native ?
++        pairs * sizeof(uint32_t) : 0u;
++    const uint64_t tile_offsets_bytes = offsets_bytes;
++    const uint64_t tile_capacity = grouped_native ?
++        (pairs + 15u) / 16u + n_total_expert : 0u;
++    const uint64_t tile_total_bytes = grouped_native ?
++        sizeof(uint32_t) : 0u;
++    const uint64_t tile_experts_bytes =
++        tile_capacity * sizeof(uint32_t);
++    const uint64_t tile_starts_bytes = tile_experts_bytes;
++    const uint64_t sorted_bytes =
++        counts_bytes + offsets_bytes + cursors_bytes +
++        sorted_pairs_bytes + tile_offsets_bytes + tile_total_bytes +
++        tile_experts_bytes + tile_starts_bytes;
++    if (grouped_native &&
++        (tile_capacity > UINT32_MAX ||
++         sorted_base > UINT64_MAX - sorted_bytes)) {
++        return 0;
++    }
++    const uint64_t scratch_bytes = grouped_native ?
++        sorted_base + sorted_bytes : midscale_offset + midscale_bytes;
 +    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc_on(
-+        logical_tier, midscale_offset + midscale_bytes,
++        logical_tier, scratch_bytes,
 +        "Laguna NVFP4 MoE");
 +    if (!scratch) return 0;
 +    int8_t *xq = (int8_t *)scratch;
@@ -6197,6 +6859,12 @@ index e66fa36..889553f 100644
 +    uint8_t *x4scale = native ? scratch + xscale_offset : NULL;
 +    uint8_t *mid4 = native ? scratch + midq_offset : NULL;
 +    uint8_t *mid4scale = native ? scratch + midscale_offset : NULL;
++    uint32_t *sorted_counts = NULL;
++    uint32_t *sorted_offsets = NULL;
++    uint32_t *sorted_pairs = NULL;
++    uint32_t *tile_total = NULL;
++    uint32_t *tile_experts = NULL;
++    uint32_t *tile_starts = NULL;
 +
 +    if (native) {
 +        for (uint32_t pair0 = 0u; pair0 < (uint32_t)pairs;) {
@@ -6234,9 +6902,197 @@ index e66fa36..889553f 100644
 +        }
 +    }
 +
-+    const bool blackwell =
-+        cuda_laguna_blackwell_ok() &&
-+        getenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4") == NULL;
++    if (grouped_native) {
++        uint8_t *cursor = scratch + sorted_base;
++        sorted_counts = (uint32_t *)cursor;
++        cursor += counts_bytes;
++        sorted_offsets = (uint32_t *)cursor;
++        cursor += offsets_bytes;
++        uint32_t *cursors = (uint32_t *)cursor;
++        cursor += cursors_bytes;
++        sorted_pairs = (uint32_t *)cursor;
++        cursor += sorted_pairs_bytes;
++        uint32_t *tile_offsets = (uint32_t *)cursor;
++        cursor += tile_offsets_bytes;
++        tile_total = (uint32_t *)cursor;
++        cursor += tile_total_bytes;
++        tile_experts = (uint32_t *)cursor;
++        cursor += tile_experts_bytes;
++        tile_starts = (uint32_t *)cursor;
++        if (!cuda_ok(cudaMemsetAsync(
++                         sorted_counts, 0, (size_t)counts_bytes),
++                     "Laguna native NVFP4 sorted counts clear")) {
++            return 0;
++        }
++        moe_count_sorted_pairs_kernel<<<
++            ((uint32_t)pairs + 255u) / 256u, 256>>>(
++                sorted_counts, (const int32_t *)selected->ptr,
++                (uint32_t)pairs, n_total_expert);
++        if (!cuda_ok(cudaGetLastError(),
++                     "Laguna native NVFP4 sorted count launch")) {
++            return 0;
++        }
++        moe_prefix_sorted_pairs_kernel<<<1, 1>>>(
++            sorted_offsets, cursors, sorted_counts, n_total_expert);
++        if (!cuda_ok(cudaGetLastError(),
++                     "Laguna native NVFP4 sorted prefix launch")) {
++            return 0;
++        }
++        moe_scatter_sorted_pairs_kernel<<<
++            ((uint32_t)pairs + 255u) / 256u, 256>>>(
++                sorted_pairs, cursors,
++                (const int32_t *)selected->ptr,
++                (uint32_t)pairs, n_total_expert);
++        if (!cuda_ok(cudaGetLastError(),
++                     "Laguna native NVFP4 sorted scatter launch")) {
++            return 0;
++        }
++        moe_build_expert_tile_offsets_kernel<<<1, 1>>>(
++            tile_offsets, tile_total, sorted_counts, 16u,
++            n_total_expert);
++        if (!cuda_ok(cudaGetLastError(),
++                     "Laguna native NVFP4 sorted tile-offset launch")) {
++            return 0;
++        }
++        moe_build_expert_tiles_kernel<<<
++            (n_total_expert + 255u) / 256u, 256>>>(
++                tile_experts, tile_starts, tile_offsets,
++                sorted_counts, 16u, n_total_expert);
++        if (!cuda_ok(cudaGetLastError(),
++                     "Laguna native NVFP4 sorted tile launch")) {
++            return 0;
++        }
++    }
++
++    if (native) {
++#if defined(DS4_CUDA_NVFP4_MMA)
++        if (!cuda_laguna_nvfp4_hw_ok()) {
++            fprintf(stderr,
++                    "ds4: native Laguna NVFP4 requires a Blackwell GPU; "
++                    "use the official Q4_K_M model on older CUDA devices\n");
++            return 0;
++        }
++        if (grouped_native) {
++            const uint64_t gate_warps =
++                tile_capacity * (expert_mid_dim / 8u);
++            const uint64_t gate_blocks = (gate_warps + 7u) / 8u;
++            if (gate_blocks > UINT32_MAX) return 0;
++            laguna_grouped_nvfp4_gate_up_mma_kernel<<<
++                (uint32_t)gate_blocks, 256>>>(
++                    (float *)mid->ptr,
++                    native_cache->gate_packed,
++                    native_cache->gate_scale,
++                    native_cache->up_packed,
++                    native_cache->up_scale,
++                    gate_scales,
++                    up_scales,
++                    native_cache->gate_input_global,
++                    x4,
++                    x4scale,
++                    sorted_pairs,
++                    sorted_offsets,
++                    sorted_counts,
++                    tile_total,
++                    tile_experts,
++                    tile_starts,
++                    (const float *)weights->ptr,
++                    expert_in_dim,
++                    expert_mid_dim);
++            if (!cuda_ok(cudaGetLastError(),
++                         "Laguna Blackwell grouped NVFP4 gate/up MMA launch")) {
++                return 0;
++            }
++
++            for (uint32_t pair0 = 0u; pair0 < (uint32_t)pairs;) {
++                uint32_t chunk = (uint32_t)pairs - pair0;
++                if (chunk > 65535u) chunk = 65535u;
++                quantize_nvfp4_selected_f32_kernel
++                    <<<dim3(expert_mid_dim / 16u, chunk, 1u), 32>>>(
++                        mid4, mid4scale, (const float *)mid->ptr,
++                        (const int32_t *)selected->ptr,
++                        native_cache->down_input_global,
++                        expert_mid_dim, expert_mid_dim / 16u,
++                        n_total_expert, (uint32_t)pairs, n_expert,
++                        pair0, true);
++                if (!cuda_ok(cudaGetLastError(),
++                             "Laguna Blackwell NVFP4 mid quantize launch")) {
++                    return 0;
++                }
++                pair0 += chunk;
++            }
++
++            for (uint32_t row0 = 0u; row0 < out_dim;
++                 row0 += expert_mid_dim) {
++                uint32_t chunk_rows = out_dim - row0;
++                if (chunk_rows > expert_mid_dim)
++                    chunk_rows = expert_mid_dim;
++                const uint64_t down_warps =
++                    tile_capacity * (chunk_rows / 8u);
++                const uint64_t down_blocks =
++                    (down_warps + 7u) / 8u;
++                if (down_blocks > UINT32_MAX) return 0;
++                laguna_grouped_nvfp4_down_mma_kernel<<<
++                    (uint32_t)down_blocks, 256>>>(
++                        (float *)mid->ptr,
++                        native_cache->down_packed,
++                        native_cache->down_scale,
++                        down_scales,
++                        native_cache->down_input_global,
++                        mid4,
++                        mid4scale,
++                        sorted_pairs,
++                        sorted_offsets,
++                        sorted_counts,
++                        tile_total,
++                        tile_experts,
++                        tile_starts,
++                        expert_mid_dim,
++                        expert_mid_dim,
++                        row0,
++                        chunk_rows);
++                if (!cuda_ok(cudaGetLastError(),
++                             "Laguna Blackwell grouped NVFP4 down MMA launch")) {
++                    return 0;
++                }
++                const uint64_t reduce_values =
++                    (uint64_t)n_tokens * chunk_rows;
++                if (reduce_values >
++                    (uint64_t)UINT32_MAX * 256u) {
++                    return 0;
++                }
++                laguna_moe_down_chunk_reduce_kernel<<<
++                    (uint32_t)((reduce_values + 255u) / 256u), 256>>>(
++                        (float *)out->ptr,
++                        (const float *)mid->ptr,
++                        n_tokens,
++                        n_expert,
++                        out_dim,
++                        expert_mid_dim,
++                        row0,
++                        chunk_rows);
++                if (!cuda_ok(cudaGetLastError(),
++                             "Laguna Blackwell grouped NVFP4 down reduce launch")) {
++                    return 0;
++                }
++            }
++            return cuda_ok(cudaGetLastError(),
++                           "Laguna Blackwell grouped NVFP4 down MMA launch");
++        }
++#else
++        fprintf(stderr,
++                "ds4: this CUDA build has no native Blackwell NVFP4 MMA; "
++                "build with make cuda-spark\n");
++        return 0;
++#endif
++    }
++
++    /*
++     * SM120-family MMA has no GEMV-sized NVFP4 instruction: m16n8k64 would
++     * discard seven of eight columns for a single routed vector.  Keep the
++     * native integer-dot decode kernel for that shape; prompt batches above
++     * use the fully occupied grouped FP4 MMA path and have already returned.
++     */
++    const bool blackwell = native || cuda_laguna_blackwell_ok();
 +    const uint32_t lanes = blackwell ? 16u : 8u;
 +    const uint32_t rows_per_block = 256u / lanes;
 +    const uint64_t gate_blocks =
@@ -7110,16 +7966,18 @@ index e66fa36..889553f 100644
 +                n_head, n_head_kv, head_dim, scale);
 +    }
 +    return cuda_ok(cudaGetLastError(), "Laguna decode attention launch");
-+}
-+
-+extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
-+        ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
-+        ds4_gpu_tensor *value_cache, ds4_gpu_tensor *staged_key,
-+        ds4_gpu_tensor *staged_value, const ds4_gpu_tensor *q,
-+        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
-+        const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
-+        uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
-+        uint32_t head_dim, float scale) {
+ }
+ 
+ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
+@@ -27772,10 +31699,111 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
+         const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
+         uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
+         uint32_t head_dim, float scale) {
+-    (void)heads; (void)key_cache; (void)value_cache; (void)staged_key;
+-    (void)staged_value; (void)q; (void)k; (void)v; (void)gate;
+-    (void)pos0; (void)n_tokens; (void)cache_cap; (void)n_head;
+-    (void)n_head_kv; (void)head_dim; (void)scale;
+-    return 0;
 +    if (!heads || !key_cache || !value_cache || !staged_key ||
 +        !staged_value || !q || !k || !v || !gate ||
 +        n_tokens == 0u || cache_cap == 0u ||
@@ -7770,12 +8628,22 @@ index 0000000..dcb035c
 +2048,2048,199.16,256,21.71,47.727,255,21.84,176570420
 +4096,2048,162.08,256,20.38,49.655,255,20.49,277241908
 +8192,4096,132.48,256,18.27,57.577,255,18.37,0
+diff --git a/speed-bench/laguna_s21_nvfp4_gb10.csv b/speed-bench/laguna_s21_nvfp4_gb10.csv
+new file mode 100644
+index 0000000..fe5e4ce
+--- /dev/null
++++ b/speed-bench/laguna_s21_nvfp4_gb10.csv
+@@ -0,0 +1,4 @@
++ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes
++2048,2048,413.38,256,14.18,98.904,255,14.26,176570420
++4096,2048,317.80,256,14.05,71.725,255,14.10,277241908
++8192,4096,224.72,256,13.49,76.631,255,13.55,0
 diff --git a/tests/cuda_laguna_smoke.c b/tests/cuda_laguna_smoke.c
 new file mode 100644
-index 0000000..65034db
+index 0000000..1599d00
 --- /dev/null
 +++ b/tests/cuda_laguna_smoke.c
-@@ -0,0 +1,1356 @@
+@@ -0,0 +1,1495 @@
 +#include "ds4_gpu.h"
 +
 +#include <cuda_runtime_api.h>
@@ -8865,24 +9733,14 @@ index 0000000..65034db
 +                               sizeof(weights_host)),
 +          "write NVFP4 MoE tensors");
 +
-+    float portable[n_tokens * dim];
-+    float selected_path[n_tokens * dim];
-+    CHECK(setenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4", "1", 1) == 0,
-+          "select portable NVFP4 schedule");
++    float result[n_tokens * dim];
 +    CHECK(ds4_gpu_laguna_routed_moe_tensor(
 +              out, mid, blob->data, blob->size, routed,
 +              dim, dim, dim, selected, weights, n_expert, n_expert,
 +              x, n_tokens) &&
-+          ds4_gpu_tensor_read(out, 0, portable, sizeof(portable)),
-+          "portable Laguna NVFP4 MoE");
-+    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_BLACKWELL_NVFP4") == 0,
-+          "select default NVFP4 schedule");
-+    CHECK(ds4_gpu_laguna_routed_moe_tensor(
-+              out, mid, blob->data, blob->size, routed,
-+              dim, dim, dim, selected, weights, n_expert, n_expert,
-+              x, n_tokens) &&
-+          ds4_gpu_tensor_read(out, 0, selected_path, sizeof(selected_path)),
-+          "default Laguna NVFP4 MoE");
++          ds4_gpu_tensor_read(out, 0, result, sizeof(result)),
++          native_w4a4 ? "Blackwell native Laguna NVFP4 MoE" :
++                        "GGUF Laguna NVFP4 MoE");
 +    for (uint32_t token = 0u; token < n_tokens; token++) {
 +        const float expected = nvfp4_moe_expected(
 +            2.56f * (float)(token + 1u),
@@ -8892,14 +9750,10 @@ index 0000000..65034db
 +        for (uint32_t i = 0u; i < dim; i++) {
 +            const uint64_t index = (uint64_t)token * dim + i;
 +            const float rtol = native_w4a4 ? 0.15f : 3e-3f;
-+            CHECK(close_enough(portable[index], expected, 0.30f, rtol),
-+                  "portable Laguna NVFP4 MoE numeric");
-+            CHECK(close_enough(selected_path[index], expected,
-+                               0.30f, rtol),
-+                  "default Laguna NVFP4 MoE numeric");
-+            CHECK(close_enough(selected_path[index], portable[index],
-+                               0.05f, 1e-4f),
-+                  "Laguna NVFP4 schedule agreement");
++            CHECK(close_enough(result[index], expected, 0.30f, rtol),
++                  native_w4a4 ?
++                      "Blackwell native Laguna NVFP4 MoE numeric" :
++                      "GGUF Laguna NVFP4 MoE numeric");
 +        }
 +    }
 +    ds4_gpu_tensor_free(mid);
@@ -8972,9 +9826,161 @@ index 0000000..65034db
 +    return check_nvfp4_moe(blob, &routed, 1);
 +}
 +
++static int check_native_nvfp4_moe_real_shape(model_blob *blob) {
++    enum {
++        n_total_expert = 256,
++        n_expert = 10,
++        n_tokens = 256,
++        expert_in_dim = 3072,
++        expert_mid_dim = 1024,
++        out_dim = 3072
++    };
++    const uint32_t rows[3] = {
++        expert_mid_dim, expert_mid_dim, out_dim
++    };
++    const uint32_t cols[3] = {
++        expert_in_dim, expert_in_dim, expert_mid_dim
++    };
++    uint64_t packed[3][n_total_expert];
++    uint64_t scale[3][n_total_expert];
++    uint64_t weight_global[3][n_total_expert];
++    uint64_t input_global[3][n_total_expert];
++    const float output_scale[3] = {0.5f, 2.0f, 1.25f};
++    for (uint32_t p = 0u; p < 3u; p++) {
++        const uint64_t packed_bytes =
++            (uint64_t)rows[p] * cols[p] / 2u;
++        const uint64_t scale_bytes =
++            (uint64_t)rows[p] * cols[p] / 16u;
++        const uint64_t packed_offset = blob_alloc(blob, packed_bytes);
++        const uint64_t scale_offset = blob_alloc(blob, scale_bytes);
++        const uint64_t weight_global_offset =
++            blob_alloc(blob, sizeof(float));
++        const uint64_t input_global_offset =
++            blob_alloc(blob, sizeof(float));
++        CHECK(packed_offset != UINT64_MAX &&
++              scale_offset != UINT64_MAX &&
++              weight_global_offset != UINT64_MAX &&
++              input_global_offset != UINT64_MAX,
++              "allocate real-shape native NVFP4 tensors");
++        memset(blob->data + packed_offset, 0x22, packed_bytes);
++        memset(blob->data + scale_offset, 0x38, scale_bytes);
++        const float raw_weight_global = 1.0f / output_scale[p];
++        const float raw_input_global = p < 2u ? 600.0f : 256.0f;
++        memcpy(blob->data + weight_global_offset,
++               &raw_weight_global, sizeof(raw_weight_global));
++        memcpy(blob->data + input_global_offset,
++               &raw_input_global, sizeof(raw_input_global));
++        for (uint32_t e = 0u; e < n_total_expert; e++) {
++            packed[p][e] = packed_offset;
++            scale[p][e] = scale_offset;
++            weight_global[p][e] = weight_global_offset;
++            input_global[p][e] = input_global_offset;
++        }
++    }
++
++    ds4_gpu_laguna_moe_desc routed = {0};
++    routed.gate_type = 40u;
++    routed.up_type = 40u;
++    routed.down_type = 40u;
++    routed.gate_row_bytes =
++        routed.up_row_bytes =
++            (uint64_t)(expert_in_dim / 64u) * sizeof(block_nvfp4);
++    routed.down_row_bytes =
++        (uint64_t)(expert_mid_dim / 64u) * sizeof(block_nvfp4);
++    routed.gate_expert_bytes =
++        routed.up_expert_bytes =
++            (uint64_t)expert_mid_dim * routed.gate_row_bytes;
++    routed.down_expert_bytes =
++        (uint64_t)out_dim * routed.down_row_bytes;
++    ds4_gpu_nvfp4_matrix_desc *matrix[3] = {
++        &routed.gate_nvfp4, &routed.up_nvfp4, &routed.down_nvfp4
++    };
++    for (uint32_t p = 0u; p < 3u; p++) {
++        matrix[p]->packed_offsets = packed[p];
++        matrix[p]->scale_offsets = scale[p];
++        matrix[p]->weight_global_scale_offsets = weight_global[p];
++        matrix[p]->input_global_scale_offsets = input_global[p];
++        matrix[p]->packed_bytes = (uint64_t)rows[p] * cols[p] / 2u;
++        matrix[p]->scale_bytes = (uint64_t)rows[p] * cols[p] / 16u;
++    }
++
++    int32_t selected_host[n_tokens * n_expert];
++    float weights_host[n_tokens * n_expert];
++    for (uint32_t token = 0u; token < n_tokens; token++) {
++        for (uint32_t e = 0u; e < n_expert; e++) {
++            const uint64_t pair = (uint64_t)token * n_expert + e;
++            selected_host[pair] =
++                (int32_t)((token * 17u + e * 23u) % n_total_expert);
++            weights_host[pair] = 1.0f / (float)n_expert;
++        }
++    }
++    ds4_gpu_tensor *x =
++        ds4_gpu_tensor_alloc(
++            (uint64_t)n_tokens * expert_in_dim * sizeof(float));
++    ds4_gpu_tensor *selected =
++        ds4_gpu_tensor_alloc(sizeof(selected_host));
++    ds4_gpu_tensor *weights =
++        ds4_gpu_tensor_alloc(sizeof(weights_host));
++    ds4_gpu_tensor *out =
++        ds4_gpu_tensor_alloc(
++            (uint64_t)n_tokens * out_dim * sizeof(float));
++    ds4_gpu_tensor *mid =
++        ds4_gpu_tensor_alloc(
++            (uint64_t)n_tokens * n_expert *
++            expert_mid_dim * sizeof(float));
++    CHECK(x && selected && weights && out && mid,
++          "real-shape NVFP4 MoE tensor allocation");
++    CHECK(ds4_gpu_tensor_fill_f32(
++              x, 0.0001f, (uint64_t)n_tokens * expert_in_dim) &&
++          ds4_gpu_tensor_write(selected, 0, selected_host,
++                               sizeof(selected_host)) &&
++          ds4_gpu_tensor_write(weights, 0, weights_host,
++                               sizeof(weights_host)),
++          "write real-shape NVFP4 MoE tensors");
++    CHECK(ds4_gpu_laguna_routed_moe_tensor(
++              out, mid, blob->data, blob->size, &routed,
++              expert_in_dim, expert_mid_dim, out_dim,
++              selected, weights, n_total_expert, n_expert, x, n_tokens),
++          "real-shape Blackwell native Laguna NVFP4 MoE");
++    CHECK(cudaDeviceSynchronize() == cudaSuccess,
++          "synchronize real-shape Blackwell native Laguna NVFP4 MoE");
++
++    const uint64_t result_count = (uint64_t)n_tokens * out_dim;
++    float *result = (float *)malloc(
++        (size_t)result_count * sizeof(float));
++    CHECK(result != NULL, "allocate real-shape NVFP4 result");
++    CHECK(ds4_gpu_tensor_read(
++              out, 0, result, result_count * sizeof(float)),
++          "read real-shape NVFP4 result");
++    const float projection = 0.0001f * (float)expert_in_dim;
++    const float gate = projection * output_scale[0];
++    const float up = projection * output_scale[1];
++    const float one_mid =
++        (gate / (1.0f + expf(-gate))) * up / (float)n_expert;
++    const float expected =
++        one_mid * (float)n_expert * (float)expert_mid_dim *
++        output_scale[2];
++    for (uint64_t i = 0u; i < result_count; i++) {
++        if (!close_enough(result[i], expected, 1.0f, 0.20f)) {
++            fprintf(stderr,
++                    "cuda-laguna: real-shape NVFP4 result[%llu]=%.9g "
++                    "expected=%.9g\n",
++                    (unsigned long long)i, result[i], expected);
++            CHECK(0, "real-shape Blackwell native Laguna NVFP4 MoE numeric");
++        }
++    }
++    free(result);
++    ds4_gpu_tensor_free(mid);
++    ds4_gpu_tensor_free(out);
++    ds4_gpu_tensor_free(weights);
++    ds4_gpu_tensor_free(selected);
++    ds4_gpu_tensor_free(x);
++    return 0;
++}
++
 +int main(void) {
 +    CHECK(ds4_gpu_init(), "ds4_gpu_init");
-+    const uint64_t blob_size = 2u * 1024u * 1024u;
++    const uint64_t blob_size = 64u * 1024u * 1024u;
 +    void *host = NULL;
 +    CHECK(cudaMallocHost(&host, blob_size) == cudaSuccess,
 +          "allocate pinned model blob");
@@ -9127,6 +10133,7 @@ index 0000000..65034db
 +    }
 +    if (rc == 0) rc = check_nvfp4_moe(&blob, &nvfp4_routed, 0);
 +    if (rc == 0) rc = check_native_nvfp4_moe(&blob);
++    if (rc == 0) rc = check_native_nvfp4_moe_real_shape(&blob);
 +    ds4_gpu_cleanup();
 +    (void)cudaFreeHost(host);
 +    if (rc == 0) puts("cuda Laguna regression: OK");
