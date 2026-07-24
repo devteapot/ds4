@@ -6,8 +6,8 @@ patches:
     - patch: laguna-s21-cuda
       revision: sha256:d889a244de59519b5d9e1448738a90fbc198f449e742f8aa1fa41dec445178bc
     - patch: laguna-s21-nvfp4-cuda
-      revision: sha256:6d547a133ec423c171b7d9dd82d8d775eb779b81ead3339d6ba780bd674319da
-result_tree: f22dba165c25e111f40a3fbdd3d9c3d97ee62788
+      revision: sha256:8c7a92403ad35d6586d7589ca69fd614125bfc60c71a6ac756394e5d7714733e
+result_tree: fb3bd900cfce7d95d142b1fcf5dc9a53a62dd924
 outcome: adapted
 verification:
     combined_acceptance: passed
@@ -18,7 +18,8 @@ verification:
     gb10_dflash_benchmark: passed
     gb10_raw_benchmark: passed
     prefill_attention_benchmark: passed
-    source_cc321ba_rebase: passed
+    source_b991057_rebase: passed
     split_attention_equivalence: passed
+    tiled_attention_equivalence: passed
 toolchain:
     patchmd: 0.1.0-dev

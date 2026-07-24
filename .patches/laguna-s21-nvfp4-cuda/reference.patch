@@ -68,7 +68,7 @@ index 81d4881..e5cfda1 100644
 -	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 +	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_laguna_smoke
 diff --git a/README.md b/README.md
-index 7d9e5c7..df12514 100644
+index 7d9e5c7..7fb00bc 100644
 --- a/README.md
 +++ b/README.md
 @@ -109,6 +109,7 @@ Download one main model. **Prefer the imatrix versions.**
@@ -79,7 +79,7 @@ index 7d9e5c7..df12514 100644
  ```
  
  For the full PRO Q4 distributed run, download one half on each machine:
-@@ -176,19 +177,125 @@ file are not supported for GLM yet.
+@@ -176,19 +177,129 @@ file are not supported for GLM yet.
  Laguna S 2.1 support targets Poolside's official imatrix-quantized Q4_K_M GGUF.
  The current 63.56 GiB recipe uses Q4_K routed experts and Q8_0 signal-path
  weights. DwarfStar also accepts Poolside's earlier 70.01 GiB recipe with F16
@@ -135,7 +135,11 @@ index 7d9e5c7..df12514 100644
 +uses exact INT8 tensor-core kernels for large Q4_K routed-expert batches.
 +`DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1` and
 +`DS4_CUDA_LAGUNA_NO_Q4_MMA=1` select the respective portable kernels for
-+comparison or rollback.
++comparison or rollback. For narrower A/B tests,
++`DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL=1` retains the warp-per-head kernel but
++stages one K/V row at a time, while
++`DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16=1` retains the eight-pair tensor-core MoE
++tile.
 +
 +CUDA also loads Poolside's official `Laguna-S-2.1-NVFP4` checkpoint directly
 +from its sharded safetensors directory—there is no GGUF conversion or
@@ -210,7 +214,7 @@ index 7d9e5c7..df12514 100644
  The shipped GGUF is configured for a 262144-token context. Laguna defaults to
  temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options
  always take precedence. Use `--nothink` or the `laguna-s-2.1-chat` server alias
-@@ -1495,10 +1602,11 @@ The default graph backend is Metal on macOS and CUDA in CUDA builds:
+@@ -1495,10 +1606,11 @@ The default graph backend is Metal on macOS and CUDA in CUDA builds:
  ```
  
  On Linux, plain `make` prints the available build targets instead of selecting a
@@ -4128,7 +4132,7 @@ index 4b2b0d3..5217fa3 100644
                  "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                  frontier,
 diff --git a/ds4_cuda.cu b/ds4_cuda.cu
-index e66fa36..d991e65 100644
+index e66fa36..413adbb 100644
 --- a/ds4_cuda.cu
 +++ b/ds4_cuda.cu
 @@ -1,5 +1,7 @@
@@ -4810,7 +4814,22 @@ index e66fa36..d991e65 100644
  __device__ static void dev_dot_q2_K_q8_K_block4(
          const cuda_block_q2_K *x,
          const cuda_block_q8_K *y0,
-@@ -23237,6 +23773,36 @@ __global__ static void glm_embed_token_q8_0_kernel(
+@@ -20135,7 +20671,13 @@ static int cuda_q4_mma_tile16_shmem_ok(int which_down) {
+     cudaError_t err = which_down
+         ? cudaFuncGetAttributes(&fn_attr, moe_down_q4K_tile16_mma_kernel<512>)
+         : cudaFuncGetAttributes(&fn_attr, moe_gate_up_mid_q4K_tile16_mma_kernel<512>);
+-    if (err != cudaSuccess || fn_attr.binaryVersion < 80) {
++    /* A lower virtual architecture can be forward-JITed to a Blackwell
++     * binaryVersion even though the __CUDA_ARCH__-guarded mma16 body compiled
++     * to a no-op.  Require both attributes so sm_75 compatibility builds
++     * cannot accidentally select the sm_80+ tile16 kernels. */
++    if (err != cudaSuccess ||
++        fn_attr.binaryVersion < 80 ||
++        fn_attr.ptxVersion < 80) {
+         failed = 1;
+         return 0;
+     }
+@@ -23237,6 +23779,36 @@ __global__ static void glm_embed_token_q8_0_kernel(
      out[d] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
  }
  
@@ -4847,7 +4866,7 @@ index e66fa36..d991e65 100644
  extern "C" int ds4_gpu_embed_token_quant_tensor(
          ds4_gpu_tensor *out,
          const void       *model_map,
-@@ -23250,12 +23816,19 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
+@@ -23250,12 +23822,19 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
          token >= n_vocab) {
          return 0;
      }
@@ -4869,7 +4888,7 @@ index e66fa36..d991e65 100644
      if (weight_offset > model_size ||
          (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
          out->bytes < (uint64_t)n_embd * sizeof(float)) {
-@@ -23266,6 +23839,32 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
+@@ -23266,6 +23845,32 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
              model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
              logical_tier, "glm_token_embd");
      if (!w) return 0;
@@ -4902,7 +4921,7 @@ index e66fa36..d991e65 100644
      glm_embed_token_q8_0_kernel<<<(n_embd + 255) / 256, 256>>>(
              (float *)out->ptr, w, token, n_embd);
      return cuda_ok(cudaGetLastError(), "glm embed token launch");
-@@ -23289,6 +23888,53 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
+@@ -23289,6 +23894,53 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
      out[gid] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
  }
  
@@ -4956,7 +4975,7 @@ index e66fa36..d991e65 100644
  extern "C" int ds4_gpu_embed_tokens_quant_tensor(
          ds4_gpu_tensor       *out,
          const ds4_gpu_tensor *tokens,
-@@ -23303,12 +23949,19 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
+@@ -23303,12 +23955,19 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
          (n_embd & 31u) != 0u) {
          return 0;
      }
@@ -4978,7 +4997,7 @@ index e66fa36..d991e65 100644
      if (weight_offset > model_size ||
          (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
          out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
-@@ -23321,10 +23974,40 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
+@@ -23321,10 +23980,40 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
              logical_tier, "glm_token_embd");
      if (!w) return 0;
      uint64_t n = (uint64_t)n_tokens * n_embd;
@@ -5022,7 +5041,7 @@ index e66fa36..d991e65 100644
      return cuda_ok(cudaGetLastError(), "glm embed tokens launch");
  }
  
-@@ -25895,6 +26578,22 @@ static int glm_routed_moe_finish_batch(
+@@ -25895,6 +26584,22 @@ static int glm_routed_moe_finish_batch(
                     "glm routed moe local output copy");
  }
  
@@ -5045,7 +5064,7 @@ index e66fa36..d991e65 100644
  extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
          ds4_gpu_tensor       *out,
          ds4_gpu_tensor       *mid,
-@@ -25922,8 +26621,40 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
+@@ -25922,8 +26627,40 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
          uint32_t                layer_index,
          const ds4_gpu_tensor *x,
          uint32_t                n_tokens,
@@ -5088,7 +5107,7 @@ index e66fa36..d991e65 100644
      if (!out || !mid || !x || !selected || !weights || !model_map ||
          n_tokens == 0 || n_expert == 0 ||
          (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
-@@ -26285,7 +27016,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
+@@ -26285,7 +27022,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
              down_expert_bytes, down_row_bytes,
              expert_in_dim, expert_mid_dim, out_dim,
              selected, weights, n_total_expert, n_expert, layer_index,
@@ -5097,7 +5116,7 @@ index e66fa36..d991e65 100644
  }
  
  /* Parallel router select: 256 threads compute sigmoid probs, then top-k
-@@ -26862,15 +27593,272 @@ extern "C" int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
+@@ -26862,15 +27599,272 @@ extern "C" int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
      return cuda_ok(cudaGetLastError(), "glm value project launch");
  }
  
@@ -5379,7 +5398,7 @@ index e66fa36..d991e65 100644
          ds4_gpu_tensor       *out,
          const void             *model_map,
          uint64_t                model_size,
-@@ -26918,6 +27906,11 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
+@@ -26918,6 +27912,11 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
          return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                           weight_offset, in_dim, out_dim,
                                           x, n_tok);
@@ -5391,7 +5410,7 @@ index e66fa36..d991e65 100644
      default:
          fprintf(stderr, "ds4: matmul_quant: unsupported type %u\n",
                  weight_type);
-@@ -27375,6 +28368,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
+@@ -27375,6 +28374,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
      (void)enabled;
  }
  
@@ -5402,7 +5421,7 @@ index e66fa36..d991e65 100644
  extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
      g_ssd_streaming_mode = enabled ? 1 : 0;
      cuda_stream_selected_cache_invalidate();
-@@ -27668,114 +28665,4217 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+@@ -27668,114 +28671,4322 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
      return 0;
  }
  
@@ -6124,7 +6143,8 @@ index e66fa36..d991e65 100644
 + * reductions behind eight block-wide barriers per key.  Here the warps run
 + * those reductions concurrently.  K/V still enters shared memory only once
 + * per group and key, so the extra parallelism does not multiply global-memory
-+ * traffic.
++ * traffic.  KEY_TILE stages consecutive rows together, amortizing the two
++ * block-wide barriers while retaining the original per-key softmax order.
 + *
 + * Build the first two reduction levels explicitly in the same order as the
 + * 128-thread tree:
@@ -6134,7 +6154,7 @@ index e66fa36..d991e65 100644
 + * The remaining warp shuffle tree corresponds to strides 16..1.  The explicit
 + * round-to-nearest intrinsics prevent contraction from changing that order,
 + * retaining the established prefill arithmetic. */
-+template <uint32_t HEADS_PER_KV>
++template <uint32_t HEADS_PER_KV, uint32_t KEY_TILE>
 +__global__ static void laguna_attention_prefill_warp_gqa_kernel(
 +        float *out,
 +        const float *q,
@@ -6169,8 +6189,8 @@ index e66fa36..d991e65 100644
 +    const uint32_t head = head0 + head_in_group;
 +    const float *qh =
 +        q + ((uint64_t)token * n_head + head) * head_dim;
-+    __shared__ __half shared_key[128];
-+    __shared__ __half shared_value[128];
++    __shared__ __align__(16) __half shared_key[KEY_TILE][128];
++    __shared__ __align__(16) __half shared_value[KEY_TILE][128];
 +
 +    float acc0 = 0.0f;
 +    float acc1 = 0.0f;
@@ -6178,55 +6198,77 @@ index e66fa36..d991e65 100644
 +    float acc3 = 0.0f;
 +    float score_sum = 0.0f;
 +    float max_score = -INFINITY;
-+    for (uint32_t key_pos = key_start; key_pos <= query_pos; key_pos++) {
-+        const bool current = key_pos >= pos0;
-+        const uint32_t source_row =
-+            current ? key_pos - pos0 : key_pos % cache_cap;
-+        const uint64_t kv_base =
-+            (uint64_t)source_row * width +
-+            (uint64_t)kv_head * head_dim;
-+        for (uint32_t d = tid; d < 128u;
-+             d += HEADS_PER_KV * 32u) {
-+            shared_key[d] = current ?
-+                staged_key[kv_base + d] : key_cache[kv_base + d];
-+            shared_value[d] = current ?
-+                staged_value[kv_base + d] : value_cache[kv_base + d];
++    for (uint32_t key_tile = key_start; key_tile <= query_pos;
++         key_tile += KEY_TILE) {
++        uint32_t tile_keys = query_pos - key_tile + 1u;
++        if (tile_keys > KEY_TILE) tile_keys = KEY_TILE;
++        const uint32_t loader_group = tid >> 4u;
++        const uint32_t vec = tid & 15u;
++        const uint32_t loader_groups = HEADS_PER_KV * 2u;
++        for (uint32_t kt = loader_group; kt < tile_keys;
++             kt += loader_groups) {
++            const uint32_t key_pos = key_tile + kt;
++            const bool current = key_pos >= pos0;
++            const uint32_t source_row =
++                current ? key_pos - pos0 : key_pos % cache_cap;
++            const uint64_t kv_base =
++                (uint64_t)source_row * width +
++                (uint64_t)kv_head * head_dim;
++            const __half *key_src =
++                (current ? staged_key : key_cache) + kv_base;
++            const __half *value_src =
++                (current ? staged_value : value_cache) + kv_base;
++            ((uint4 *)shared_key[kt])[vec] =
++                ((const uint4 *)key_src)[vec];
++            ((uint4 *)shared_value[kt])[vec] =
++                ((const uint4 *)value_src)[vec];
 +        }
 +        __syncthreads();
 +
-+        const float key0 = __half2float(shared_key[lane]);
-+        const float key1 = __half2float(shared_key[lane + 32u]);
-+        const float key2 = __half2float(shared_key[lane + 64u]);
-+        const float key3 = __half2float(shared_key[lane + 96u]);
-+        const float pair0 = __fadd_rn(
-+                __fmul_rn(qh[lane], key0),
-+                __fmul_rn(qh[lane + 64u], key2));
-+        const float pair1 = __fadd_rn(
-+                __fmul_rn(qh[lane + 32u], key1),
-+                __fmul_rn(qh[lane + 96u], key3));
-+        float score = warp_sum_f32(__fadd_rn(pair0, pair1));
++        for (uint32_t kt = 0u; kt < tile_keys; kt++) {
++            const float key0 =
++                __half2float(shared_key[kt][lane]);
++            const float key1 =
++                __half2float(shared_key[kt][lane + 32u]);
++            const float key2 =
++                __half2float(shared_key[kt][lane + 64u]);
++            const float key3 =
++                __half2float(shared_key[kt][lane + 96u]);
++            const float pair0 = __fadd_rn(
++                    __fmul_rn(qh[lane], key0),
++                    __fmul_rn(qh[lane + 64u], key2));
++            const float pair1 = __fadd_rn(
++                    __fmul_rn(qh[lane + 32u], key1),
++                    __fmul_rn(qh[lane + 96u], key3));
++            float score = warp_sum_f32(__fadd_rn(pair0, pair1));
 +
-+        float old_scale = 0.0f;
-+        float value_scale = 0.0f;
-+        if (lane == 0u) {
-+            score *= scale;
-+            const float next_max = fmaxf(max_score, score);
-+            old_scale = isinf(max_score) ?
-+                0.0f : expf(max_score - next_max);
-+            value_scale = expf(score - next_max);
-+            score_sum = score_sum * old_scale + value_scale;
-+            max_score = next_max;
++            float old_scale = 0.0f;
++            float value_scale = 0.0f;
++            if (lane == 0u) {
++                score *= scale;
++                const float next_max = fmaxf(max_score, score);
++                old_scale = isinf(max_score) ?
++                    0.0f : expf(max_score - next_max);
++                value_scale = expf(score - next_max);
++                score_sum = score_sum * old_scale + value_scale;
++                max_score = next_max;
++            }
++            old_scale =
++                __shfl_sync(0xffffffffu, old_scale, 0);
++            value_scale =
++                __shfl_sync(0xffffffffu, value_scale, 0);
++            acc0 = acc0 * old_scale +
++                __half2float(shared_value[kt][lane]) * value_scale;
++            acc1 = acc1 * old_scale +
++                __half2float(shared_value[kt][lane + 32u]) *
++                    value_scale;
++            acc2 = acc2 * old_scale +
++                __half2float(shared_value[kt][lane + 64u]) *
++                    value_scale;
++            acc3 = acc3 * old_scale +
++                __half2float(shared_value[kt][lane + 96u]) *
++                    value_scale;
 +        }
-+        old_scale = __shfl_sync(0xffffffffu, old_scale, 0);
-+        value_scale = __shfl_sync(0xffffffffu, value_scale, 0);
-+        acc0 = acc0 * old_scale +
-+            __half2float(shared_value[lane]) * value_scale;
-+        acc1 = acc1 * old_scale +
-+            __half2float(shared_value[lane + 32u]) * value_scale;
-+        acc2 = acc2 * old_scale +
-+            __half2float(shared_value[lane + 64u]) * value_scale;
-+        acc3 = acc3 * old_scale +
-+            __half2float(shared_value[lane + 96u]) * value_scale;
 +        __syncthreads();
 +    }
 +
@@ -8703,6 +8745,13 @@ index e66fa36..d991e65 100644
 +        desc->gate_expert_bytes == desc->up_expert_bytes &&
 +        desc->gate_row_bytes == desc->up_row_bytes &&
 +        getenv("DS4_CUDA_LAGUNA_NO_SORTED_MOE") == NULL;
++    const bool use_q4_mma_gate_up_tile16 =
++        use_sorted_gate_up &&
++        use_q4_mma_gate_up &&
++        n_tokens >= 128u &&
++        cuda_laguna_blackwell_ok() &&
++        getenv("DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16") == NULL &&
++        cuda_q4_mma_tile16_shmem_ok(0);
 +    const uint64_t xq_bytes =
 +        (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K);
 +    const uint64_t midq_offset = (xq_bytes + 255u) & ~255ull;
@@ -8728,10 +8777,22 @@ index e66fa36..d991e65 100644
 +    const uint64_t tile_experts_bytes =
 +        tile_capacity * sizeof(uint32_t);
 +    const uint64_t tile_starts_bytes = tile_experts_bytes;
++    const uint64_t tile16_offsets_bytes =
++        use_q4_mma_gate_up_tile16 ? offsets_bytes : 0u;
++    const uint64_t tile16_capacity =
++        use_q4_mma_gate_up_tile16 ?
++            (pairs + 15u) / 16u + n_total_expert : 0u;
++    const uint64_t tile16_total_bytes =
++        use_q4_mma_gate_up_tile16 ? sizeof(uint32_t) : 0u;
++    const uint64_t tile16_experts_bytes =
++        tile16_capacity * sizeof(uint32_t);
++    const uint64_t tile16_starts_bytes = tile16_experts_bytes;
 +    const uint64_t sorted_bytes =
 +        counts_bytes + offsets_bytes + cursors_bytes +
 +        sorted_pairs_bytes + tile_offsets_bytes + tile_total_bytes +
-+        tile_experts_bytes + tile_starts_bytes;
++        tile_experts_bytes + tile_starts_bytes +
++        tile16_offsets_bytes + tile16_total_bytes +
++        tile16_experts_bytes + tile16_starts_bytes;
 +    if (sorted_base > UINT64_MAX - sorted_bytes) return 0;
 +    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc_on(
 +            logical_tier, sorted_base + sorted_bytes, "Laguna MoE");
@@ -8745,6 +8806,9 @@ index e66fa36..d991e65 100644
 +    uint32_t *tile_total = NULL;
 +    uint32_t *tile_experts = NULL;
 +    uint32_t *tile_starts = NULL;
++    uint32_t *tile16_total = NULL;
++    uint32_t *tile16_experts = NULL;
++    uint32_t *tile16_starts = NULL;
 +    q8_K_quantize_kernel<<<dim3(xq_blocks, n_tokens, 1u), 256>>>(
 +            xq, (const float *)x->ptr, expert_in_dim, n_tokens);
 +    if (!cuda_ok(cudaGetLastError(), "Laguna MoE input quantize launch")) {
@@ -8768,7 +8832,19 @@ index e66fa36..d991e65 100644
 +            (uint8_t *)tile_total + tile_total_bytes);
 +        tile_starts = (uint32_t *)(
 +            (uint8_t *)tile_experts + tile_experts_bytes);
-+        if (pairs > UINT32_MAX || tile_capacity > UINT32_MAX) return 0;
++        uint32_t *tile16_offsets = (uint32_t *)(
++            (uint8_t *)tile_starts + tile_starts_bytes);
++        tile16_total = (uint32_t *)(
++            (uint8_t *)tile16_offsets + tile16_offsets_bytes);
++        tile16_experts = (uint32_t *)(
++            (uint8_t *)tile16_total + tile16_total_bytes);
++        tile16_starts = (uint32_t *)(
++            (uint8_t *)tile16_experts + tile16_experts_bytes);
++        if (pairs > UINT32_MAX ||
++            tile_capacity > UINT32_MAX ||
++            tile16_capacity > UINT32_MAX) {
++            return 0;
++        }
 +        if (!cuda_ok(cudaMemsetAsync(sorted_counts, 0, counts_bytes),
 +                     "Laguna sorted MoE counts clear")) {
 +            return 0;
@@ -8814,10 +8890,54 @@ index e66fa36..d991e65 100644
 +                     "Laguna sorted MoE tile launch")) {
 +            return 0;
 +        }
++        if (use_q4_mma_gate_up_tile16) {
++            moe_build_expert_tile_offsets_kernel<<<1, 1>>>(
++                    tile16_offsets, tile16_total, sorted_counts,
++                    16u, n_total_expert);
++            if (!cuda_ok(cudaGetLastError(),
++                         "Laguna sorted MoE tile16-offset launch")) {
++                return 0;
++            }
++            moe_build_expert_tiles_kernel<<<
++                    (n_total_expert + 255u) / 256u, 256>>>(
++                    tile16_experts, tile16_starts, tile16_offsets,
++                    sorted_counts, 16u, n_total_expert);
++            if (!cuda_ok(cudaGetLastError(),
++                         "Laguna sorted MoE tile16 launch")) {
++                return 0;
++            }
++        }
 +        if (n_tokens >= 128u) {
 +            dim3 grid((expert_mid_dim + 511u) / 512u,
 +                      (uint32_t)tile_capacity, 1u);
-+            if (use_q4_mma_gate_up) {
++            if (use_q4_mma_gate_up_tile16) {
++                const size_t tile16_shmem =
++                    16u * 16u * sizeof(cuda_block_q8_K);
++                dim3 grid16((expert_mid_dim + 511u) / 512u,
++                            (uint32_t)tile16_capacity, 1u);
++                moe_gate_up_mid_q4K_tile16_mma_kernel<512>
++                        <<<grid16, 256, tile16_shmem>>>(
++                        (float *)mid->ptr,
++                        (float *)mid->ptr,
++                        (float *)mid->ptr,
++                        gate,
++                        up,
++                        xq,
++                        sorted_pairs,
++                        sorted_offsets,
++                        sorted_counts,
++                        tile16_total,
++                        tile16_experts,
++                        tile16_starts,
++                        (const float *)weights->ptr,
++                        desc->gate_expert_bytes,
++                        desc->gate_row_bytes,
++                        xq_blocks,
++                        expert_mid_dim,
++                        n_expert,
++                        0u,
++                        0.0f);
++            } else if (use_q4_mma_gate_up) {
 +                moe_gate_up_mid_q4K_tile8_mma_kernel<512>
 +                        <<<grid, 256>>>(
 +                        (float *)mid->ptr,
@@ -9607,6 +9727,21 @@ index e66fa36..d991e65 100644
 +        n_head >= 48u &&
 +        getenv("DS4_CUDA_LAGUNA_NO_GQA_PREFILL") == NULL &&
 +        getenv("DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL") == NULL;
++    const bool use_tiled_warp_gqa =
++        getenv("DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL") == NULL;
++#define DS4_LAGUNA_WARP_GQA_LAUNCH(HEADS, KEYS) do { \
++        laguna_attention_prefill_warp_gqa_kernel<HEADS, KEYS><<< \
++                dim3(n_head_kv, n_tokens, 1u), HEADS * 32u>>>( \
++                (float *)heads->ptr, \
++                (const float *)q->ptr, \
++                (const float *)gate->ptr, \
++                (const __half *)key_cache->ptr, \
++                (const __half *)value_cache->ptr, \
++                (const __half *)staged_key->ptr, \
++                (const __half *)staged_value->ptr, \
++                pos0, n_tokens, cache_cap, \
++                n_head, n_head_kv, head_dim, scale); \
++    } while (0)
 +    if (blackwell_verify_split) {
 +        laguna_attention_verify_split_kernel<16><<<
 +                dim3(n_head, n_tokens, 1u), 512>>>(
@@ -9620,30 +9755,18 @@ index e66fa36..d991e65 100644
 +                pos0, n_tokens, cache_cap,
 +                n_head, n_head_kv, head_dim, scale);
 +    } else if (heads_per_kv == 6u && use_warp_gqa) {
-+        laguna_attention_prefill_warp_gqa_kernel<6><<<
-+                dim3(n_head_kv, n_tokens, 1u), 6u * 32u>>>(
-+                (float *)heads->ptr,
-+                (const float *)q->ptr,
-+                (const float *)gate->ptr,
-+                (const __half *)key_cache->ptr,
-+                (const __half *)value_cache->ptr,
-+                (const __half *)staged_key->ptr,
-+                (const __half *)staged_value->ptr,
-+                pos0, n_tokens, cache_cap,
-+                n_head, n_head_kv, head_dim, scale);
++        if (use_tiled_warp_gqa) {
++            DS4_LAGUNA_WARP_GQA_LAUNCH(6, 16);
++        } else {
++            DS4_LAGUNA_WARP_GQA_LAUNCH(6, 1);
++        }
 +    } else if (heads_per_kv == 9u && use_warp_gqa &&
 +               getenv("DS4_CUDA_DFLASH_NO_BLACKWELL") == NULL) {
-+        laguna_attention_prefill_warp_gqa_kernel<9><<<
-+                dim3(n_head_kv, n_tokens, 1u), 9u * 32u>>>(
-+                (float *)heads->ptr,
-+                (const float *)q->ptr,
-+                (const float *)gate->ptr,
-+                (const __half *)key_cache->ptr,
-+                (const __half *)value_cache->ptr,
-+                (const __half *)staged_key->ptr,
-+                (const __half *)staged_value->ptr,
-+                pos0, n_tokens, cache_cap,
-+                n_head, n_head_kv, head_dim, scale);
++        if (use_tiled_warp_gqa) {
++            DS4_LAGUNA_WARP_GQA_LAUNCH(9, 16);
++        } else {
++            DS4_LAGUNA_WARP_GQA_LAUNCH(9, 1);
++        }
 +    } else if (heads_per_kv == 6u &&
 +        getenv("DS4_CUDA_LAGUNA_NO_GQA_PREFILL") == NULL) {
 +        laguna_attention_prefill_gqa_kernel<6><<<
@@ -9690,7 +9813,7 @@ index e66fa36..d991e65 100644
 +                pos0, n_tokens, cache_cap,
 +                n_head, n_head_kv, head_dim, scale);
 +    } else {
-+        laguna_attention_prefill_kernel<<<
++            laguna_attention_prefill_kernel<<<
 +                dim3(n_head, n_tokens, 1u), head_dim>>>(
 +                (float *)heads->ptr,
 +                (const float *)q->ptr,
@@ -9702,6 +9825,7 @@ index e66fa36..d991e65 100644
 +                pos0, n_tokens, cache_cap,
 +                n_head, n_head_kv, head_dim, scale);
 +    }
++#undef DS4_LAGUNA_WARP_GQA_LAUNCH
 +    if (!cuda_ok(cudaGetLastError(), "Laguna prefill attention launch")) {
 +        return 0;
 +    }
@@ -10896,15 +11020,17 @@ index 0000000..fe5e4ce
 +8192,4096,224.72,256,13.49,76.631,255,13.55,0
 diff --git a/speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv b/speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv
 new file mode 100644
-index 0000000..deecfea
+index 0000000..6d4b7ee
 --- /dev/null
 +++ b/speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv
-@@ -0,0 +1,5 @@
+@@ -0,0 +1,7 @@
 +source,mode,ctx_tokens,prefill_tokens,prefill_tps,environment
 +pre-rebase,blackwell-warp-gqa,2048,2048,578.52,-
 +pre-rebase,portable-grouped-gqa,2048,2048,415.27,DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1
 +cc321ba,blackwell-warp-gqa,2048,2048,518.77,-
 +cc321ba,portable-grouped-gqa,2048,2048,374.67,DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1
++b991057,tiled-blackwell-warp-gqa,2048,2048,580.54,-
++b991057,untiled-blackwell-warp-gqa,2048,2048,518.49,DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL=1
 diff --git a/speed-bench/laguna_s21_q2_q3_gb10.csv b/speed-bench/laguna_s21_q2_q3_gb10.csv
 new file mode 100644
 index 0000000..39b2eba
@@ -10918,10 +11044,10 @@ index 0000000..39b2eba
 +ds4.c,2048,2048,256,dflash-blackwell,266.75,32.49,241.872,254,33.30,-
 diff --git a/tests/cuda_laguna_smoke.c b/tests/cuda_laguna_smoke.c
 new file mode 100644
-index 0000000..b0b0e9b
+index 0000000..12f6812
 --- /dev/null
 +++ b/tests/cuda_laguna_smoke.c
-@@ -0,0 +1,1894 @@
+@@ -0,0 +1,1907 @@
 +#include "ds4_gpu.h"
 +
 +#include <cuda_runtime_api.h>
@@ -11775,17 +11901,17 @@ index 0000000..b0b0e9b
 +
 +static int check_dflash_blackwell_attention(void) {
 +    enum {
-+        n_tokens = 3,
++        n_tokens = 17,
 +        n_head = 72,
 +        n_head_kv = 8,
-+        cache_cap = 4
++        cache_cap = 20
 +    };
 +    const uint64_t q_values = (uint64_t)n_tokens * n_head * HEAD_DIM;
 +    const uint64_t kv_values =
 +        (uint64_t)n_tokens * n_head_kv * HEAD_DIM;
 +    float q[q_values], k[kv_values], v[kv_values];
 +    float gate[n_tokens * n_head];
-+    float portable[q_values], blackwell[q_values];
++    float portable[q_values], untiled[q_values], blackwell[q_values];
 +    for (uint64_t i = 0; i < q_values; i++) {
 +        q[i] = 0.015625f * (float)(1u + i % 13u);
 +    }
@@ -11831,6 +11957,17 @@ index 0000000..b0b0e9b
 +          "portable DFlash attention");
 +    CHECK(unsetenv("DS4_CUDA_DFLASH_NO_BLACKWELL") == 0,
 +          "select Blackwell DFlash attention");
++    CHECK(setenv("DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL", "1", 1) == 0,
++          "select untiled Blackwell DFlash attention");
++    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
++              heads, key_cache, value_cache, staged_key, staged_value,
++              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
++              n_head, n_head_kv, HEAD_DIM,
++              1.0f / sqrtf((float)HEAD_DIM)) &&
++          ds4_gpu_tensor_read(heads, 0, untiled, sizeof(untiled)),
++          "untiled Blackwell DFlash attention");
++    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL") == 0,
++          "select tiled Blackwell DFlash attention");
 +    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
 +              heads, key_cache, value_cache, staged_key, staged_value,
 +              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
@@ -11839,6 +11976,8 @@ index 0000000..b0b0e9b
 +          ds4_gpu_tensor_read(heads, 0, blackwell, sizeof(blackwell)),
 +          "Blackwell DFlash attention");
 +    for (uint64_t i = 0; i < q_values; i++) {
++        CHECK(close_enough(blackwell[i], untiled[i], 1e-6f, 1e-6f),
++              "tiled Blackwell DFlash attention equivalence");
 +        CHECK(close_enough(blackwell[i], portable[i], 1e-6f, 1e-6f),
 +              "Blackwell DFlash attention equivalence");
 +    }

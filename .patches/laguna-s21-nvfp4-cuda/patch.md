@@ -114,7 +114,7 @@ DFlash Tensor Core and Blackwell attention kernels.
 - The attached CUDA host is a GB10 (`sm_121`) with CUDA 13 and is the primary
   Blackwell validation target.
 - The dependent Laguna CUDA source realization is commit
-  `cc321ba60594bccb1029ea1f1b3cde801e7b0910`.
+  `b991057b0ae752defc90cca1805442cc64bac327`.
 
 # Open questions
 
@@ -195,11 +195,18 @@ reproduce the portable reduction tree before the warp shuffle reduction.
   attention for both six-head target groups and nine-head DFlash groups. Gate
   it on production-size models and retain
   `DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1` as the direct portable comparison.
+- Inherit the source patch's 16-key shared-memory attention tile for ordinary
+  target and DFlash prefill because native NVFP4 keeps attention in BF16.
+  Preserve the split-history verifier dispatch for at-most-16-token batches
+  and retain `DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL=1` as the direct untiled
+  comparison.
 - Inherit the source patch's exact INT8 tensor-core Q4_K gate/up and
   chunked-down kernels for GGUF targets, but keep native type-40 dispatch on
   its existing block-scaled FP4 MMA. The source kernels are format-specific,
   while NVFP4 already applies the same expert grouping and compact chunked
-  term-buffer schedule directly to packed E2M1 weights.
+  term-buffer schedule directly to packed E2M1 weights. Likewise, keep the
+  source's new Q4_K tile16 selection and PTX guard scoped to Q4_K; native
+  NVFP4 already launches its own 16-route expert tiles through FP4 MMA.
 - Keep the 16-lane W4A4 integer-dot schedule for decode because SM121 offers
   no GEMV-sized NVFP4 MMA instruction and the direct one-column MMA path
   benchmarks slower.
@@ -251,6 +258,11 @@ reproduce the portable reduction tree before the warp shuffle reduction.
   `DS4_CUDA_LAGUNA_NO_WARP_GQA_PREFILL=1`, a 38.5% improvement. The earlier
   tree measured 578.52 versus 415.27 token/s; both paired results are stored in
   `speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv`.
+- After rebasing onto source commit `b991057`, the same workload measures
+  580.54 token/s with the inherited 16-key attention tile versus 518.49
+  token/s with `DS4_CUDA_LAGUNA_NO_TILED_GQA_PREFILL=1`, an additional 12.0%
+  improvement over the otherwise identical warp-per-head schedule. The pair
+  is stored in `speed-bench/laguna_s21_nvfp4_prefill_attention_gb10.csv`.
 - The grouped FP4 MMA benchmark at 2K/4K/8K reports prompt throughput of
   413.38/317.80/224.72 token/s, compared with 95.05/87.59/78.13 for the prior
   integer-dot prompt kernel, and steady decode of 14.26/14.10/13.55 token/s.
@@ -312,6 +324,10 @@ Explicitly requested:
 - Repeat the adaptation after the optimized source implementation was pushed:
   rebase the NVFP4 commits onto it, retain applicable changes, benchmark the
   combined tree, and update the branch.
+- Repeat the process after the source attention and MoE tiling optimization:
+  reuse the BF16 attention tile for NVFP4, retain the native FP4-specific MoE
+  schedule, benchmark the direct tiled/untiled pair, and update the patch,
+  commit, and PR branch.
 
 Observed from the official checkpoint:
 
