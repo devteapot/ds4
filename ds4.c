@@ -3539,10 +3539,17 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
                                                    uint32_t span_count,
                                                    uint64_t *prepared_out) {
     uint64_t cap = m->n_tensors;
+    if (m->native_safetensors) {
+        const uint64_t native_spans =
+            (uint64_t)DS4_N_LAYER * 3u * DS4_N_EXPERT * 2u;
+        if (cap > UINT64_MAX - native_spans) return false;
+        cap += native_spans;
+    }
     if (cap == 0) {
         if (prepared_out) *prepared_out = 0;
         return true;
     }
+    if (cap > SIZE_MAX / sizeof(accelerator_tensor_span)) return false;
 
     accelerator_tensor_span *spans = xmalloc((size_t)cap * sizeof(spans[0]));
     uint64_t nspan = 0;
@@ -3574,6 +3581,50 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
         };
+    }
+    /*
+     * A native NVFP4 expert group is represented by one logical ds4_tensor,
+     * but its packed weights and block scales remain separate tensors in the
+     * official safetensors shards.  Add those physical ranges to the same
+     * startup residency pass used by GGUF tensors.  This keeps first inference
+     * from paying a one-time expert upload and lets the descriptor cache reuse
+     * the already prepared CUDA ranges.
+     */
+    if (m->native_safetensors && m->native_nvfp4) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            for (uint32_t pi = 0; pi < 3u; pi++) {
+                const ds4_native_nvfp4_matrix *g =
+                    &m->native_nvfp4[il * 3u + pi];
+                if (g->packed_bytes == 0 || g->scale_bytes == 0) continue;
+                for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                    const uint64_t packed_off = g->packed_offset[e];
+                    const uint64_t scale_off = g->scale_offset[e];
+                    if (packed_off > m->size ||
+                        g->packed_bytes > m->size - packed_off ||
+                        scale_off > m->size ||
+                        g->scale_bytes > m->size - scale_off) {
+                        free(spans);
+                        return false;
+                    }
+                    if (accelerator_span_filter_contains(
+                            packed_off, g->packed_bytes,
+                            span_offsets, span_sizes, span_count)) {
+                        spans[nspan++] = (accelerator_tensor_span){
+                            .off = packed_off,
+                            .end = packed_off + g->packed_bytes,
+                        };
+                    }
+                    if (accelerator_span_filter_contains(
+                            scale_off, g->scale_bytes,
+                            span_offsets, span_sizes, span_count)) {
+                        spans[nspan++] = (accelerator_tensor_span){
+                            .off = scale_off,
+                            .end = scale_off + g->scale_bytes,
+                        };
+                    }
+                }
+            }
+        }
     }
     if (nspan == 0) {
         free(spans);

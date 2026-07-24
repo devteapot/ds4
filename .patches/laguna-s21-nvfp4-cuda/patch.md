@@ -101,8 +101,11 @@ None.
 Keep native-file parsing narrow and Laguna-specific. Map shards into one
 reserved virtual range so existing model-offset APIs remain usable for dense
 tensors, but carry routed expert physical offsets through
-`ds4_gpu_nvfp4_matrix_desc`. Skip logical native groups during contiguous
-startup span preparation; CUDA resolves and caches their physical tensors.
+`ds4_gpu_nvfp4_matrix_desc`. Skip the synthetic logical native groups during
+contiguous startup span preparation because their underlying shard ranges are
+not contiguous. Add their physical packed-weight and block-scale ranges
+instead, so CUDA resolves and caches the real tensors before first inference
+and benchmark prefill does not pay a one-time expert upload.
 
 The packed compressed-tensors layout is adjacent: each byte's low nibble is
 the even element and its high nibble is the odd element. Both weights and
@@ -144,9 +147,14 @@ stored in the CUDA descriptor cache.
 - Native tokenizer smoke: `Hello` maps to token 6352.
 - Deterministic live prompt `Reply with exactly: OK` produces `OK` directly
   from the official sharded checkpoint. On rebased GB10 code the W4A4 path
-  reports about 11.3 token/s decode. Cold first-prompt preparation is
-  dominated by building the file-backed expert cache and reports about
-  0.25 token/s for 48 input tokens.
+  reports about 11.3 token/s decode.
+- CUDA startup residency covers 66.96 GiB of physical dense, packed-weight,
+  and block-scale tensor ranges before inference timing.
+- `ds4-bench` with 2K/4K/8K frontiers and 256 decode tokens reports Blackwell
+  steady decode of 14.01/14.04/13.39 token/s and portable steady decode of
+  13.76/12.91/11.86 token/s. The raw runs are stored in
+  `speed-bench/laguna_s21_nvfp4_gb10.csv` and
+  `speed-bench/laguna_s21_nvfp4_gb10_portable.csv`.
 
 # Provenance
 

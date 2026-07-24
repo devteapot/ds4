@@ -283,7 +283,7 @@ index e52da5d..df0c619 100755
      cd "$ROOT"
      ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
 diff --git a/ds4.c b/ds4.c
-index 39b39be..1d3437e 100644
+index 39b39be..a896caa 100644
 --- a/ds4.c
 +++ b/ds4.c
 @@ -19,6 +19,7 @@
@@ -991,7 +991,25 @@ index 39b39be..1d3437e 100644
      ds4_dspark_summary s = model_dspark_summary(m);
      if (summary_out) *summary_out = s;
      if (stages_out) *stages_out = s.stages;
-@@ -2958,6 +3547,11 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
+@@ -2941,10 +3530,17 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
+                                                    uint32_t span_count,
+                                                    uint64_t *prepared_out) {
+     uint64_t cap = m->n_tensors;
++    if (m->native_safetensors) {
++        const uint64_t native_spans =
++            (uint64_t)DS4_N_LAYER * 3u * DS4_N_EXPERT * 2u;
++        if (cap > UINT64_MAX - native_spans) return false;
++        cap += native_spans;
++    }
+     if (cap == 0) {
+         if (prepared_out) *prepared_out = 0;
+         return true;
+     }
++    if (cap > SIZE_MAX / sizeof(accelerator_tensor_span)) return false;
+ 
+     accelerator_tensor_span *spans = xmalloc((size_t)cap * sizeof(spans[0]));
+     uint64_t nspan = 0;
+@@ -2958,6 +3554,11 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
      }
      for (uint64_t i = 0; i < m->n_tensors; i++) {
          const ds4_tensor *t = &m->tensors[i];
@@ -1003,7 +1021,58 @@ index 39b39be..1d3437e 100644
          if (t->bytes == 0) continue;
          if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
              free(spans);
-@@ -3053,6 +3647,7 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
+@@ -2972,6 +3573,50 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
+             .end = t->abs_offset + t->bytes,
+         };
+     }
++    /*
++     * A native NVFP4 expert group is represented by one logical ds4_tensor,
++     * but its packed weights and block scales remain separate tensors in the
++     * official safetensors shards.  Add those physical ranges to the same
++     * startup residency pass used by GGUF tensors.  This keeps first inference
++     * from paying a one-time expert upload and lets the descriptor cache reuse
++     * the already prepared CUDA ranges.
++     */
++    if (m->native_safetensors && m->native_nvfp4) {
++        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
++            for (uint32_t pi = 0; pi < 3u; pi++) {
++                const ds4_native_nvfp4_matrix *g =
++                    &m->native_nvfp4[il * 3u + pi];
++                if (g->packed_bytes == 0 || g->scale_bytes == 0) continue;
++                for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
++                    const uint64_t packed_off = g->packed_offset[e];
++                    const uint64_t scale_off = g->scale_offset[e];
++                    if (packed_off > m->size ||
++                        g->packed_bytes > m->size - packed_off ||
++                        scale_off > m->size ||
++                        g->scale_bytes > m->size - scale_off) {
++                        free(spans);
++                        return false;
++                    }
++                    if (accelerator_span_filter_contains(
++                            packed_off, g->packed_bytes,
++                            span_offsets, span_sizes, span_count)) {
++                        spans[nspan++] = (accelerator_tensor_span){
++                            .off = packed_off,
++                            .end = packed_off + g->packed_bytes,
++                        };
++                    }
++                    if (accelerator_span_filter_contains(
++                            scale_off, g->scale_bytes,
++                            span_offsets, span_sizes, span_count)) {
++                        spans[nspan++] = (accelerator_tensor_span){
++                            .off = scale_off,
++                            .end = scale_off + g->scale_bytes,
++                        };
++                    }
++                }
++            }
++        }
++    }
+     if (nspan == 0) {
+         free(spans);
+         if (prepared_out) *prepared_out = 0;
+@@ -3053,6 +3698,7 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
                                           uint32_t span_count) {
      for (uint64_t i = 0; i < m->n_tensors; i++) {
          const ds4_tensor *t = &m->tensors[i];
@@ -1011,7 +1080,7 @@ index 39b39be..1d3437e 100644
          if (t->bytes == 0) continue;
          if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
          if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
-@@ -4163,6 +4758,9 @@ typedef struct {
+@@ -4163,6 +4809,9 @@ typedef struct {
      ds4_tensor *ffn_gate_exps;
      ds4_tensor *ffn_up_exps;
      ds4_tensor *ffn_down_exps;
@@ -1021,7 +1090,7 @@ index 39b39be..1d3437e 100644
      ds4_tensor *ffn_gate_shexp;
      ds4_tensor *ffn_up_shexp;
      ds4_tensor *ffn_down_shexp;
-@@ -4225,6 +4823,28 @@ typedef struct {
+@@ -4225,6 +4874,28 @@ typedef struct {
      ds4_dspark_stage_weights stage[DS4_DSPARK_MAX_STAGES];
  } ds4_dspark_weights;
  
@@ -1050,7 +1119,7 @@ index 39b39be..1d3437e 100644
  /* =========================================================================
   * Fixed Weight Binding and Model Validation.
   * =========================================================================
-@@ -4449,7 +5069,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
+@@ -4449,7 +5120,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
             type == DS4_TENSOR_Q2_K ||
             type == DS4_TENSOR_Q4_K ||
             type == DS4_TENSOR_Q5_K ||
@@ -1060,7 +1129,7 @@ index 39b39be..1d3437e 100644
  }
  
  static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
-@@ -4460,6 +5081,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
+@@ -4460,6 +5132,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
      case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
      case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
      case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
@@ -1068,7 +1137,7 @@ index 39b39be..1d3437e 100644
      default:                 ds4_die("unsupported routed expert tensor type");
      }
      return 0;
-@@ -4850,14 +5472,20 @@ static bool weights_laguna_layer_has_required(const ds4_layer_weights *l, uint32
+@@ -4850,14 +5523,20 @@ static bool weights_laguna_layer_has_required(const ds4_layer_weights *l, uint32
      if (il < DS4_N_LEADING_DENSE) {
          return l->ffn_gate && l->ffn_up && l->ffn_down;
      }
@@ -1097,7 +1166,7 @@ index 39b39be..1d3437e 100644
  }
  
  static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
-@@ -5035,22 +5663,41 @@ static void weights_validate_laguna_layout(
+@@ -5035,22 +5714,41 @@ static void weights_validate_laguna_layout(
          ds4_die("invalid layer range in Laguna weight layout validation");
      }
  
@@ -1144,7 +1213,7 @@ index 39b39be..1d3437e 100644
                  tensor_type_name(layout_marker->type));
          exit(1);
      }
-@@ -5058,7 +5705,9 @@ static void weights_validate_laguna_layout(
+@@ -5058,7 +5756,9 @@ static void weights_validate_laguna_layout(
      if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
      if (w->token_embd) {
          tensor_expect_layout(w->token_embd,
@@ -1155,7 +1224,7 @@ index 39b39be..1d3437e 100644
                               2, DS4_N_EMBD, DS4_N_VOCAB, 0);
      }
  
-@@ -5066,10 +5715,12 @@ static void weights_validate_laguna_layout(
+@@ -5066,10 +5766,12 @@ static void weights_validate_laguna_layout(
      if (require_output && !have_output) ds4_die("required output head tensors are missing");
      if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
      if (have_output) {
@@ -1170,7 +1239,7 @@ index 39b39be..1d3437e 100644
                               2, DS4_N_EMBD, DS4_N_VOCAB, 0);
      }
  
-@@ -5083,10 +5734,10 @@ static void weights_validate_laguna_layout(
+@@ -5083,10 +5785,10 @@ static void weights_validate_laguna_layout(
          const uint64_t q_dim = (uint64_t)n_head * DS4_N_HEAD_DIM;
          const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
  
@@ -1183,7 +1252,7 @@ index 39b39be..1d3437e 100644
          tensor_expect_layout(l->attn_q, attn_type,
                               2, DS4_N_EMBD, q_dim, 0);
          tensor_expect_layout(l->attn_k, attn_type,
-@@ -5095,54 +5746,83 @@ static void weights_validate_laguna_layout(
+@@ -5095,54 +5797,83 @@ static void weights_validate_laguna_layout(
                               2, DS4_N_EMBD, kv_dim, 0);
          tensor_expect_layout(l->attn_gate, attn_type,
                               2, DS4_N_EMBD, n_head, 0);
@@ -1283,7 +1352,7 @@ index 39b39be..1d3437e 100644
              shared_down_type != DS4_TENSOR_Q4_K &&
              shared_down_type != DS4_TENSOR_Q6_K) {
              fprintf(stderr,
-@@ -5967,6 +6647,12 @@ static void config_validate_laguna_model(const ds4_model *m) {
+@@ -5967,6 +6698,12 @@ static void config_validate_laguna_model(const ds4_model *m) {
      memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
      memset(g_ds4_head_counts, 0, sizeof(g_ds4_head_counts));
  
@@ -1296,7 +1365,7 @@ index 39b39be..1d3437e 100644
      const uint32_t n_layer = required_u32(m, "laguna.block_count");
      const uint64_t n_ctx = required_u64_compat(m, "laguna.context_length");
      const uint32_t n_embd = required_u32(m, "laguna.embedding_length");
-@@ -6069,6 +6755,10 @@ static void config_validate_laguna_model(const ds4_model *m) {
+@@ -6069,6 +6806,10 @@ static void config_validate_laguna_model(const ds4_model *m) {
  }
  
  static void config_validate_model(const ds4_model *m) {
@@ -1307,7 +1376,7 @@ index 39b39be..1d3437e 100644
      ds4_str arch = {0};
      if (model_get_string(m, "general.architecture", &arch) && ds4_streq(arch, "glm-dsa")) {
          config_validate_glm_dsa_model(m);
-@@ -6123,6 +6813,12 @@ static void weights_bind_laguna_layer(ds4_layer_weights *l, const ds4_model *m,
+@@ -6123,6 +6864,12 @@ static void weights_bind_laguna_layer(ds4_layer_weights *l, const ds4_model *m,
      l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
      l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
      l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
@@ -1320,7 +1389,7 @@ index 39b39be..1d3437e 100644
      l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
      l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
      l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
-@@ -6871,6 +7567,133 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
+@@ -6871,6 +7618,133 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
      mtp_weights_validate_layout(w);
  }
  
@@ -1454,7 +1523,7 @@ index 39b39be..1d3437e 100644
  static ds4_tensor *dspark_bind_tensor(
          ds4_dspark_weights *dw,
          const ds4_model    *m,
-@@ -35686,6 +36509,9 @@ struct ds4_vocab {
+@@ -35686,6 +36560,9 @@ struct ds4_vocab {
      int dsml_id;
      str_i32_table token_to_id;
      str_i32_table merge_rank;
@@ -1464,7 +1533,7 @@ index 39b39be..1d3437e 100644
  };
  
  /* Engine-side tensor-parallel state.  The transport context is owned by the
-@@ -35713,6 +36539,7 @@ struct ds4_engine {
+@@ -35713,6 +36590,7 @@ struct ds4_engine {
      ds4_weights weights;
      ds4_mtp_weights mtp_weights;
      ds4_dspark_weights dspark_weights;
@@ -1472,7 +1541,7 @@ index 39b39be..1d3437e 100644
      ds4_backend backend;
      ds4_support_kind support_kind;
      int dspark_exec_tier;
-@@ -35748,6 +36575,7 @@ struct ds4_engine {
+@@ -35748,6 +36626,7 @@ struct ds4_engine {
      ds4_engine_tp_state tp;
      bool metal_ready;
      bool mtp_ready;
@@ -1480,7 +1549,7 @@ index 39b39be..1d3437e 100644
      bool share_session_prefill_workspace;
  #ifndef DS4_NO_GPU
      bool shared_prefill_workspace_ready;
-@@ -36544,9 +37372,177 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
+@@ -36544,9 +37423,177 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
  
  /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
  
@@ -1658,7 +1727,7 @@ index 39b39be..1d3437e 100644
      ds4_array_ref tokens;
      ds4_array_ref merges;
      if (!model_get_array(model, "tokenizer.ggml.tokens", &tokens) ||
-@@ -36653,6 +37649,13 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
+@@ -36653,6 +37700,13 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
  }
  
  static void vocab_free(ds4_vocab *vocab) {
@@ -1672,7 +1741,7 @@ index 39b39be..1d3437e 100644
      free(vocab->token);
      table_free(&vocab->token_to_id);
      table_free(&vocab->merge_rank);
-@@ -47247,6 +48250,43 @@ static int generate_glm_metal_argmax(
+@@ -47247,6 +48301,43 @@ static int generate_glm_metal_argmax(
   * full-attention and sliding-window layers with different query geometry.
   * Keep this graph separate from DeepSeek's compressed-attention graph and
   * GLM's DSA graph so their mature scheduling paths remain untouched. */
@@ -1716,7 +1785,7 @@ index 39b39be..1d3437e 100644
  typedef struct {
      uint32_t ctx_size;
      uint32_t prefill_cap;
-@@ -47284,6 +48324,10 @@ typedef struct {
+@@ -47284,6 +48375,10 @@ typedef struct {
      ds4_gpu_tensor *key_cache[DS4_MAX_LAYER];
      ds4_gpu_tensor *value_cache[DS4_MAX_LAYER];
      uint32_t cache_cap[DS4_MAX_LAYER];
@@ -1727,7 +1796,7 @@ index 39b39be..1d3437e 100644
  } ds4_laguna_gpu_graph;
  
  static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
-@@ -47331,6 +48375,121 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
+@@ -47331,6 +48426,121 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
      memset(g, 0, sizeof(*g));
  }
  
@@ -1849,7 +1918,7 @@ index 39b39be..1d3437e 100644
  static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
      if (!g || ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
          DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
-@@ -47414,7 +48573,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+@@ -47414,7 +48624,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
      }
  
      fprintf(stderr,
@@ -1858,7 +1927,7 @@ index 39b39be..1d3437e 100644
              ctx_size,
              g->prefill_cap,
              (double)g->kv_bytes / 1073741824.0,
-@@ -47422,7 +48581,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+@@ -47422,7 +48632,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
      return true;
  
  fail:
@@ -1867,7 +1936,7 @@ index 39b39be..1d3437e 100644
      laguna_graph_free(g);
      return false;
  }
-@@ -47444,6 +48603,26 @@ static bool laguna_graph_matmul(
+@@ -47444,6 +48654,26 @@ static bool laguna_graph_matmul(
                                           x,
                                           n_tokens) != 0;
      }
@@ -1894,7 +1963,7 @@ index 39b39be..1d3437e 100644
      if (weight->type == DS4_TENSOR_Q6_K) {
          return ds4_gpu_matmul_q6_K_tensor(out,
                                            model->map,
-@@ -47465,10 +48644,90 @@ static bool laguna_graph_matmul(
+@@ -47465,10 +48695,90 @@ static bool laguna_graph_matmul(
                                         n_tokens) != 0;
  }
  
@@ -1985,7 +2054,7 @@ index 39b39be..1d3437e 100644
          int                   token,
          uint32_t              pos,
          float                *logits_out) {
-@@ -47509,13 +48768,8 @@ static bool laguna_graph_forward_token(
+@@ -47509,13 +48819,8 @@ static bool laguna_graph_forward_token(
          const uint32_t rope_ctx = is_swa ?
              (uint32_t)DS4_CONTEXT_LENGTH : (uint32_t)DS4_ROPE_ORIG_CTX;
  
@@ -2001,7 +2070,7 @@ index 39b39be..1d3437e 100644
          if (ok) {
              if (l->attn_q->type == DS4_TENSOR_F16) {
                  ok = ds4_gpu_laguna_qkvg_f16_tensor(
-@@ -47534,6 +48788,17 @@ static bool laguna_graph_forward_token(
+@@ -47534,6 +48839,17 @@ static bool laguna_graph_forward_token(
                          DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
                          n_head,
                          g->attn_norm) != 0;
@@ -2019,7 +2088,7 @@ index 39b39be..1d3437e 100644
              } else {
                  ok = ds4_gpu_matmul_q8_0_pair_tensor(
                          g->q,
-@@ -47562,7 +48827,16 @@ static bool laguna_graph_forward_token(
+@@ -47562,7 +48878,16 @@ static bool laguna_graph_forward_token(
              }
          }
          if (ok) {
@@ -2037,7 +2106,7 @@ index 39b39be..1d3437e 100644
                      g->q,
                      g->k,
                      model->map,
-@@ -47583,6 +48857,7 @@ static bool laguna_graph_forward_token(
+@@ -47583,6 +48908,7 @@ static bool laguna_graph_forward_token(
                      beta_fast,
                      beta_slow,
                      DS4_RMS_EPS) != 0;
@@ -2045,7 +2114,7 @@ index 39b39be..1d3437e 100644
          }
          uint32_t key_count = pos + 1u;
          if (key_count > g->cache_cap[il]) key_count = g->cache_cap[il];
-@@ -47629,13 +48904,8 @@ static bool laguna_graph_forward_token(
+@@ -47629,13 +48955,8 @@ static bool laguna_graph_forward_token(
              }
          }
          if (ok) {
@@ -2061,7 +2130,7 @@ index 39b39be..1d3437e 100644
          }
  
          if (ok && il < DS4_N_LEADING_DENSE) {
-@@ -47671,14 +48941,11 @@ static bool laguna_graph_forward_token(
+@@ -47671,14 +48992,11 @@ static bool laguna_graph_forward_token(
                                          DS4_N_EMBD) != 0;
              }
          } else if (ok) {
@@ -2081,7 +2150,7 @@ index 39b39be..1d3437e 100644
              if (ok) {
                  ok = ds4_gpu_glm_router_select_tensor(
                          g->router_selected,
-@@ -47706,15 +48973,24 @@ static bool laguna_graph_forward_token(
+@@ -47706,15 +49024,24 @@ static bool laguna_graph_forward_token(
              const uint64_t down_expert_bytes =
                  l->ffn_down_exps->dim[1] * down_row_bytes;
              const uint64_t shared_gate_row_bytes =
@@ -2109,7 +2178,7 @@ index 39b39be..1d3437e 100644
                  .gate_type = l->ffn_gate_exps->type,
                  .up_type = l->ffn_up_exps->type,
                  .down_type = l->ffn_down_exps->type,
-@@ -47724,11 +49000,20 @@ static bool laguna_graph_forward_token(
+@@ -47724,11 +49051,20 @@ static bool laguna_graph_forward_token(
                  .up_row_bytes = up_row_bytes,
                  .down_expert_bytes = down_expert_bytes,
                  .down_row_bytes = down_row_bytes,
@@ -2130,7 +2199,7 @@ index 39b39be..1d3437e 100644
                  .gate_type = l->ffn_gate_shexp->type,
                  .up_type = l->ffn_up_shexp->type,
                  .down_type = l->ffn_down_shexp->type,
-@@ -47745,7 +49030,51 @@ static bool laguna_graph_forward_token(
+@@ -47745,7 +49081,51 @@ static bool laguna_graph_forward_token(
              /* The legacy recipe can co-dispatch routed and shared Q4 work.
               * The replacement keeps routed experts Q4 but makes the shared
               * expert Q8, so each uses its native fast kernel family. */
@@ -2183,7 +2252,7 @@ index 39b39be..1d3437e 100644
                  ok = ds4_gpu_laguna_routed_shared_moe_one_tensor(
                          g->ffn_out,
                          g->routed_mid,
-@@ -47826,17 +49155,16 @@ static bool laguna_graph_forward_token(
+@@ -47826,17 +49206,16 @@ static bool laguna_graph_forward_token(
              ds4_gpu_tensor *tmp = g->cur;
              g->cur = g->next;
              g->next = tmp;
@@ -2207,7 +2276,7 @@ index 39b39be..1d3437e 100644
          if (ok) {
              ok = laguna_graph_matmul(g->logits,
                                       model,
-@@ -47882,13 +49210,15 @@ static bool laguna_graph_forward_batch(
+@@ -47882,13 +49261,15 @@ static bool laguna_graph_forward_batch(
          ds4_laguna_gpu_graph *g,
          const ds4_model      *model,
          const ds4_weights    *weights,
@@ -2224,7 +2293,7 @@ index 39b39be..1d3437e 100644
      if (!g || !model || !weights || !tokens || n_tokens == 0 ||
          n_tokens > g->prefill_cap || pos0 > g->ctx_size - n_tokens) {
          return false;
-@@ -47960,15 +49290,8 @@ static bool laguna_graph_forward_batch(
+@@ -47960,15 +49341,8 @@ static bool laguna_graph_forward_batch(
              (uint32_t)DS4_CONTEXT_LENGTH : (uint32_t)DS4_ROPE_ORIG_CTX;
  
          failed_stage = "attention norm";
@@ -2242,7 +2311,7 @@ index 39b39be..1d3437e 100644
          if (ok) {
              failed_stage = "Q projection";
              ok = laguna_graph_matmul(g->q,
-@@ -48000,7 +49323,15 @@ static bool laguna_graph_forward_batch(
+@@ -48000,7 +49374,15 @@ static bool laguna_graph_forward_batch(
          }
          if (ok) {
              failed_stage = "Q norm/RoPE";
@@ -2259,7 +2328,7 @@ index 39b39be..1d3437e 100644
                      g->q,
                      model->map,
                      model->size,
-@@ -48018,10 +49349,19 @@ static bool laguna_graph_forward_batch(
+@@ -48018,10 +49400,19 @@ static bool laguna_graph_forward_batch(
                      beta_fast,
                      beta_slow,
                      DS4_RMS_EPS) != 0;
@@ -2280,7 +2349,7 @@ index 39b39be..1d3437e 100644
                      g->k,
                      model->map,
                      model->size,
-@@ -48039,6 +49379,7 @@ static bool laguna_graph_forward_batch(
+@@ -48039,6 +49430,7 @@ static bool laguna_graph_forward_batch(
                      beta_fast,
                      beta_slow,
                      DS4_RMS_EPS) != 0;
@@ -2288,7 +2357,7 @@ index 39b39be..1d3437e 100644
          }
          if (ok) {
              failed_stage = "causal attention";
-@@ -48077,15 +49418,8 @@ static bool laguna_graph_forward_batch(
+@@ -48077,15 +49469,8 @@ static bool laguna_graph_forward_batch(
          }
          if (ok) {
              failed_stage = "FFN norm";
@@ -2306,7 +2375,7 @@ index 39b39be..1d3437e 100644
          }
  
          if (ok && il < DS4_N_LEADING_DENSE) {
-@@ -48127,14 +49461,11 @@ static bool laguna_graph_forward_batch(
+@@ -48127,14 +49512,11 @@ static bool laguna_graph_forward_batch(
              }
          } else if (ok) {
              failed_stage = "router projection";
@@ -2326,7 +2395,7 @@ index 39b39be..1d3437e 100644
              if (ok) {
                  failed_stage = "router selection";
                  ok = ds4_gpu_glm_router_select_batch_tensor(
-@@ -48165,35 +49496,79 @@ static bool laguna_graph_forward_batch(
+@@ -48165,35 +49547,79 @@ static bool laguna_graph_forward_batch(
                  l->ffn_down_exps->dim[1] * down_row_bytes;
              if (ok) {
                  failed_stage = "routed experts";
@@ -2435,7 +2504,7 @@ index 39b39be..1d3437e 100644
              }
              if (ok) {
                  failed_stage = "shared expert gate/up";
-@@ -48242,6 +49617,10 @@ static bool laguna_graph_forward_batch(
+@@ -48242,6 +49668,10 @@ static bool laguna_graph_forward_batch(
              g->cur = g->next;
              g->next = tmp;
              completed_layers = il + 1u;
@@ -2446,7 +2515,7 @@ index 39b39be..1d3437e 100644
          }
          if (ok && live_progress) {
              ok = ds4_gpu_end_commands() != 0;
-@@ -48274,6 +49653,39 @@ static bool laguna_graph_forward_batch(
+@@ -48274,6 +49704,39 @@ static bool laguna_graph_forward_batch(
      }
  
      ds4_gpu_tensor *last = NULL;
@@ -2486,7 +2555,7 @@ index 39b39be..1d3437e 100644
      if (ok && logits_out) {
          last = ds4_gpu_tensor_view(
                  g->cur,
-@@ -48281,14 +49693,9 @@ static bool laguna_graph_forward_batch(
+@@ -48281,14 +49744,9 @@ static bool laguna_graph_forward_batch(
                  (uint64_t)DS4_N_EMBD * sizeof(float));
          ok = last != NULL;
          if (ok) {
@@ -2504,7 +2573,7 @@ index 39b39be..1d3437e 100644
          }
          if (ok) {
              ok = laguna_graph_matmul(g->logits,
-@@ -48319,7 +49726,354 @@ static bool laguna_graph_forward_batch(
+@@ -48319,7 +49777,354 @@ static bool laguna_graph_forward_batch(
      return ok;
  }
  
@@ -2860,7 +2929,7 @@ index 39b39be..1d3437e 100644
          const ds4_model   *model,
          const ds4_vocab   *vocab,
          const ds4_weights *weights,
-@@ -48346,6 +50100,7 @@ static int generate_laguna_metal_argmax(
+@@ -48346,6 +50151,7 @@ static int generate_laguna_metal_argmax(
          ok = laguna_graph_forward_batch(&g,
                                          model,
                                          weights,
@@ -2868,7 +2937,7 @@ index 39b39be..1d3437e 100644
                                          prompt->v + i,
                                          n,
                                          (uint32_t)i,
-@@ -48353,7 +50108,8 @@ static int generate_laguna_metal_argmax(
+@@ -48353,7 +50159,8 @@ static int generate_laguna_metal_argmax(
                                              logits : NULL,
                                          NULL,
                                          NULL,
@@ -2878,7 +2947,7 @@ index 39b39be..1d3437e 100644
          i += (int)n;
          if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
      }
-@@ -48373,7 +50129,8 @@ static int generate_laguna_metal_argmax(
+@@ -48373,7 +50180,8 @@ static int generate_laguna_metal_argmax(
          if (emit) emit(emit_ud, token);
          generated++;
          if (i + 1 == n_predict || pos + 1u >= (uint32_t)ctx_size) break;
@@ -2888,7 +2957,7 @@ index 39b39be..1d3437e 100644
          pos++;
      }
      const double decode_t1 = now_sec();
-@@ -48459,17 +50216,17 @@ static int generate_metal_graph_raw_swa(
+@@ -48459,17 +50267,17 @@ static int generate_metal_graph_raw_swa(
                                           progress_ud);
      }
      if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
@@ -2917,7 +2986,7 @@ index 39b39be..1d3437e 100644
      }
  
      const uint32_t prefill_cap =
-@@ -49274,6 +51031,8 @@ struct ds4_session {
+@@ -49274,6 +51082,8 @@ struct ds4_session {
      bool glm_graph_ready;
      ds4_laguna_gpu_graph laguna_graph;
      bool laguna_graph_ready;
@@ -2926,7 +2995,7 @@ index 39b39be..1d3437e 100644
      uint32_t glm_dense_cache_len;
      /* GLM MTP speculative state (--glm-mtp, greedy only). */
      int glm_mtp_draft;
-@@ -51080,6 +52839,7 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
+@@ -51080,6 +52890,7 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
          return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
      }
      if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
@@ -2934,7 +3003,7 @@ index 39b39be..1d3437e 100644
  #ifndef DS4_NO_GPU
      if (e &&
          e->backend != DS4_BACKEND_CPU &&
-@@ -57480,9 +59240,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57480,9 +59291,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
              *out = e;
              return 0;
          }
@@ -2947,7 +3016,7 @@ index 39b39be..1d3437e 100644
              ds4_engine_close(e);
              *out = NULL;
              return 1;
-@@ -57509,12 +59270,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57509,12 +59321,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
              opt->directional_steering_ffn != 0.0f ||
              e->power_percent < 100 ||
              opt->prefill_chunk != 0 ||
@@ -2962,7 +3031,7 @@ index 39b39be..1d3437e 100644
              ds4_engine_close(e);
              *out = NULL;
              return 1;
-@@ -57770,10 +59530,34 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57770,10 +59581,34 @@ static int ds4_engine_open_internal(ds4_engine **out,
                      e->dspark_weights.missing_tensors,
                      e->dspark_weights.invalid_tensors,
                      e->dspark_weights.metadata_errors);
@@ -2998,7 +3067,7 @@ index 39b39be..1d3437e 100644
                      opt->mtp_path,
                      support_kind_name(e->support_kind));
              ds4_engine_close(e);
-@@ -57867,6 +59651,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -57867,6 +59702,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
          }
          ds4_gpu_set_quality(e->quality);
          ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
@@ -3009,7 +3078,7 @@ index 39b39be..1d3437e 100644
          ds4_gpu_set_ssd_streaming(e->ssd_streaming);
          if (!ds4_engine_configure_streaming_auto_cache(e)) {
              ds4_engine_close(e);
-@@ -58129,6 +59917,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
+@@ -58129,6 +59968,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
          }
          const bool support_model_runtime_ready =
              e->mtp_ready ||
@@ -3017,7 +3086,7 @@ index 39b39be..1d3437e 100644
              (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
          if (support_model_runtime_ready &&
              !ds4_gpu_set_model_map_range(e->mtp_model.map,
-@@ -58708,7 +60497,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+@@ -58708,7 +60548,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
              return 1;
          }
          s->laguna_graph_ready = true;
@@ -3041,7 +3110,7 @@ index 39b39be..1d3437e 100644
          s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
          s->sample_probs =
              xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
-@@ -59001,6 +60805,7 @@ void ds4_session_free(ds4_session *s) {
+@@ -59001,6 +60856,7 @@ void ds4_session_free(ds4_session *s) {
  #ifndef DS4_NO_GPU
      else {
          if (ds4_session_is_laguna(s)) {
@@ -3049,7 +3118,7 @@ index 39b39be..1d3437e 100644
              laguna_graph_free(&s->laguna_graph);
          } else if (ds4_session_is_glm(s)) {
              glm_graph_free(&s->glm_graph);
-@@ -60130,19 +61935,24 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
+@@ -60130,19 +61986,24 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                  laguna_graph_forward_token(&s->laguna_graph,
                                             &e->model,
                                             &e->weights,
@@ -3075,7 +3144,7 @@ index 39b39be..1d3437e 100644
              if (!ok) {
                  snprintf(err, errlen,
                           "%s Laguna prefill failed at token %d",
-@@ -60151,6 +61961,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
+@@ -60151,6 +62012,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                  s->checkpoint_valid = false;
                  return 1;
              }
@@ -3095,7 +3164,7 @@ index 39b39be..1d3437e 100644
              for (uint32_t j = 0; j < n; j++) {
                  token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
              }
-@@ -61698,6 +63521,8 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
+@@ -61698,6 +63572,8 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
      case DS4_SUPPORT_DSPARK:
          (void)ds4_session_prepare_dspark_draft(s, token, pos);
          break;
@@ -3104,7 +3173,7 @@ index 39b39be..1d3437e 100644
      case DS4_SUPPORT_NONE:
      default:
          break;
-@@ -61758,13 +63583,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -61758,13 +63634,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
          }
          if ((uint32_t)s->checkpoint.len >= s->laguna_graph.ctx_size) {
              if (errlen) snprintf(err, errlen,
@@ -3121,7 +3190,7 @@ index 39b39be..1d3437e 100644
                                          token,
                                          (uint32_t)s->checkpoint.len,
                                          s->logits)) {
-@@ -61773,6 +63600,18 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -61773,6 +63651,18 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
              s->checkpoint_valid = false;
              return 1;
          }
@@ -3140,7 +3209,7 @@ index 39b39be..1d3437e 100644
          token_vec_push(&s->checkpoint, token);
          s->checkpoint_valid = true;
          s->mtp_draft_valid = false;
-@@ -66135,6 +67974,136 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
+@@ -66135,6 +68025,136 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
      return rc;
  }
  
@@ -3277,7 +3346,7 @@ index 39b39be..1d3437e 100644
  int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                          int max_tokens, int eos_token,
                                          int *accepted, int accepted_cap,
-@@ -66191,6 +68160,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+@@ -66191,6 +68211,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      return -1;
  #else
      ds4_engine *e = s->engine;
