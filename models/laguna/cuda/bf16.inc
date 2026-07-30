@@ -1,5 +1,261 @@
 /* CUDA-only BF16 projection and norm fusions for official Laguna checkpoints. */
 
+enum {
+    CUDA_LAGUNA_BF16_LT_PLAN_COUNT = 5,
+};
+
+static const uint32_t cuda_laguna_bf16_lt_out_dims[
+        CUDA_LAGUNA_BF16_LT_PLAN_COUNT] = {
+    1024u, 6144u, 9216u, 12288u, 100352u,
+};
+
+typedef struct {
+    cublasLtMatmulDesc_t operation;
+    cublasLtMatrixLayout_t a;
+    cublasLtMatrixLayout_t b;
+    cublasLtMatrixLayout_t c;
+    cublasLtMatmulAlgo_t algorithm;
+    int state; /* 0: unprepared, 1: ready, -1: unavailable */
+} cuda_laguna_bf16_lt_plan;
+
+static cuda_laguna_bf16_lt_plan
+    g_cuda_laguna_bf16_lt_plans[DS4_MAX_GPUS]
+                                    [CUDA_LAGUNA_BF16_LT_PLAN_COUNT];
+
+static int32_t cuda_laguna_bf16_lt_config_i32(
+        const cublasLtMatmulAlgo_t *algorithm,
+        cublasLtMatmulAlgoConfigAttributes_t attribute) {
+    int32_t value = -1;
+    size_t written = 0u;
+    if (cublasLtMatmulAlgoConfigGetAttribute(
+            algorithm, attribute, &value, sizeof(value), &written) !=
+            CUBLAS_STATUS_SUCCESS) {
+        return -1;
+    }
+    return value;
+}
+
+static uint32_t cuda_laguna_bf16_lt_config_u32(
+        const cublasLtMatmulAlgo_t *algorithm,
+        cublasLtMatmulAlgoConfigAttributes_t attribute) {
+    uint32_t value = UINT32_MAX;
+    size_t written = 0u;
+    if (cublasLtMatmulAlgoConfigGetAttribute(
+            algorithm, attribute, &value, sizeof(value), &written) !=
+            CUBLAS_STATUS_SUCCESS) {
+        return UINT32_MAX;
+    }
+    return value;
+}
+
+static void cuda_laguna_bf16_lt_destroy_plan(
+        cuda_laguna_bf16_lt_plan *plan) {
+    if (plan->c) (void)cublasLtMatrixLayoutDestroy(plan->c);
+    if (plan->b) (void)cublasLtMatrixLayoutDestroy(plan->b);
+    if (plan->a) (void)cublasLtMatrixLayoutDestroy(plan->a);
+    if (plan->operation) {
+        (void)cublasLtMatmulDescDestroy(plan->operation);
+    }
+    memset(plan, 0, sizeof(*plan));
+}
+
+static int cuda_laguna_bf16_lt_prepare_plan(
+        int logical_tier,
+        int slot) {
+    cuda_laguna_bf16_lt_plan *plan =
+        &g_cuda_laguna_bf16_lt_plans[logical_tier][slot];
+    if (plan->state != 0) return plan->state > 0;
+    plan->state = -1;
+
+    const cublasLtHandle_t handle =
+        (cublasLtHandle_t)g_gpu[logical_tier].cublaslt;
+    if (!handle) return 0;
+
+    constexpr uint32_t in_dim = 3072u;
+    const uint32_t out_dim = cuda_laguna_bf16_lt_out_dims[slot];
+    const cublasOperation_t transa = CUBLAS_OP_T;
+    const cublasOperation_t transb = CUBLAS_OP_N;
+    cublasLtMatmulPreference_t preference = NULL;
+    constexpr uint64_t max_workspace = 0u;
+    constexpr uint32_t min_alignment_a = 64u;
+    bool descriptors_ok =
+        cublasLtMatmulDescCreate(
+            &plan->operation, CUBLAS_COMPUTE_32F, CUDA_R_32F) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulDescSetAttribute(
+            plan->operation, CUBLASLT_MATMUL_DESC_TRANSA,
+            &transa, sizeof(transa)) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulDescSetAttribute(
+            plan->operation, CUBLASLT_MATMUL_DESC_TRANSB,
+            &transb, sizeof(transb)) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(
+            &plan->a, CUDA_R_16BF, in_dim, out_dim, in_dim) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(
+            &plan->b, CUDA_R_16BF, in_dim, 1u, in_dim) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatrixLayoutCreate(
+            &plan->c, CUDA_R_32F, out_dim, 1u, out_dim) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulPreferenceCreate(&preference) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulPreferenceSetAttribute(
+            preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &max_workspace, sizeof(max_workspace)) ==
+            CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulPreferenceSetAttribute(
+            preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,
+            &min_alignment_a, sizeof(min_alignment_a)) ==
+            CUBLAS_STATUS_SUCCESS;
+    if (!descriptors_ok) {
+        if (preference) {
+            (void)cublasLtMatmulPreferenceDestroy(preference);
+        }
+        cuda_laguna_bf16_lt_destroy_plan(plan);
+        plan->state = -1;
+        return 0;
+    }
+
+    constexpr int requested = 32;
+    cublasLtMatmulHeuristicResult_t heuristics[requested] = {};
+    int returned = 0;
+    const cublasStatus_t heuristic_status =
+        cublasLtMatmulAlgoGetHeuristic(
+            handle, plan->operation, plan->a, plan->b,
+            plan->c, plan->c, preference, requested,
+            heuristics, &returned);
+    (void)cublasLtMatmulPreferenceDestroy(preference);
+    if (heuristic_status != CUBLAS_STATUS_SUCCESS) {
+        cuda_laguna_bf16_lt_destroy_plan(plan);
+        plan->state = -1;
+        return 0;
+    }
+
+    for (int i = 0; i < returned; i++) {
+        const cublasLtMatmulAlgo_t *algorithm =
+            &heuristics[i].algo;
+        if (heuristics[i].state != CUBLAS_STATUS_SUCCESS ||
+            heuristics[i].workspaceSize != 0u ||
+            cuda_laguna_bf16_lt_config_i32(
+                algorithm, CUBLASLT_ALGO_CONFIG_ID) != 13 ||
+            cuda_laguna_bf16_lt_config_u32(
+                algorithm, CUBLASLT_ALGO_CONFIG_TILE_ID) != 0 ||
+            cuda_laguna_bf16_lt_config_u32(
+                algorithm, CUBLASLT_ALGO_CONFIG_STAGES_ID) != 0 ||
+            cuda_laguna_bf16_lt_config_i32(
+                algorithm, CUBLASLT_ALGO_CONFIG_SPLITK_NUM) != 1 ||
+            cuda_laguna_bf16_lt_config_u32(
+                algorithm, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION) != 75 ||
+            cuda_laguna_bf16_lt_config_u32(
+                algorithm, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING) != 0 ||
+            cuda_laguna_bf16_lt_config_u32(
+                algorithm, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME) != 0) {
+            continue;
+        }
+        cublasLtMatmulHeuristicResult_t check = {};
+        if (cublasLtMatmulAlgoCheck(
+                handle, plan->operation, plan->a, plan->b,
+                plan->c, plan->c, algorithm, &check) !=
+                CUBLAS_STATUS_SUCCESS ||
+            check.state != CUBLAS_STATUS_SUCCESS ||
+            check.workspaceSize != 0u) {
+            continue;
+        }
+        plan->algorithm = *algorithm;
+        plan->state = 1;
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            fprintf(stderr,
+                    "ds4: Laguna BF16 Lt plan ready "
+                    "K=%u M=%u algo=13 custom=75\n",
+                    in_dim, out_dim);
+        }
+        return 1;
+    }
+
+    cuda_laguna_bf16_lt_destroy_plan(plan);
+    plan->state = -1;
+    return 0;
+}
+
+static int cuda_laguna_bf16_lt_matmul(
+        float *out,
+        const __nv_bfloat16 *weights,
+        const __nv_bfloat16 *input,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        int logical_tier) {
+    if (!g_cuda_laguna_bf16_lt_enabled ||
+        !out || !weights || !input ||
+        in_dim != 3072u ||
+        (reinterpret_cast<uintptr_t>(weights) & 63u) != 0u ||
+        (reinterpret_cast<uintptr_t>(input) & 255u) != 0u ||
+        (reinterpret_cast<uintptr_t>(out) & 255u) != 0u ||
+        logical_tier < 0 || logical_tier >= g_n_gpus ||
+        g_gpu[logical_tier].sm_major != 12 ||
+        g_gpu[logical_tier].sm_minor != 1) {
+        return 0;
+    }
+    int slot = -1;
+    for (int i = 0; i < CUDA_LAGUNA_BF16_LT_PLAN_COUNT; i++) {
+        if (cuda_laguna_bf16_lt_out_dims[i] == out_dim) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) return 0;
+    cuda_laguna_bf16_lt_plan *plan =
+        &g_cuda_laguna_bf16_lt_plans[logical_tier][slot];
+    if (plan->state == 0 &&
+        !cuda_laguna_bf16_lt_prepare_plan(logical_tier, slot)) {
+        return 0;
+    }
+    if (plan->state != 1) return 0;
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasLtMatmul(
+        (cublasLtHandle_t)g_gpu[logical_tier].cublaslt,
+        plan->operation,
+        &alpha,
+        weights,
+        plan->a,
+        input,
+        plan->b,
+        &beta,
+        out,
+        plan->c,
+        out,
+        plan->c,
+        &plan->algorithm,
+        NULL,
+        0u,
+        NULL);
+    if (status == CUBLAS_STATUS_SUCCESS) return 1;
+    plan->state = -1;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr,
+                "ds4: Laguna BF16 Lt launch failed "
+                "K=%u M=%u status=%d; disabling plan\n",
+                in_dim, out_dim, (int)status);
+    }
+    return 0;
+}
+
+static void cuda_laguna_bf16_lt_cleanup(void) {
+    for (int tier = 0; tier < DS4_MAX_GPUS; tier++) {
+        if (g_cuda_laguna_bf16_lt_plans[tier][0].state != 0 &&
+            tier < g_n_gpus) {
+            (void)cudaSetDevice(g_gpu[tier].device_id);
+        }
+        for (int slot = 0;
+             slot < CUDA_LAGUNA_BF16_LT_PLAN_COUNT;
+             slot++) {
+            cuda_laguna_bf16_lt_destroy_plan(
+                &g_cuda_laguna_bf16_lt_plans[tier][slot]);
+        }
+    }
+}
+
 __global__ static void dflash_aux_rms_norm_bf16_kernel(
         float *features,
         const __nv_bfloat16 *weights,
@@ -367,6 +623,16 @@ extern "C" int ds4_gpu_laguna_qkvg_bf16_tensor(
                 const cublasHandle_t handle =
                     cuda_cublas_for_tier(logical_tier);
                 for (uint32_t i = 0u; i < 4u; i++) {
+                    if (n_tokens == 1u &&
+                        cuda_laguna_bf16_lt_matmul(
+                            (float *)outputs[i],
+                            (const __nv_bfloat16 *)weights[i],
+                            xb,
+                            in_dim,
+                            (uint32_t)rows[i],
+                            logical_tier)) {
+                        continue;
+                    }
                     const cublasStatus_t st = cublasGemmEx(
                         handle,
                         CUBLAS_OP_T,

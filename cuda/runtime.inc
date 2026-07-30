@@ -1790,6 +1790,9 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
     cuda_xdev_env_refresh();
     cuda_decode_dispatch_env_refresh();
+    g_cuda_laguna_bf16_lt_enabled =
+        getenv("DS4_CUDA_LAGUNA_NO_BF16_LT") == NULL &&
+        getenv("DS4_CUDA_DFLASH_NO_BF16_CUBLAS") == NULL;
     g_current_logical_tier = -1;
 
     /* g_n_gpus is published incrementally so ds4_gpu_cleanup() can unwind
@@ -1808,10 +1811,15 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
          * calls hit the right context. */
         g_n_gpus = i + 1;
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
-        cudaDeviceProp prop;
+        cudaDeviceProp prop = {};
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
+            c->sm_major = prop.major;
+            c->sm_minor = prop.minor;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
+        } else {
+            c->sm_major = 0;
+            c->sm_minor = 0;
         }
         /* Per-device stream. */
         cudaStream_t s = NULL;
@@ -1826,6 +1834,17 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         cublasHandle_t h = NULL;
         if (!cublas_ok(cublasCreate(&h), "init cublas")) return 0;
         c->cublas = (void *)h;
+        cublasLtHandle_t lth = NULL;
+        const cublasStatus_t lt_status = cublasLtCreate(&lth);
+        if (lt_status == CUBLAS_STATUS_SUCCESS) {
+            c->cublaslt = (void *)lth;
+        } else {
+            c->cublaslt = NULL;
+            fprintf(stderr,
+                    "ds4: cuBLASLt unavailable on device %d "
+                    "(status=%d); using cuBLAS fallbacks\n",
+                    c->device_id, (int)lt_status);
+        }
         const cublasMath_t math_mode =
             (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
                 ? CUBLAS_DEFAULT_MATH
@@ -1989,6 +2008,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     g_current_logical_tier = -1;
     cuda_native_nvfp4_cache_release_all();
+    cuda_laguna_bf16_lt_cleanup();
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
      * slabs, per-pair bounce buffers. */
@@ -2010,6 +2030,12 @@ extern "C" void ds4_gpu_cleanup(void) {
             c->cublas = NULL;
             c->cublas_ready = 0;
         }
+        if (c->cublaslt) {
+            (void)cublasLtDestroy((cublasLtHandle_t)c->cublaslt);
+            c->cublaslt = NULL;
+        }
+        c->sm_major = 0;
+        c->sm_minor = 0;
         if (c->scratch) {
             (void)cudaFree(c->scratch);
             c->scratch = NULL;

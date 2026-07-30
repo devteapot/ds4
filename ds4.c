@@ -3799,6 +3799,7 @@ static ds4_support_kind support_model_detect(
 typedef struct {
     uint64_t off;
     uint64_t end;
+    bool realign;
 } accelerator_tensor_span;
 
 static int accelerator_tensor_span_cmp(const void *a, const void *b) {
@@ -3808,6 +3809,7 @@ static int accelerator_tensor_span_cmp(const void *a, const void *b) {
     if (sa->off > sb->off) return 1;
     if (sa->end < sb->end) return -1;
     if (sa->end > sb->end) return 1;
+    if (sa->realign != sb->realign) return sa->realign ? -1 : 1;
     return 0;
 }
 
@@ -3891,6 +3893,19 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
+#ifndef DS4_ROCM_BUILD
+            /*
+             * Safetensors guarantees only element alignment; official
+             * Laguna BF16 matrices consequently cycle through every even
+             * address.  Isolating their cache ranges lets the CUDA arena
+             * place the unchanged bytes at a 256-byte address, which is the
+             * alignment assumed by the fastest Blackwell GEMV algorithms.
+             */
+            .realign =
+                m->native_safetensors && m->native_nvfp4 &&
+                t->type == DS4_TENSOR_BF16 &&
+                getenv("DS4_CUDA_LAGUNA_NO_BF16_REALIGN") == NULL,
+#endif
         };
     }
     if (m->native_safetensors && m->native_nvfp4) {
@@ -3964,10 +3979,13 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
          * from offsets within the cached range.
          */
         const uint64_t preload_align = 256u;
-        uint64_t off = spans[i].off & ~(preload_align - 1u);
+        const bool realign = spans[i].realign;
+        uint64_t off = realign ?
+            spans[i].off :
+            spans[i].off & ~(preload_align - 1u);
         uint64_t end = spans[i].end;
         i++;
-        while (i < nspan &&
+        while (!realign && i < nspan && !spans[i].realign &&
                spans[i].off <= end + 65536u &&
                spans[i].end - off <= max_span) {
             if (spans[i].end > end) end = spans[i].end;

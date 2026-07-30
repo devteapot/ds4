@@ -12,6 +12,8 @@ The Laguna S 2.1 reference measurements were recorded on NVIDIA GB10 on
 - `laguna_s21_dflash_quant_comparison_gb10.csv` compares Q4_K_M and native
   NVFP4 targets, each with its matching official drafter, on the same
   2,048-token prompt and 256-token greedy decode.
+- `laguna_s21_nvfp4_sm121_optimizations_gb10.csv` records the isolated
+  SM121 kernel A/Bs and matched end-to-end before/after measurements.
 
 The DFlash CSVs include verifier and proposal-acceptance counters because their
 throughput is prompt-sensitive. The official Laguna drafter is selected with
@@ -23,8 +25,27 @@ The current 2K/256 results are:
 | --- | --- | ---: | ---: |
 | Q4_K_M | raw | 22.32 | 1.00x |
 | Q4_K_M | BF16 DFlash, fixed 15 | 23.42 | 1.05x |
-| native NVFP4 | raw | 15.58 | 1.00x |
-| native NVFP4 | official native DFlash, fixed 7 | 35.05 | 2.25x |
+| native NVFP4 | raw | 18.61 | 1.00x |
+| native NVFP4 | official native DFlash, fixed 7 | 36.82 | 1.98x |
+
+On the matched pre-optimization run, native raw decode was 15.09 token/s
+(15.16 steady) and fixed-depth DFlash was 34.86 token/s (35.14 steady).
+The SM121 paths raise those to 18.61/18.71 and 36.82/37.05 token/s,
+respectively. DFlash verifier-cycle latency fell from 175.53 ms to
+161.22 ms even though proposal acceptance was lower in the optimized run.
+For latency rows in the optimization CSV, `improvement_pct` is the reduction
+in elapsed time.
+
+Nsight attributes nearly all raw-decode gain to the intended kernels: BF16
+projection time fell from 44.88 to 33.57 ms/token, and native MoE fell from
+13.64 to 13.37 ms/token. On real-model prefill, normalized grouped gate/up plus
+three down launches fell from 19.64 to 15.64 ms per sparse layer.
+
+The optimized paths retain independent A/B controls:
+
+- `DS4_CUDA_LAGUNA_NO_BF16_LT=1` disables the SM121 `n=1` cuBLASLt plans.
+- `DS4_CUDA_LAGUNA_NO_BF16_REALIGN=1` preserves original BF16 cache offsets.
+- `DS4_CUDA_NVFP4_GROUPED_STAGE_ACTIVATION=0` disables grouped CTA staging.
 
 Run the native rows with:
 

@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
 
@@ -286,6 +287,16 @@ static int cuda_q4_mma_ok(void) {
 static int cuda_q4_mma_tile16_shmem_ok(int which_down);
 
 static void cuda_native_nvfp4_cache_release_all(void);
+
+static int g_cuda_laguna_bf16_lt_enabled;
+static int cuda_laguna_bf16_lt_matmul(
+        float *out,
+        const __nv_bfloat16 *weights,
+        const __nv_bfloat16 *input,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        int logical_tier);
+static void cuda_laguna_bf16_lt_cleanup(void);
 
 static void routed_moe_decode_graph_destroy_one(int logical_tier);
 

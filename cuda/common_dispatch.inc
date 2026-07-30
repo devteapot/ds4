@@ -1306,6 +1306,16 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(
         if (!cuda_ok(cudaGetLastError(), "Laguna BF16 activation convert")) {
             return 0;
         }
+        if (n_tok == 1u &&
+            cuda_laguna_bf16_lt_matmul(
+                (float *)out->ptr,
+                (const __nv_bfloat16 *)wptr,
+                xb,
+                (uint32_t)in_dim,
+                (uint32_t)out_dim,
+                logical_tier)) {
+            return 1;
+        }
         const float alpha = 1.0f;
         const float beta = 0.0f;
         const cublasStatus_t st = cublasGemmEx(

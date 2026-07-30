@@ -39,6 +39,17 @@ static uint32_t cuda_laguna_nvfp4_grouped_min_tokens(void) {
     return end != value && *end == '\0' && parsed > 0u &&
            parsed <= UINT32_MAX ? (uint32_t)parsed : 256u;
 }
+
+static int cuda_laguna_nvfp4_grouped_stage_activation(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    const char *value =
+        getenv("DS4_CUDA_NVFP4_GROUPED_STAGE_ACTIVATION");
+    cached = !value || !value[0] ||
+             (strcmp(value, "0") != 0 &&
+              strcmp(value, "false") != 0);
+    return cached;
+}
 #endif
 
 struct cuda_native_nvfp4_cache {
@@ -116,6 +127,32 @@ __device__ __forceinline__ static int32_t dev_nvfp4_pack4_adjacent(
                packed[1]) << 16u) |
            ((uint32_t)(uint8_t)dev_nvfp4_e2m1_i8(
                packed[1] >> 4u) << 24u);
+}
+
+/*
+ * Raw decode is not bandwidth-saturated at one routed row.  Decode all four
+ * adjacent E2M1 nibbles together so their magnitudes and signs stay in
+ * registers instead of issuing sixteen divergent device-global LUT reads per
+ * 16-value dot.  The batch verifier uses the LUT path below: on its larger
+ * grid this extra integer work is slightly slower once weight bandwidth is
+ * saturated.
+ */
+__device__ __forceinline__ static int32_t
+dev_nvfp4_pack4_adjacent_prmt_vneg(const uint8_t *packed) {
+    const uint32_t x = *(const uint16_t *)packed;
+    const uint32_t magnitude = __byte_perm(
+        0x03020100u, 0x0c080604u, x & 0x7777u);
+    const uint32_t negative = __vneg4(magnitude);
+    const uint32_t select = 0x3210u | ((x >> 1u) & 0x4444u);
+    return (int32_t)__byte_perm(magnitude, negative, select);
+}
+
+template <bool PRMT_DECODE>
+__device__ __forceinline__ static int32_t
+dev_nvfp4_pack4_adjacent_decode(const uint8_t *packed) {
+    if (PRMT_DECODE)
+        return dev_nvfp4_pack4_adjacent_prmt_vneg(packed);
+    return dev_nvfp4_pack4_adjacent(packed);
 }
 
 __device__ __forceinline__ static uint8_t dev_nvfp4_f32_to_e2m1(
@@ -239,6 +276,7 @@ __device__ __forceinline__ static float dev_dot_nvfp4_q8_0_block(
     return total;
 }
 
+template <bool PRMT_DECODE>
 __device__ __forceinline__ static float dev_dot_nvfp4_native_w4a4_group(
         const uint8_t *weight_packed,
         uint8_t weight_scale,
@@ -247,9 +285,11 @@ __device__ __forceinline__ static float dev_dot_nvfp4_native_w4a4_group(
     int32_t dot = 0;
 #pragma unroll
     for (uint32_t i = 0u; i < 16u; i += 4u) {
-        dot = __dp4a(dev_nvfp4_pack4_adjacent(weight_packed + i / 2u),
-                     *(const int32_t *)(activation_i8 + i),
-                     dot);
+        dot = __dp4a(
+            dev_nvfp4_pack4_adjacent_decode<PRMT_DECODE>(
+                weight_packed + i / 2u),
+            *(const int32_t *)(activation_i8 + i),
+            dot);
     }
     /* dev_nvfp4_ue4m3_to_f32 includes the 1/2 factor for the
      * doubled-integer E2M1 representation. Applying it to both operands
@@ -259,6 +299,7 @@ __device__ __forceinline__ static float dev_dot_nvfp4_native_w4a4_group(
            dev_nvfp4_ue4m3_to_f32(activation_scale);
 }
 
+template <bool PRMT_DECODE>
 __device__ __forceinline__ static void
 dev_dot_nvfp4_native_w4a4_gate_up_group(
         const uint8_t *gate_packed,
@@ -276,10 +317,12 @@ dev_dot_nvfp4_native_w4a4_gate_up_group(
         const int32_t activation =
             *(const int32_t *)(activation_i8 + i);
         gate_dot = __dp4a(
-            dev_nvfp4_pack4_adjacent(gate_packed + i / 2u),
+            dev_nvfp4_pack4_adjacent_decode<PRMT_DECODE>(
+                gate_packed + i / 2u),
             activation, gate_dot);
         up_dot = __dp4a(
-            dev_nvfp4_pack4_adjacent(up_packed + i / 2u),
+            dev_nvfp4_pack4_adjacent_decode<PRMT_DECODE>(
+                up_packed + i / 2u),
             activation, up_dot);
     }
     const float activation_factor =
@@ -386,11 +429,143 @@ __device__ __forceinline__ static void laguna_nvfp4_load_grouped_weight(
 }
 
 /*
+ * Eight warps in an official Laguna grouped block consume the same sixteen
+ * routed activation rows while covering adjacent output columns.  Direct
+ * loads therefore fetch each activation tile eight times.  The staged
+ * variant cooperatively fetches one K=256 tile per CTA and reuses it from
+ * shared memory.  Padding each row avoids all sixteen rows aliasing the same
+ * shared-memory banks.
+ */
+enum {
+    LAGUNA_NVFP4_STAGE_ROWS = 16,
+    LAGUNA_NVFP4_STAGE_PACKED_WORDS = 32,
+    /*
+     * Four padding words keep every row 16-byte aligned while rotating
+     * successive routes by four banks.  The eight route groups and their
+     * four participating lanes then cover all 32 banks exactly once.
+     */
+    LAGUNA_NVFP4_STAGE_PACKED_STRIDE = 36,
+    LAGUNA_NVFP4_STAGE_SCALE_WORDS = 4
+};
+
+__device__ __forceinline__ static void
+laguna_nvfp4_prepare_staged_routes(
+        uint32_t *route_pairs,
+        uint32_t *route_sources,
+        uint32_t *route_valid,
+        const uint32_t *sorted_pairs,
+        uint32_t sorted_offset,
+        uint32_t local_start,
+        uint32_t pair_count,
+        uint32_t source_divisor) {
+    const uint32_t tid = threadIdx.x;
+    if (tid < LAGUNA_NVFP4_STAGE_ROWS) {
+        const uint32_t local = local_start + tid;
+        const bool valid = local < pair_count;
+        const uint32_t pair =
+            valid ? sorted_pairs[sorted_offset + local] : 0u;
+        route_pairs[tid] = pair;
+        route_sources[tid] =
+            valid ? pair / source_divisor : 0u;
+        route_valid[tid] = valid ? 1u : 0u;
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ static void
+laguna_nvfp4_stage_activation_k256(
+        uint32_t *staged_packed,
+        uint32_t *staged_scales,
+        const uint8_t *packed,
+        const uint8_t *scales,
+        const uint32_t *route_sources,
+        const uint32_t *route_valid,
+        uint32_t packed_row,
+        uint32_t scale_row,
+        uint32_t kbase) {
+    const uint32_t tid = threadIdx.x;
+    /*
+     * Sixteen routes x eight 16-byte vectors are copied by half the CTA.
+     * Both source and padded destination rows remain 16-byte aligned.
+     */
+    if (tid < LAGUNA_NVFP4_STAGE_ROWS * 8u) {
+        const uint32_t row = tid >> 3u;
+        const uint32_t vector = tid & 7u;
+        uint4 value = make_uint4(0u, 0u, 0u, 0u);
+        if (route_valid[row]) {
+            value = *(const uint4 *)(
+                packed +
+                (uint64_t)route_sources[row] * packed_row +
+                kbase / 2u + vector * sizeof(uint4));
+        }
+        *(uint4 *)(staged_packed +
+                   row * LAGUNA_NVFP4_STAGE_PACKED_STRIDE +
+                   vector * 4u) = value;
+    }
+    if (tid < LAGUNA_NVFP4_STAGE_ROWS *
+                  LAGUNA_NVFP4_STAGE_SCALE_WORDS) {
+        const uint32_t row = tid & (LAGUNA_NVFP4_STAGE_ROWS - 1u);
+        const uint32_t word = tid >> 4u;
+        /*
+         * Transposing [route][K-word] to [K-word][route] gives the sixteen
+         * scale loads consumed by each MMA stage distinct banks.
+         */
+        staged_scales[
+            word * LAGUNA_NVFP4_STAGE_ROWS + row] =
+                route_valid[row] ?
+                    laguna_nvfp4_load_u32(
+                        scales +
+                        (uint64_t)route_sources[row] * scale_row +
+                        kbase / 16u + word * sizeof(uint32_t)) :
+                    0u;
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ static void
+laguna_nvfp4_load_staged_activation(
+        const uint32_t *packed,
+        const uint32_t *scales,
+        uint32_t source_lo,
+        uint32_t source_hi,
+        bool valid_lo,
+        bool valid_hi,
+        uint32_t k0,
+        uint32_t lane,
+        uint32_t &a0,
+        uint32_t &a1,
+        uint32_t &a2,
+        uint32_t &a3,
+        uint32_t &scale_a) {
+    const uint32_t tid = lane & 3u;
+    const uint32_t word0 = k0 / 8u + tid;
+    const uint32_t word1 = word0 + 4u;
+    a0 = valid_lo ?
+        packed[source_lo * LAGUNA_NVFP4_STAGE_PACKED_STRIDE + word0] : 0u;
+    a1 = valid_hi ?
+        packed[source_hi * LAGUNA_NVFP4_STAGE_PACKED_STRIDE + word0] : 0u;
+    a2 = valid_lo ?
+        packed[source_lo * LAGUNA_NVFP4_STAGE_PACKED_STRIDE + word1] : 0u;
+    a3 = valid_hi ?
+        packed[source_hi * LAGUNA_NVFP4_STAGE_PACKED_STRIDE + word1] : 0u;
+    scale_a = 0u;
+    const uint32_t scale_word = k0 / 64u;
+    if (tid == 0u && valid_lo) {
+        scale_a =
+            scales[scale_word * LAGUNA_NVFP4_STAGE_ROWS + source_lo];
+    } else if (tid == 1u && valid_hi) {
+        scale_a =
+            scales[scale_word * LAGUNA_NVFP4_STAGE_ROWS + source_hi];
+    }
+}
+
+/*
  * Prefill groups up to sixteen routes for the same expert into MMA's M
  * dimension and computes eight output channels in N.  Unlike the decode
  * kernel's unavoidable GEMV shape, this consumes the complete 16x8 result
  * tile and reuses each expert weight fragment across sixteen prompt tokens.
  */
+template <bool STAGE_ACTIVATION>
 __global__ static void laguna_grouped_nvfp4_gate_up_mma_kernel(
         float *mid,
         const uint8_t *const *gate_packed,
@@ -411,6 +586,18 @@ __global__ static void laguna_grouped_nvfp4_gate_up_mma_kernel(
         const float *router_weights,
         uint32_t expert_in_dim,
         uint32_t expert_mid_dim) {
+    __shared__ __align__(16) uint32_t staged_packed[
+        LAGUNA_NVFP4_STAGE_ROWS *
+        LAGUNA_NVFP4_STAGE_PACKED_STRIDE];
+    __shared__ uint32_t staged_scales[
+        LAGUNA_NVFP4_STAGE_ROWS *
+        LAGUNA_NVFP4_STAGE_SCALE_WORDS];
+    __shared__ uint32_t staged_route_pairs[
+        LAGUNA_NVFP4_STAGE_ROWS];
+    __shared__ uint32_t staged_route_sources[
+        LAGUNA_NVFP4_STAGE_ROWS];
+    __shared__ uint32_t staged_route_valid[
+        LAGUNA_NVFP4_STAGE_ROWS];
     const uint32_t warp_in_block = threadIdx.x >> 5u;
     const uint32_t lane = threadIdx.x & 31u;
     const uint64_t warp =
@@ -430,15 +617,34 @@ __global__ static void laguna_grouped_nvfp4_gate_up_mma_kernel(
     const uint32_t tid = lane & 3u;
     const uint32_t local_lo = local_start + group;
     const uint32_t local_hi = local_lo + 8u;
-    const bool valid_lo = local_lo < pair_count;
-    const bool valid_hi = local_hi < pair_count;
-    const uint32_t pair_lo =
-        valid_lo ? sorted_pairs[sorted_offset + local_lo] : 0u;
-    const uint32_t pair_hi =
-        valid_hi ? sorted_pairs[sorted_offset + local_hi] : 0u;
-    /* The official checkpoint always routes ten experts per token. */
-    const uint32_t source_lo = pair_lo / 10u;
-    const uint32_t source_hi = pair_hi / 10u;
+    bool valid_lo;
+    bool valid_hi;
+    uint32_t pair_lo;
+    uint32_t pair_hi;
+    uint32_t source_lo;
+    uint32_t source_hi;
+    if (STAGE_ACTIVATION) {
+        /* The official checkpoint always routes ten experts per token. */
+        laguna_nvfp4_prepare_staged_routes(
+            staged_route_pairs, staged_route_sources,
+            staged_route_valid, sorted_pairs, sorted_offset,
+            local_start, pair_count, 10u);
+        valid_lo = staged_route_valid[group] != 0u;
+        valid_hi = staged_route_valid[group + 8u] != 0u;
+        pair_lo = staged_route_pairs[group];
+        pair_hi = staged_route_pairs[group + 8u];
+        source_lo = group;
+        source_hi = group + 8u;
+    } else {
+        valid_lo = local_lo < pair_count;
+        valid_hi = local_hi < pair_count;
+        pair_lo =
+            valid_lo ? sorted_pairs[sorted_offset + local_lo] : 0u;
+        pair_hi =
+            valid_hi ? sorted_pairs[sorted_offset + local_hi] : 0u;
+        source_lo = pair_lo / 10u;
+        source_hi = pair_hi / 10u;
+    }
     const uint8_t *gate_weight = gate_packed[expert];
     const uint8_t *gate_sf = gate_scale[expert];
     const uint8_t *up_weight = up_packed[expert];
@@ -447,23 +653,40 @@ __global__ static void laguna_grouped_nvfp4_gate_up_mma_kernel(
     float gd[4][4] = {};
     float ud[4][4] = {};
     for (uint32_t kbase = 0u; kbase < expert_in_dim; kbase += 256u) {
+        if (STAGE_ACTIVATION) {
+            laguna_nvfp4_stage_activation_k256(
+                staged_packed, staged_scales,
+                x4, x4scale, staged_route_sources,
+                staged_route_valid, packed_row, scale_row, kbase);
+        }
 #pragma unroll
         for (uint32_t stage = 0u; stage < 4u; stage++) {
-            const uint32_t k0 = kbase + stage * 64u;
+            const uint32_t k0 =
+                (STAGE_ACTIVATION ? 0u : kbase) + stage * 64u;
             uint32_t a0, a1, a2, a3, sa;
             uint32_t gb0, gb1, gsb;
             uint32_t ub0, ub1, usb;
-            laguna_nvfp4_load_grouped_activation(
-                x4, x4scale, source_lo, source_hi, valid_lo, valid_hi,
-                packed_row, scale_row, k0, lane,
-                a0, a1, a2, a3, sa);
+            if (STAGE_ACTIVATION) {
+                laguna_nvfp4_load_staged_activation(
+                    staged_packed, staged_scales,
+                    source_lo, source_hi, valid_lo, valid_hi,
+                    k0, lane, a0, a1, a2, a3, sa);
+            } else {
+                laguna_nvfp4_load_grouped_activation(
+                    x4, x4scale,
+                    source_lo, source_hi, valid_lo, valid_hi,
+                    packed_row, scale_row, k0, lane,
+                    a0, a1, a2, a3, sa);
+            }
             laguna_nvfp4_load_grouped_weight(
                 gate_weight, gate_sf,
-                packed_row, scale_row, col0, k0, lane,
+                packed_row, scale_row, col0,
+                kbase + stage * 64u, lane,
                 gb0, gb1, gsb);
             laguna_nvfp4_load_grouped_weight(
                 up_weight, up_sf,
-                packed_row, scale_row, col0, k0, lane,
+                packed_row, scale_row, col0,
+                kbase + stage * 64u, lane,
                 ub0, ub1, usb);
             laguna_nvfp4_mma_m16n8k64(
                 gd[stage][0], gd[stage][1],
@@ -474,6 +697,7 @@ __global__ static void laguna_grouped_nvfp4_gate_up_mma_kernel(
                 ud[stage][2], ud[stage][3],
                 a0, a1, a2, a3, ub0, ub1, sa, usb);
         }
+        if (STAGE_ACTIVATION) __syncthreads();
     }
 #pragma unroll
     for (uint32_t stage = 1u; stage < 4u; stage++) {
@@ -516,6 +740,7 @@ __global__ static void laguna_grouped_nvfp4_gate_up_mma_kernel(
     }
 }
 
+template <bool STAGE_ACTIVATION>
 __global__ static void laguna_grouped_nvfp4_down_mma_kernel(
         float *terms,
         const uint8_t *const *down_packed,
@@ -534,6 +759,18 @@ __global__ static void laguna_grouped_nvfp4_down_mma_kernel(
         uint32_t term_stride,
         uint32_t row0,
         uint32_t chunk_rows) {
+    __shared__ __align__(16) uint32_t staged_packed[
+        LAGUNA_NVFP4_STAGE_ROWS *
+        LAGUNA_NVFP4_STAGE_PACKED_STRIDE];
+    __shared__ uint32_t staged_scales[
+        LAGUNA_NVFP4_STAGE_ROWS *
+        LAGUNA_NVFP4_STAGE_SCALE_WORDS];
+    __shared__ uint32_t staged_route_pairs[
+        LAGUNA_NVFP4_STAGE_ROWS];
+    __shared__ uint32_t staged_route_sources[
+        LAGUNA_NVFP4_STAGE_ROWS];
+    __shared__ uint32_t staged_route_valid[
+        LAGUNA_NVFP4_STAGE_ROWS];
     const uint32_t warp_in_block = threadIdx.x >> 5u;
     const uint32_t lane = threadIdx.x & 31u;
     const uint64_t warp =
@@ -554,35 +791,73 @@ __global__ static void laguna_grouped_nvfp4_down_mma_kernel(
     const uint32_t tid = lane & 3u;
     const uint32_t local_lo = local_start + group;
     const uint32_t local_hi = local_lo + 8u;
-    const bool valid_lo = local_lo < pair_count;
-    const bool valid_hi = local_hi < pair_count;
-    const uint32_t pair_lo =
-        valid_lo ? sorted_pairs[sorted_offset + local_lo] : 0u;
-    const uint32_t pair_hi =
-        valid_hi ? sorted_pairs[sorted_offset + local_hi] : 0u;
+    bool valid_lo;
+    bool valid_hi;
+    uint32_t pair_lo;
+    uint32_t pair_hi;
+    uint32_t source_lo;
+    uint32_t source_hi;
+    if (STAGE_ACTIVATION) {
+        laguna_nvfp4_prepare_staged_routes(
+            staged_route_pairs, staged_route_sources,
+            staged_route_valid, sorted_pairs, sorted_offset,
+            local_start, pair_count, 1u);
+        valid_lo = staged_route_valid[group] != 0u;
+        valid_hi = staged_route_valid[group + 8u] != 0u;
+        pair_lo = staged_route_pairs[group];
+        pair_hi = staged_route_pairs[group + 8u];
+        source_lo = group;
+        source_hi = group + 8u;
+    } else {
+        valid_lo = local_lo < pair_count;
+        valid_hi = local_hi < pair_count;
+        pair_lo =
+            valid_lo ? sorted_pairs[sorted_offset + local_lo] : 0u;
+        pair_hi =
+            valid_hi ? sorted_pairs[sorted_offset + local_hi] : 0u;
+        source_lo = pair_lo;
+        source_hi = pair_hi;
+    }
     const uint8_t *down_weight = down_packed[expert];
     const uint8_t *down_sf = down_scale[expert];
 
     float d[4][4] = {};
     for (uint32_t kbase = 0u; kbase < expert_mid_dim; kbase += 256u) {
+        if (STAGE_ACTIVATION) {
+            laguna_nvfp4_stage_activation_k256(
+                staged_packed, staged_scales,
+                mid4, mid4scale, staged_route_sources,
+                staged_route_valid, packed_row, scale_row, kbase);
+        }
 #pragma unroll
         for (uint32_t stage = 0u; stage < 4u; stage++) {
-            const uint32_t k0 = kbase + stage * 64u;
+            const uint32_t k0 =
+                (STAGE_ACTIVATION ? 0u : kbase) + stage * 64u;
             uint32_t a0, a1, a2, a3, sa;
             uint32_t b0, b1, sb;
-            laguna_nvfp4_load_grouped_activation(
-                mid4, mid4scale, pair_lo, pair_hi, valid_lo, valid_hi,
-                packed_row, scale_row, k0, lane,
-                a0, a1, a2, a3, sa);
+            if (STAGE_ACTIVATION) {
+                laguna_nvfp4_load_staged_activation(
+                    staged_packed, staged_scales,
+                    source_lo, source_hi, valid_lo, valid_hi,
+                    k0, lane, a0, a1, a2, a3, sa);
+            } else {
+                laguna_nvfp4_load_grouped_activation(
+                    mid4, mid4scale,
+                    source_lo, source_hi, valid_lo, valid_hi,
+                    packed_row, scale_row, k0, lane,
+                    a0, a1, a2, a3, sa);
+            }
             laguna_nvfp4_load_grouped_weight(
                 down_weight, down_sf,
-                packed_row, scale_row, col0, k0, lane,
+                packed_row, scale_row, col0,
+                kbase + stage * 64u, lane,
                 b0, b1, sb);
             laguna_nvfp4_mma_m16n8k64(
                 d[stage][0], d[stage][1],
                 d[stage][2], d[stage][3],
                 a0, a1, a2, a3, b0, b1, sa, sb);
         }
+        if (STAGE_ACTIVATION) __syncthreads();
     }
 #pragma unroll
     for (uint32_t stage = 1u; stage < 4u; stage++) {
@@ -622,7 +897,7 @@ __device__ __forceinline__ static float laguna_subwarp_sum_f32(float value) {
     return value;
 }
 
-template <uint32_t LANES>
+template <uint32_t LANES, int NATIVE_MODE, bool PRMT_DECODE>
 __global__ static void laguna_moe_gate_up_nvfp4_kernel(
         float *mid,
         const cuda_block_nvfp4 *gate_base,
@@ -669,7 +944,8 @@ __global__ static void laguna_moe_gate_up_nvfp4_kernel(
     if (row >= expert_mid_dim) return;
 
     const uint32_t expert = (uint32_t)expert_i;
-    const bool native = gate_native_packed != NULL;
+    const bool native = NATIVE_MODE > 0 ? true :
+        NATIVE_MODE == 0 ? false : gate_native_packed != NULL;
     const cuda_block_nvfp4 *gate = native ? NULL :
         gate_base + (uint64_t)expert * gate_expert_blocks +
         (uint64_t)row * gate_row_blocks;
@@ -704,7 +980,7 @@ __global__ static void laguna_moe_gate_up_nvfp4_kernel(
         const uint8_t *x4scale_row =
             x4scale + input_row * (uint64_t)groups;
         for (uint32_t b = lane; b < groups; b += LANES) {
-            dev_dot_nvfp4_native_w4a4_gate_up_group(
+            dev_dot_nvfp4_native_w4a4_gate_up_group<PRMT_DECODE>(
                 gate_packed + b * 8u, gate_scale[b],
                 up_packed + b * 8u, up_scale[b],
                 x4_row + b * 16u, x4scale_row[b],
@@ -732,7 +1008,7 @@ __global__ static void laguna_moe_gate_up_nvfp4_kernel(
     }
 }
 
-template <uint32_t LANES>
+template <uint32_t LANES, int NATIVE_MODE, bool PRMT_DECODE>
 __global__ static void laguna_moe_down_nvfp4_kernel(
         float *out,
         const cuda_block_nvfp4 *down_base,
@@ -771,7 +1047,8 @@ __global__ static void laguna_moe_down_nvfp4_kernel(
         const int32_t expert_i = selected[pair];
         if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) continue;
         const uint32_t expert = (uint32_t)expert_i;
-        const bool native = down_native_packed != NULL;
+        const bool native = NATIVE_MODE > 0 ? true :
+            NATIVE_MODE == 0 ? false : down_native_packed != NULL;
         const cuda_block_nvfp4 *weight = native ? NULL :
             down_base + (uint64_t)expert * down_expert_blocks +
             (uint64_t)row * down_row_blocks;
@@ -793,7 +1070,7 @@ __global__ static void laguna_moe_down_nvfp4_kernel(
             const uint8_t *mid4scale_row =
                 mid4scale + pair * (uint64_t)groups;
             for (uint32_t b = lane; b < groups; b += LANES) {
-                part += dev_dot_nvfp4_native_w4a4_group(
+                part += dev_dot_nvfp4_native_w4a4_group<PRMT_DECODE>(
                     packed + b * 8u, block_scale[b],
                     mid4_row + b * 16u, mid4scale_row[b]);
             }
@@ -1323,31 +1600,45 @@ static int cuda_laguna_nvfp4_routed_moe(
             return 0;
         }
         if (grouped_native) {
+            const bool stage_activation =
+                cuda_laguna_nvfp4_grouped_stage_activation() &&
+                n_expert == 10u &&
+                expert_in_dim % 256u == 0u &&
+                expert_mid_dim % 256u == 0u &&
+                expert_mid_dim % 64u == 0u &&
+                out_dim % expert_mid_dim == 0u;
             const uint64_t gate_warps =
                 tile_capacity * (expert_mid_dim / 8u);
             const uint64_t gate_blocks = (gate_warps + 7u) / 8u;
             if (gate_blocks > UINT32_MAX) return 0;
-            laguna_grouped_nvfp4_gate_up_mma_kernel<<<
-                (uint32_t)gate_blocks, 256>>>(
-                    (float *)mid->ptr,
-                    native_cache->gate_packed,
-                    native_cache->gate_scale,
-                    native_cache->up_packed,
-                    native_cache->up_scale,
-                    gate_scales,
-                    up_scales,
-                    native_cache->gate_input_global,
-                    x4,
-                    x4scale,
-                    sorted_pairs,
-                    sorted_offsets,
-                    sorted_counts,
-                    tile_total,
-                    tile_experts,
-                    tile_starts,
-                    (const float *)weights->ptr,
-                    expert_in_dim,
-                    expert_mid_dim);
+#define DS4_LAUNCH_GROUPED_NVFP4_GATE_UP(STAGE_) \
+            laguna_grouped_nvfp4_gate_up_mma_kernel<STAGE_><<< \
+                (uint32_t)gate_blocks, 256>>>( \
+                    (float *)mid->ptr, \
+                    native_cache->gate_packed, \
+                    native_cache->gate_scale, \
+                    native_cache->up_packed, \
+                    native_cache->up_scale, \
+                    gate_scales, \
+                    up_scales, \
+                    native_cache->gate_input_global, \
+                    x4, \
+                    x4scale, \
+                    sorted_pairs, \
+                    sorted_offsets, \
+                    sorted_counts, \
+                    tile_total, \
+                    tile_experts, \
+                    tile_starts, \
+                    (const float *)weights->ptr, \
+                    expert_in_dim, \
+                    expert_mid_dim)
+            if (stage_activation) {
+                DS4_LAUNCH_GROUPED_NVFP4_GATE_UP(true);
+            } else {
+                DS4_LAUNCH_GROUPED_NVFP4_GATE_UP(false);
+            }
+#undef DS4_LAUNCH_GROUPED_NVFP4_GATE_UP
             if (!cuda_ok(cudaGetLastError(),
                          "Laguna Blackwell grouped NVFP4 gate/up MMA launch")) {
                 return 0;
@@ -1381,25 +1672,32 @@ static int cuda_laguna_nvfp4_routed_moe(
                 const uint64_t down_blocks =
                     (down_warps + 7u) / 8u;
                 if (down_blocks > UINT32_MAX) return 0;
-                laguna_grouped_nvfp4_down_mma_kernel<<<
-                    (uint32_t)down_blocks, 256>>>(
-                        (float *)mid->ptr,
-                        native_cache->down_packed,
-                        native_cache->down_scale,
-                        down_scales,
-                        native_cache->down_input_global,
-                        mid4,
-                        mid4scale,
-                        sorted_pairs,
-                        sorted_offsets,
-                        sorted_counts,
-                        tile_total,
-                        tile_experts,
-                        tile_starts,
-                        expert_mid_dim,
-                        expert_mid_dim,
-                        row0,
-                        chunk_rows);
+#define DS4_LAUNCH_GROUPED_NVFP4_DOWN(STAGE_) \
+                laguna_grouped_nvfp4_down_mma_kernel<STAGE_><<< \
+                    (uint32_t)down_blocks, 256>>>( \
+                        (float *)mid->ptr, \
+                        native_cache->down_packed, \
+                        native_cache->down_scale, \
+                        down_scales, \
+                        native_cache->down_input_global, \
+                        mid4, \
+                        mid4scale, \
+                        sorted_pairs, \
+                        sorted_offsets, \
+                        sorted_counts, \
+                        tile_total, \
+                        tile_experts, \
+                        tile_starts, \
+                        expert_mid_dim, \
+                        expert_mid_dim, \
+                        row0, \
+                        chunk_rows)
+                if (stage_activation) {
+                    DS4_LAUNCH_GROUPED_NVFP4_DOWN(true);
+                } else {
+                    DS4_LAUNCH_GROUPED_NVFP4_DOWN(false);
+                }
+#undef DS4_LAUNCH_GROUPED_NVFP4_DOWN
                 if (!cuda_ok(cudaGetLastError(),
                              "Laguna Blackwell grouped NVFP4 down MMA launch")) {
                     return 0;
@@ -1448,8 +1746,8 @@ static int cuda_laguna_nvfp4_routed_moe(
     const uint64_t gate_blocks =
         pairs * ((expert_mid_dim + rows_per_block - 1u) / rows_per_block);
     if (gate_blocks > UINT32_MAX) return 0;
-#define DS4_LAUNCH_NVFP4_GATE_UP(LANES_) \
-    laguna_moe_gate_up_nvfp4_kernel<LANES_> \
+#define DS4_LAUNCH_NVFP4_GATE_UP(LANES_, NATIVE_MODE_, PRMT_) \
+    laguna_moe_gate_up_nvfp4_kernel<LANES_, NATIVE_MODE_, PRMT_> \
         <<<(uint32_t)gate_blocks, 256>>>( \
             (float *)mid->ptr, \
             gate, up, \
@@ -1468,10 +1766,15 @@ static int cuda_laguna_nvfp4_routed_moe(
             desc->up_row_bytes / nvfp4_block_bytes, \
             xq_blocks, expert_mid_dim, n_total_expert, n_expert, n_tokens, \
             shared_native_dp4a_input)
-    if (blackwell) {
-        DS4_LAUNCH_NVFP4_GATE_UP(16u);
+    const bool raw_native_prmt = native && n_tokens == 1u;
+    if (raw_native_prmt) {
+        DS4_LAUNCH_NVFP4_GATE_UP(16u, 1, true);
+    } else if (native) {
+        DS4_LAUNCH_NVFP4_GATE_UP(16u, 1, false);
+    } else if (blackwell) {
+        DS4_LAUNCH_NVFP4_GATE_UP(16u, -1, false);
     } else {
-        DS4_LAUNCH_NVFP4_GATE_UP(8u);
+        DS4_LAUNCH_NVFP4_GATE_UP(8u, -1, false);
     }
 #undef DS4_LAUNCH_NVFP4_GATE_UP
     if (!cuda_ok(cudaGetLastError(),
@@ -1511,8 +1814,8 @@ static int cuda_laguna_nvfp4_routed_moe(
         (uint64_t)n_tokens *
         ((out_dim + rows_per_block - 1u) / rows_per_block);
     if (down_blocks > UINT32_MAX) return 0;
-#define DS4_LAUNCH_NVFP4_DOWN(LANES_) \
-    laguna_moe_down_nvfp4_kernel<LANES_> \
+#define DS4_LAUNCH_NVFP4_DOWN(LANES_, NATIVE_MODE_, PRMT_) \
+    laguna_moe_down_nvfp4_kernel<LANES_, NATIVE_MODE_, PRMT_> \
         <<<(uint32_t)down_blocks, 256>>>( \
             (float *)out->ptr, down, \
             native_cache ? native_cache->down_packed : NULL, \
@@ -1523,10 +1826,14 @@ static int cuda_laguna_nvfp4_routed_moe(
             desc->down_expert_bytes / nvfp4_block_bytes, \
             desc->down_row_bytes / nvfp4_block_bytes, \
             midq_blocks, out_dim, n_total_expert, n_expert, n_tokens)
-    if (blackwell) {
-        DS4_LAUNCH_NVFP4_DOWN(16u);
+    if (raw_native_prmt) {
+        DS4_LAUNCH_NVFP4_DOWN(16u, 1, true);
+    } else if (native) {
+        DS4_LAUNCH_NVFP4_DOWN(16u, 1, false);
+    } else if (blackwell) {
+        DS4_LAUNCH_NVFP4_DOWN(16u, -1, false);
     } else {
-        DS4_LAUNCH_NVFP4_DOWN(8u);
+        DS4_LAUNCH_NVFP4_DOWN(8u, -1, false);
     }
 #undef DS4_LAUNCH_NVFP4_DOWN
     return cuda_ok(cudaGetLastError(), "Laguna NVFP4 down launch");

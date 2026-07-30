@@ -87,7 +87,10 @@ typedef struct {
     int    device_id;
     void  *stream;             /* cudaStream_t under CUDA */
     void  *cublas;             /* cublasHandle_t under CUDA */
+    void  *cublaslt;           /* cublasLtHandle_t under CUDA */
     int    cublas_ready;
+    int    sm_major;           /* cached device capability */
+    int    sm_minor;
     void  *scratch;
     size_t scratch_bytes;
     size_t budget_bytes;
