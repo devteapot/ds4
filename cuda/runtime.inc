@@ -293,6 +293,11 @@ static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *wha
     return p;
 }
 
+extern "C" void *ds4_cuda_nvfp4_tmp_alloc_on(
+        int logical_tier, uint64_t bytes, const char *what) {
+    return cuda_tmp_alloc_on(logical_tier, bytes, what);
+}
+
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
     return n_comp <= DS4_CUDA_ATTENTION_SCORE_CAP - DS4_CUDA_ATTENTION_RAW_SCORE_CAP;
 }
@@ -304,7 +309,10 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+    if (model_map == g_model_host_base &&
+        (g_model_device_owned || g_model_registered)) {
+        return cuda_model_ptr(model_map, offset);
+    }
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
@@ -532,9 +540,22 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
     return NULL;
 }
 
+extern "C" const char *ds4_cuda_nvfp4_resolve_weight_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier,
+        const char *label) {
+    return cuda_resolve_weight_ptr(
+        model_map, offset, bytes, logical_tier, label);
+}
+
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered) return 1;
+    if (model_map == g_model_host_base &&
+        (g_model_device_owned || g_model_registered)) {
+        return 1;
+    }
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -2008,6 +2029,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     g_current_logical_tier = -1;
     cuda_native_nvfp4_cache_release_all();
+    ds4_cuda_laguna_native_nvfp4_cache_release_all();
     cuda_laguna_bf16_lt_cleanup();
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
@@ -2924,6 +2946,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     cuda_native_nvfp4_cache_release_all();
+    ds4_cuda_laguna_native_nvfp4_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
@@ -3022,6 +3045,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     cuda_native_nvfp4_cache_release_all();
+    ds4_cuda_laguna_native_nvfp4_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {

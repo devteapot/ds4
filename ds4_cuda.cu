@@ -287,6 +287,23 @@ static int cuda_q4_mma_ok(void) {
 static int cuda_q4_mma_tile16_shmem_ok(int which_down);
 
 static void cuda_native_nvfp4_cache_release_all(void);
+extern "C" int ds4_cuda_laguna_native_nvfp4_routed_moe_tensor(
+        ds4_gpu_tensor                *out,
+        ds4_gpu_tensor                *mid,
+        const void                    *model_map,
+        uint64_t                       model_size,
+        const ds4_gpu_laguna_moe_desc *routed,
+        uint32_t                       expert_in_dim,
+        uint32_t                       expert_mid_dim,
+        uint32_t                       out_dim,
+        const ds4_gpu_tensor          *selected,
+        const ds4_gpu_tensor          *weights,
+        uint32_t                       n_total_expert,
+        uint32_t                       n_expert,
+        const ds4_gpu_tensor          *x,
+        uint32_t                       n_tokens);
+extern "C" void
+ds4_cuda_laguna_native_nvfp4_cache_release_all(void);
 
 static int g_cuda_laguna_bf16_lt_enabled;
 static int cuda_laguna_bf16_lt_matmul(
@@ -305,6 +322,67 @@ static void routed_moe_decode_graph_destroy_one(int logical_tier);
 #include "models/deepseek/cuda/control.inc"
 #include "cuda/common_dispatch.inc"
 #include "models/deepseek/cuda/moe.inc"
+
+extern "C" int ds4_cuda_nvfp4_prepare_sorted_tiles16(
+        uint32_t *counts,
+        uint32_t *offsets,
+        uint32_t *cursors,
+        uint32_t *sorted_pairs,
+        uint32_t *tile_offsets,
+        uint32_t *tile_total,
+        uint32_t *tile_experts,
+        uint32_t *tile_starts,
+        const int32_t *selected,
+        uint32_t pair_count,
+        uint32_t n_total_expert) {
+    if (!counts || !offsets || !cursors || !sorted_pairs ||
+        !tile_offsets || !tile_total || !tile_experts ||
+        !tile_starts || !selected || pair_count == 0u ||
+        n_total_expert == 0u) {
+        return 0;
+    }
+    if (!cuda_ok(cudaMemsetAsync(
+                     counts, 0,
+                     (size_t)n_total_expert * sizeof(counts[0])),
+                 "Laguna native NVFP4 sorted counts clear")) {
+        return 0;
+    }
+    moe_count_sorted_pairs_kernel<<<
+        (pair_count + 255u) / 256u, 256>>>(
+            counts, selected, pair_count, n_total_expert);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Laguna native NVFP4 sorted count launch")) {
+        return 0;
+    }
+    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(
+        offsets, cursors, counts, n_total_expert);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Laguna native NVFP4 sorted prefix launch")) {
+        return 0;
+    }
+    moe_scatter_sorted_pairs_kernel<<<
+        (pair_count + 255u) / 256u, 256>>>(
+            sorted_pairs, cursors, selected,
+            pair_count, n_total_expert);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Laguna native NVFP4 sorted scatter launch")) {
+        return 0;
+    }
+    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(
+        tile_offsets, tile_total, counts, 16u,
+        n_total_expert);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Laguna native NVFP4 sorted tile-offset launch")) {
+        return 0;
+    }
+    moe_build_expert_tiles_kernel<<<
+        (n_total_expert + 255u) / 256u, 256>>>(
+            tile_experts, tile_starts, tile_offsets,
+            counts, 16u, n_total_expert);
+    return cuda_ok(cudaGetLastError(),
+                   "Laguna native NVFP4 sorted tile launch");
+}
+
 #include "models/deepseek/cuda/hc.inc"
 #include "cuda/runtime_services.inc"
 #include "models/glm/cuda/kernels.inc"

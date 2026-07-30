@@ -1,0 +1,5 @@
+run,ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,steady_gen_tps,all_frontiers_verifier_blocks,all_frontiers_drafted,all_frontiers_matched,all_frontiers_acceptance_pct,all_frontiers_avg_block_ms
+1,2048,2032,628.14,256,22.71,22.73,46,678,460,67.8,396.78
+2,2048,2032,621.22,256,22.98,23.00,46,675,460,68.1,389.60
+3,2048,2032,627.07,256,23.37,23.40,46,665,460,69.2,384.44
+median,2048,2032,627.07,256,22.98,23.00,46,675,460,68.1,389.60

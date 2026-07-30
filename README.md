@@ -246,14 +246,17 @@ make cuda-spark       # GB10 / sm_121 Blackwell family target
   -p "Explain this repository"
 ```
 
-The Spark build emits native `compute_121f`/`sm_121` code. Prompt-sized routed
-batches use Blackwell block-scaled `m16n8k64` FP4 MMA directly on the
-checkpoint's E2M1 weights and UE4M3 scales. Single-token decode and the
-eight-row verifier produced by a seven-token DFlash draft deliberately use
-the integer-dot kernel instead:
-the SM121 FP4 MMA tile has eight columns, so those narrow shapes leave most of
-the tile idle. The checkpoint's routed experts are NVFP4; attention and the
-remaining dense projections are BF16.
+The Spark build isolates hardware-specific code generation: the canonical
+GGUF Q4/DFlash CUDA translation unit keeps the upstream toolchain-default
+target, while the native-checkpoint translation unit alone emits
+`compute_121f`/`sm_121`. Prompt-sized routed batches use Blackwell block-scaled
+`m16n8k64` FP4 MMA directly on the checkpoint's E2M1 weights and UE4M3 scales.
+Single-token decode and the eight-row verifier produced by a seven-token
+DFlash draft deliberately use the tuned integer-dot kernel instead: the SM121
+FP4 MMA tile has eight columns, so those narrow shapes leave most of the tile
+idle. The checkpoint's routed experts are NVFP4; attention and the remaining
+dense projections are BF16, with decode projections using the tuned cuBLASLt
+path.
 
 This native path is Blackwell-only and CUDA-only. Use the Laguna GGUF models
 for pre-Blackwell CUDA, Metal, ROCm, SSD streaming, distributed inference, or
@@ -270,19 +273,18 @@ native seven-token default for greedy decoding:
   --dflash-draft 7 --temp 0 -p "Explain this repository"
 ```
 
-On the development GB10, one 2,048-token `ds4.c` prompt followed by 256 greedy
-tokens measured 15.58 token/s without speculation and 35.05 token/s with the
-official native drafter at fixed depth 7, a 2.25x speedup. The drafter
-accepted 212 of 280 proposals (75.7%) across 40 verifier blocks and committed
-6.30 tokens per block on average. In the same run shape, Q4_K_M measured
-22.32 token/s normally and 23.42 token/s with its warmed BF16 DFlash drafter
-at fixed depth 15. Native NVFP4 is slower for ordinary single-token decode,
-but its native batched verifier reaches 1.50x the warmed Q4_K_M+DFlash
-throughput. See
-[`laguna_s21_nvfp4_dflash_gb10.csv`](speed-bench/laguna_s21_nvfp4_dflash_gb10.csv)
-and
+On the development GB10, the final warmed 16-to-2,048-token `ds4.c` protocol
+followed by 256 greedy tokens measured 18.59 token/s raw and 41.13 token/s
+with the official native drafter at fixed depth 7, a 2.21x speedup. Prefill
+was unchanged at about 1,080 token/s. Under the same protocol, current Q4_K_M
+measured 22.97 token/s raw and 22.98 token/s with its BF16 DFlash drafter;
+the `origin/laguna-s2.1` raw reference measured 22.89 token/s. The canonical
+Q4 full-row injection schedule costs about 400 ms per verifier block, so its
+speculative lane is effectively raw speed. See
 [`laguna_s21_dflash_quant_comparison_gb10.csv`](speed-bench/laguna_s21_dflash_quant_comparison_gb10.csv)
-for the measured counters and warmup annotation. Speculative results are
+and
+[`laguna_s21_upstream_q4_parity_repeats_gb10.csv`](speed-bench/laguna_s21_upstream_q4_parity_repeats_gb10.csv)
+for the measured rows and warmup annotation. Speculative results are
 prompt-sensitive.
 
 For Strix Halo:

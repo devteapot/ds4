@@ -1195,7 +1195,8 @@ static bool dflash_graph_matmul(
                                          x,
                                          n_rows) != 0;
     }
-    if (weight->type == DS4_TENSOR_BF16) {
+    if (e->mtp_model.native_dflash &&
+        weight->type == DS4_TENSOR_BF16) {
         return ds4_gpu_matmul_bf16_tensor(out,
                                           e->mtp_model.map,
                                           e->mtp_model.size,
@@ -1258,7 +1259,8 @@ static bool dflash_graph_rms_norm(
         uint32_t              n,
         uint32_t              rows) {
     if (!out || !x || !e || !weight || rows == 0u) return false;
-    if (weight->type == DS4_TENSOR_BF16) {
+    if (e->mtp_model.native_dflash &&
+        weight->type == DS4_TENSOR_BF16) {
         return ds4_gpu_rms_norm_bf16_weight_tensor(
                    out,
                    x,
@@ -1315,7 +1317,8 @@ static bool dflash_graph_encode_inject(
     bool ok = ds4_gpu_commands_active() ||
               ds4_gpu_begin_commands() != 0;
     if (ok) {
-        if (w->aux_norm->type == DS4_TENSOR_BF16) {
+        if (native_dflash &&
+            w->aux_norm->type == DS4_TENSOR_BF16) {
             ok = ds4_gpu_dflash_aux_norm_bf16_tensor(
                      g->features,
                      e->mtp_model.map,
@@ -1367,7 +1370,8 @@ static bool dflash_graph_encode_inject(
                                      g->norm, n_rows);
         }
         if (ok) {
-            if (l->attn_k_norm->type == DS4_TENSOR_BF16) {
+            if (native_dflash &&
+                l->attn_k_norm->type == DS4_TENSOR_BF16) {
                 ok = ds4_gpu_laguna_head_rms_norm_rope_bf16_tensor(
                          g->k,
                          e->mtp_model.map,
@@ -1517,7 +1521,7 @@ static bool dflash_graph_draft_block(
                         l->attn_gate->abs_offset,
                         n_rows,
                         g->norm) != 0;
-            } else if (all_bf16 &&
+            } else if (native_dflash && all_bf16 &&
                        getenv(
                            "DS4_CUDA_DFLASH_NO_BF16_QKVG_FUSION") == NULL) {
                 projections_done =
@@ -1550,7 +1554,8 @@ static bool dflash_graph_draft_block(
                                       g->norm, n_rows));
         }
         if (ok) {
-            if (l->attn_q_norm->type == DS4_TENSOR_BF16 &&
+            if (native_dflash &&
+                l->attn_q_norm->type == DS4_TENSOR_BF16 &&
                 getenv(
                     "DS4_CUDA_DFLASH_NO_QK_NORM_ROPE_FUSION") == NULL) {
                 ok = ds4_gpu_laguna_qk_head_rms_norm_rope_bf16_tensor(
@@ -1574,7 +1579,8 @@ static bool dflash_graph_draft_block(
                          0.0f,
                          0.0f,
                          DS4_SHAPE_LAGUNA_S21.rms_eps) != 0;
-            } else if (l->attn_q_norm->type == DS4_TENSOR_BF16) {
+            } else if (native_dflash &&
+                       l->attn_q_norm->type == DS4_TENSOR_BF16) {
                 ok = ds4_gpu_laguna_head_rms_norm_rope_bf16_tensor(
                          g->q,
                          e->mtp_model.map,

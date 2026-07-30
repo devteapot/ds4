@@ -74,6 +74,7 @@ NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
 CUDA_CODE ?=
 CUDA_NVFP4_MMA ?= 0
+CUDA_BACKEND_OBJS := ds4_cuda.o models/laguna/cuda/nvfp4_native.o
 ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
@@ -81,10 +82,12 @@ ifneq ($(strip $(CUDA_CODE)),)
 NVCC_ARCH_FLAGS += -code=$(CUDA_CODE)
 endif
 ifeq ($(CUDA_NVFP4_MMA),1)
-NVCC_ARCH_FLAGS += -DDS4_CUDA_NVFP4_MMA=1
+NVFP4_NATIVE_NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math -arch=compute_121f -code=sm_121 -DDS4_CUDA_NVFP4_MMA=1 -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+else
+NVFP4_NATIVE_NVCCFLAGS ?= $(NVCCFLAGS)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CORE_OBJS = ds4.o $(MODEL_PROVIDER_OBJS) ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o
+CORE_OBJS = ds4.o $(MODEL_PROVIDER_OBJS) ds4_distributed.o ds4_tp.o ds4_ssd.o $(CUDA_BACKEND_OBJS) ds4_layer_pack.o
 CPU_CORE_OBJS = ds4_cpu.o $(MODEL_PROVIDER_OBJS) ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
@@ -164,7 +167,7 @@ help:
 
 cuda-spark:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CUDA_ARCH=compute_121f CUDA_CODE=sm_121 CUDA_NVFP4_MMA=1
+		CUDA_ARCH= CUDA_CODE= CUDA_NVFP4_MMA=1
 
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
@@ -326,6 +329,10 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc \
 	$(CUDA_IMPL_FRAGMENTS)
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
+models/laguna/cuda/nvfp4_native.o: models/laguna/cuda/nvfp4_native.cu \
+	models/laguna/cuda/nvfp4.inc ds4_gpu.h ds4_gpu_mgpu.h
+	$(NVCC) $(NVFP4_NATIVE_NVCCFLAGS) -I. -c -o $@ $<
+
 ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
@@ -335,10 +342,10 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_BACKEND_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/cuda_laguna_nvfp4_smoke: tests/cuda_laguna_nvfp4_smoke.o ds4_cuda.o
+tests/cuda_laguna_nvfp4_smoke: tests/cuda_laguna_nvfp4_smoke.o $(CUDA_BACKEND_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/cuda_laguna_bf16_microbench: tests/cuda_laguna_bf16_microbench.cu
@@ -369,19 +376,19 @@ ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o
+tests/test_gpu_xdev: tests/test_gpu_xdev.o $(CUDA_BACKEND_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o
+tests/test_gpu_model_cache: tests/test_gpu_model_cache.o $(CUDA_BACKEND_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o
+tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o $(CUDA_BACKEND_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_cuda_test_hooks.o: ds4.c $(DS4_IMPL_FRAGMENTS) ds4.h ds4_model_provider.h ds4_model_provider_builtin.h models/deepseek/provider.h models/glm/provider.h models/laguna/provider.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
@@ -396,7 +403,7 @@ tests/test_engine_mgpu_refusal: tests/test_engine_mgpu_refusal.o ds4_gpu_args.o 
 tests/test_engine_mgpu_runtime.o: tests/test_engine_mgpu_runtime.c ds4.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_engine_mgpu_runtime: tests/test_engine_mgpu_runtime.o ds4_cuda_test_hooks.o $(MODEL_PROVIDER_OBJS) ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o
+tests/test_engine_mgpu_runtime: tests/test_engine_mgpu_runtime.o ds4_cuda_test_hooks.o $(MODEL_PROVIDER_OBJS) ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o $(CUDA_BACKEND_OBJS) ds4_layer_pack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_engine_correctness.o: tests/test_engine_correctness.c ds4.h ds4_gpu_mgpu.h
@@ -408,7 +415,7 @@ tests/test_engine_correctness: tests/test_engine_correctness.o ds4_gpu_args.o ds
 tests/test_sampling.o: tests/test_sampling.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_sampling: tests/test_sampling.o ds4_cuda_test_hooks.o $(MODEL_PROVIDER_OBJS) ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o
+tests/test_sampling: tests/test_sampling.o ds4_cuda_test_hooks.o $(MODEL_PROVIDER_OBJS) ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o $(CUDA_BACKEND_OBJS) ds4_layer_pack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_cuda_session_batch.o: tests/test_cuda_session_batch.c ds4.h ds4_gpu_args.h ds4_gpu_mgpu.h
@@ -423,7 +430,7 @@ test-cuda-session-batch: tests/test_cuda_session_batch
 tests/test_cuda_mixed_batch.o: tests/test_cuda_mixed_batch.c ds4.h ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_cuda_mixed_batch: tests/test_cuda_mixed_batch.o ds4_cuda_test_hooks.o $(MODEL_PROVIDER_OBJS) ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o
+tests/test_cuda_mixed_batch: tests/test_cuda_mixed_batch.o ds4_cuda_test_hooks.o $(MODEL_PROVIDER_OBJS) ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o $(CUDA_BACKEND_OBJS) ds4_layer_pack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-mixed-batch: tests/test_cuda_mixed_batch
@@ -488,4 +495,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_session_snapshot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o models/deepseek/provider.o models/glm/provider.o models/laguna/provider.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cuda_laguna_nvfp4_smoke tests/cuda_laguna_bf16_microbench
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_session_snapshot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o models/deepseek/provider.o models/glm/provider.o models/laguna/provider.o models/laguna/cuda/nvfp4_native.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cuda_laguna_nvfp4_smoke tests/cuda_laguna_bf16_microbench

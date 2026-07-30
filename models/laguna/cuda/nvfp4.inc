@@ -54,6 +54,7 @@ static int cuda_laguna_nvfp4_grouped_stage_activation(void) {
 
 struct cuda_native_nvfp4_cache {
     const uint64_t *key;
+    int device_id;
     const uint8_t **gate_packed;
     const uint8_t **gate_scale;
     const uint8_t **up_packed;
@@ -71,8 +72,14 @@ struct cuda_native_nvfp4_cache {
 static std::vector<cuda_native_nvfp4_cache> g_native_nvfp4_caches;
 
 static void cuda_native_nvfp4_cache_release_all(void) {
-    for (const cuda_native_nvfp4_cache &c : g_native_nvfp4_caches)
-        if (c.storage) (void)cudaFree(c.storage);
+    int previous_device = 0;
+    (void)cudaGetDevice(&previous_device);
+    for (const cuda_native_nvfp4_cache &c : g_native_nvfp4_caches) {
+        if (!c.storage) continue;
+        (void)cudaSetDevice(c.device_id);
+        (void)cudaFree(c.storage);
+    }
+    (void)cudaSetDevice(previous_device);
     g_native_nvfp4_caches.clear();
 }
 
@@ -1129,8 +1136,16 @@ static const cuda_native_nvfp4_cache *cuda_native_nvfp4_prepare(
         &desc->gate_nvfp4, &desc->up_nvfp4, &desc->down_nvfp4
     };
     if (!matrix[0]->packed_offsets) return NULL;
+    int device_id = 0;
+    if (!cuda_ok(cudaGetDevice(&device_id),
+                 "native NVFP4 cache device query")) {
+        return NULL;
+    }
     for (const cuda_native_nvfp4_cache &cached : g_native_nvfp4_caches)
-        if (cached.key == matrix[0]->packed_offsets) return &cached;
+        if (cached.key == matrix[0]->packed_offsets &&
+            cached.device_id == device_id) {
+            return &cached;
+        }
 
     for (uint32_t p = 0; p < 3u; p++) {
         if (!matrix[p]->packed_offsets || !matrix[p]->scale_offsets ||
@@ -1216,6 +1231,7 @@ static const cuda_native_nvfp4_cache *cuda_native_nvfp4_prepare(
     uint8_t *cursor = (uint8_t *)storage;
     cuda_native_nvfp4_cache cached = {};
     cached.key = matrix[0]->packed_offsets;
+    cached.device_id = device_id;
     cached.storage = storage;
 #define DS4_NVFP4_COPY_PTRS(dst_field_, src_) do { \
         cached.dst_field_ = (const uint8_t **)cursor; \
@@ -1511,7 +1527,9 @@ static int cuda_laguna_nvfp4_routed_moe(
             }
             pair0 += chunk;
         }
-    } else {
+    }
+#if !defined(DS4_CUDA_NVFP4_NATIVE_ONLY)
+    else {
         for (uint32_t token0 = 0u; token0 < n_tokens;) {
             uint32_t chunk = n_tokens - token0;
             if (chunk > 65535u) chunk = 65535u;
@@ -1528,6 +1546,7 @@ static int cuda_laguna_nvfp4_routed_moe(
             token0 += chunk;
         }
     }
+#endif
 
     if (grouped_native) {
         uint8_t *cursor = scratch + sorted_base;
@@ -1546,6 +1565,22 @@ static int cuda_laguna_nvfp4_routed_moe(
         tile_experts = (uint32_t *)cursor;
         cursor += tile_experts_bytes;
         tile_starts = (uint32_t *)cursor;
+#if defined(DS4_CUDA_NVFP4_NATIVE_ONLY)
+        if (!ds4_cuda_nvfp4_prepare_sorted_tiles16(
+                sorted_counts,
+                sorted_offsets,
+                cursors,
+                sorted_pairs,
+                tile_offsets,
+                tile_total,
+                tile_experts,
+                tile_starts,
+                (const int32_t *)selected->ptr,
+                (uint32_t)pairs,
+                n_total_expert)) {
+            return 0;
+        }
+#else
         if (!cuda_ok(cudaMemsetAsync(
                          sorted_counts, 0, (size_t)counts_bytes),
                      "Laguna native NVFP4 sorted counts clear")) {
@@ -1589,6 +1624,7 @@ static int cuda_laguna_nvfp4_routed_moe(
                      "Laguna native NVFP4 sorted tile launch")) {
             return 0;
         }
+#endif
     }
 
     if (native) {
@@ -1794,7 +1830,9 @@ static int cuda_laguna_nvfp4_routed_moe(
                     expert_mid_dim, expert_mid_dim / 16u,
                     n_total_expert, (uint32_t)pairs, n_expert,
                     1u, pair0, true, true);
-        } else {
+        }
+#if !defined(DS4_CUDA_NVFP4_NATIVE_ONLY)
+        else {
             quantize_q8_0_f32_kernel<<<dim3(midq_blocks, chunk, 1u), 32>>>(
                 midq + (uint64_t)pair0 * expert_mid_dim,
                 midscale + (uint64_t)pair0 * midq_blocks,
@@ -1802,6 +1840,7 @@ static int cuda_laguna_nvfp4_routed_moe(
                     (uint64_t)pair0 * expert_mid_dim,
                 expert_mid_dim, midq_blocks);
         }
+#endif
         if (!cuda_ok(cudaGetLastError(),
                      native ? "Laguna native NVFP4 mid quantize launch" :
                               "Laguna NVFP4 mid quantize launch")) {
@@ -1840,7 +1879,15 @@ static int cuda_laguna_nvfp4_routed_moe(
 }
 
 
-extern "C" int ds4_gpu_laguna_routed_moe_tensor(
+#if defined(DS4_CUDA_NVFP4_NATIVE_ONLY)
+#define DS4_CUDA_LAGUNA_NVFP4_ENTRY \
+    ds4_cuda_laguna_native_nvfp4_routed_moe_tensor
+#else
+#define DS4_CUDA_LAGUNA_NVFP4_ENTRY \
+    ds4_gpu_laguna_routed_moe_tensor
+#endif
+
+extern "C" int DS4_CUDA_LAGUNA_NVFP4_ENTRY(
         ds4_gpu_tensor                *out,
         ds4_gpu_tensor                *mid,
         const void                    *model_map,
@@ -1859,8 +1906,25 @@ extern "C" int ds4_gpu_laguna_routed_moe_tensor(
         routed->up_type != 40u || routed->down_type != 40u) {
         return 0;
     }
+#if defined(DS4_CUDA_NVFP4_NATIVE_ONLY)
+    if (!routed->gate_nvfp4.packed_offsets ||
+        !routed->up_nvfp4.packed_offsets ||
+        !routed->down_nvfp4.packed_offsets) {
+        return 0;
+    }
+#endif
+#if !defined(DS4_CUDA_NVFP4_NATIVE_ONLY)
+    if (routed->gate_nvfp4.packed_offsets != NULL) {
+        return ds4_cuda_laguna_native_nvfp4_routed_moe_tensor(
+            out, mid, model_map, model_size, routed,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_total_expert, n_expert, x, n_tokens);
+    }
+#endif
     return cuda_laguna_nvfp4_routed_moe(
         out, mid, model_map, model_size, routed,
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_expert, x, n_tokens);
 }
+
+#undef DS4_CUDA_LAGUNA_NVFP4_ENTRY

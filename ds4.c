@@ -3974,15 +3974,18 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
 
     for (uint64_t i = 0; i < nspan;) {
         /*
-         * Preserve the source address's low alignment bits when CUDA caches a
-         * merged range. Native NVFP4 kernels perform aligned fragment loads
-         * from offsets within the cached range.
+         * Preserve source-address alignment only for the native NVFP4
+         * safetensors ranges whose fragment loads depend on it. GGUF keeps
+         * the canonical Laguna behavior: cache from the first tensor's exact
+         * offset so cudaMalloc aligns that tensor on the device.
          */
         const uint64_t preload_align = 256u;
         const bool realign = spans[i].realign;
-        uint64_t off = realign ?
-            spans[i].off :
-            spans[i].off & ~(preload_align - 1u);
+        const bool preserve_source_alignment =
+            m->native_safetensors && m->native_nvfp4 && !realign;
+        uint64_t off = preserve_source_alignment ?
+            spans[i].off & ~(preload_align - 1u) :
+            spans[i].off;
         uint64_t end = spans[i].end;
         i++;
         while (!realign && i < nspan && !spans[i].realign &&
