@@ -3365,12 +3365,14 @@ static bool ds4_gpu_glm_gate_pair_type_supported(
         uint32_t up_type) {
     return gate_type == up_type &&
            (gate_type == DS4_METAL_TENSOR_Q2_K ||
+            gate_type == DS4_METAL_TENSOR_Q3_K ||
             gate_type == DS4_METAL_TENSOR_Q4_K ||
             gate_type == DS4_METAL_TENSOR_Q5_K);
 }
 
 static bool ds4_gpu_glm_down_type_supported(uint32_t down_type) {
     return down_type == DS4_METAL_TENSOR_Q2_K ||
+           down_type == DS4_METAL_TENSOR_Q3_K ||
            down_type == DS4_METAL_TENSOR_Q4_K ||
            down_type == DS4_METAL_TENSOR_Q5_K ||
            down_type == DS4_METAL_TENSOR_Q6_K;
@@ -3478,13 +3480,16 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         }
 
         const BOOL gate_pair_q2 = gate_type == DS4_METAL_TENSOR_Q2_K;
+        const BOOL gate_pair_q3 = gate_type == DS4_METAL_TENSOR_Q3_K;
         const BOOL gate_pair_q5 = gate_type == DS4_METAL_TENSOR_Q5_K;
         const BOOL down_scalar_q2 = down_type == DS4_METAL_TENSOR_Q2_K;
+        const BOOL down_simd_q3 = down_type == DS4_METAL_TENSOR_Q3_K;
         const BOOL down_scalar_q4 = down_type == DS4_METAL_TENSOR_Q4_K;
         const BOOL down_simd_q4 = down_scalar_q4;
         const BOOL down_simd_q5 = down_type == DS4_METAL_TENSOR_Q5_K;
         const BOOL down_simd_q6 = down_type == DS4_METAL_TENSOR_Q6_K;
-        const BOOL down_simd = down_simd_q4 || down_simd_q5 || down_simd_q6;
+        const BOOL down_simd =
+            down_simd_q3 || down_simd_q4 || down_simd_q5 || down_simd_q6;
         const BOOL stream_addr_q2 =
             gate_pair_q2 && down_scalar_q2 &&
             g_glm_q2_k_addr_pair_swiglu2_f32_pipeline != nil &&
@@ -3761,6 +3766,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              gate_pair_q2 ?
              ds4_gpu_hot_pipeline(g_glm_q2_k_pair_swiglu_f32_pipeline,
                                   "kernel_glm_q2_K_pair_swiglu_f32") :
+             gate_pair_q3 ?
+             ds4_gpu_hot_pipeline(g_glm_q3_k_pair_swiglu_f32_pipeline,
+                                  "kernel_glm_q3_K_pair_swiglu_f32") :
              gate_pair_q5 ?
              ds4_gpu_hot_pipeline(g_glm_q5_k_pair_swiglu_f32_pipeline,
                                   "kernel_glm_q5_K_pair_swiglu_f32") :
@@ -3776,6 +3784,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              down_scalar_q2 ?
              ds4_gpu_hot_pipeline(g_glm_q2_k_down_f32_pipeline,
                                   "kernel_glm_q2_K_down_f32") :
+             down_simd_q3 ?
+             ds4_gpu_hot_pipeline(g_glm_q3_k_down_f32_pipeline,
+                                  "kernel_glm_q3_K_down_f32") :
              down_scalar_q4 ?
              ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
                                   "kernel_glm_q4_K_down_f32") :
@@ -3803,12 +3814,14 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             (gate_pair_q2 ? "q2_stream_addr_swiglu" :
                             "q4_stream_addr_swiglu") :
             gate_pair_q2 ? "q2_scalar_swiglu" :
+            gate_pair_q3 ? "q3_pair_simd_swiglu" :
             gate_pair_q5 ? "q5_pair_simd_swiglu" : "q4_pair2_simd_swiglu";
         const char *glm_down_path =
             use_stream_expert_addr_table ?
             (down_scalar_q2 ? "q2_stream_addr_down" :
                               "q4_stream_addr_down_simd") :
             down_scalar_q2 ? "q2_down_simd" :
+            down_simd_q3 ? "q3_down_simd" :
             down_scalar_q4 ? "q4_down_simd" :
             down_simd_q5 ? "q5_down_simd" : "q6_down_simd";
         double glm_moe_stage_t0 = 0.0;
@@ -3875,6 +3888,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             gate_pair_q2 ? (use_stream_expert_addr_table ?
                             (NSUInteger)((expert_mid_dim + 1u) / 2u) :
                             (NSUInteger)((expert_mid_dim + 7u) / 8u)) :
+            gate_pair_q3 ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
             gate_pair_q5 ? (NSUInteger)((expert_mid_dim + 7u) / 8u) :
             use_stream_expert_addr_table ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
             (NSUInteger)((expert_mid_dim + 1u) / 2u);
@@ -3882,6 +3896,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const NSUInteger pair_threads = 64u;
         const NSUInteger down_x_groups =
             down_scalar_q2 ? (NSUInteger)((out_dim + 7u) / 8u) :
+            down_simd_q3 ? (NSUInteger)((out_dim + 3u) / 4u) :
             down_simd_q4 ? (NSUInteger)((out_dim + 3u) / 4u) :
             down_simd_q5 ? (NSUInteger)((out_dim + 3u) / 4u) :
             down_simd_q6 ? (NSUInteger)((out_dim + 3u) / 4u) :
@@ -4879,13 +4894,16 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         uint32_t stream_unique = 0;
 
         const BOOL gate_pair_q2 = gate_type == DS4_METAL_TENSOR_Q2_K;
+        const BOOL gate_pair_q3 = gate_type == DS4_METAL_TENSOR_Q3_K;
         const BOOL gate_pair_q5 = gate_type == DS4_METAL_TENSOR_Q5_K;
         const BOOL down_scalar_q2 = down_type == DS4_METAL_TENSOR_Q2_K;
+        const BOOL down_simd_q3 = down_type == DS4_METAL_TENSOR_Q3_K;
         const BOOL down_scalar_q4 = down_type == DS4_METAL_TENSOR_Q4_K;
         const BOOL down_simd_q4 = down_scalar_q4;
         const BOOL down_simd_q5 = down_type == DS4_METAL_TENSOR_Q5_K;
         const BOOL down_simd_q6 = down_type == DS4_METAL_TENSOR_Q6_K;
-        const BOOL down_simd = down_simd_q4 || down_simd_q5 || down_simd_q6;
+        const BOOL down_simd =
+            down_simd_q3 || down_simd_q4 || down_simd_q5 || down_simd_q6;
         const BOOL stream_addr_q2 =
             gate_pair_q2 && down_scalar_q2 &&
             g_glm_q2_k_addr_pair_swiglu2_f32_pipeline != nil &&
@@ -4920,7 +4938,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         const BOOL q4_scalar_pair = false;
         const BOOL q4_pair2 =
             !use_stream_expert_addr_table &&
-            !gate_pair_q5 && !q4_scalar_pair &&
+            !gate_pair_q3 && !gate_pair_q5 && !q4_scalar_pair &&
             (force_scalar_q4_pair || !enable_q4_pair4);
         id<MTLComputePipelineState> pair_pipeline =
             use_stream_expert_addr_table ?
@@ -4932,6 +4950,9 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             gate_pair_q2 ?
              ds4_gpu_hot_pipeline(g_glm_q2_k_pair_swiglu_f32_pipeline,
                                   "kernel_glm_q2_K_pair_swiglu_f32") :
+            gate_pair_q3 ?
+             ds4_gpu_hot_pipeline(g_glm_q3_k_pair_swiglu_f32_pipeline,
+                                  "kernel_glm_q3_K_pair_swiglu_f32") :
             gate_pair_q5 ?
              ds4_gpu_hot_pipeline(g_glm_q5_k_pair_swiglu_f32_pipeline,
                                   "kernel_glm_q5_K_pair_swiglu_f32") :
@@ -4953,6 +4974,9 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             down_scalar_q2 ?
             ds4_gpu_hot_pipeline(g_glm_q2_k_down_f32_pipeline,
                                  "kernel_glm_q2_K_down_f32") :
+            down_simd_q3 ?
+            ds4_gpu_hot_pipeline(g_glm_q3_k_down_f32_pipeline,
+                                 "kernel_glm_q3_K_down_f32") :
             down_scalar_q4 ?
             ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
                                  "kernel_glm_q4_K_down_f32") :
@@ -5055,6 +5079,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                                     (gate_pair_q2 ? "q2_stream_addr_swiglu" :
                                                     "q4_stream_addr_swiglu") :
                                     gate_pair_q2 ? "q2_scalar_swiglu" :
+                                    gate_pair_q3 ? "q3_pair_simd_swiglu" :
                                     gate_pair_q5 ? "q5_pair_simd_swiglu" :
                                     (q4_scalar_pair ? "q4_scalar_swiglu" :
                                     (q4_pair2 ? "q4_pair2_simd_swiglu" :
@@ -5063,6 +5088,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             use_stream_expert_addr_table ?
             (down_scalar_q2 ? "q2_stream_addr_down" : "q4_stream_addr_down_simd") :
             down_scalar_q2 ? "q2_down_scalar" :
+            down_simd_q3 ? "q3_down_simd" :
             down_scalar_q4 ? "q4_down_simd" :
             down_simd_q5 ? "q5_down_simd" : "q6_down_simd";
         double glm_moe_stage_t0 = 0.0;
@@ -5129,6 +5155,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             gate_pair_q2 ? (use_stream_expert_addr_table ?
                             (NSUInteger)((expert_mid_dim + 1u) / 2u) :
                             (NSUInteger)((expert_mid_dim + 7u) / 8u)) :
+            gate_pair_q3 ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
             gate_pair_q5 ? (NSUInteger)((expert_mid_dim + 7u) / 8u) :
             use_stream_expert_addr_table ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
             q4_scalar_pair ? (NSUInteger)expert_mid_dim :
@@ -5140,6 +5167,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             q4_scalar_pair ? 256u : 64u;
         const NSUInteger down_x_groups =
             down_scalar_q2 ? (NSUInteger)((out_dim + 7u) / 8u) :
+            down_simd_q3 ? (NSUInteger)((out_dim + 3u) / 4u) :
             down_simd_q4 ? (NSUInteger)((out_dim + 3u) / 4u) :
             down_simd_q5 ? (NSUInteger)((out_dim + 3u) / 4u) :
             down_simd_q6 ? (NSUInteger)((out_dim + 3u) / 4u) :
@@ -5337,4 +5365,325 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
                                                     mid_token_stride,
                                                     false,
                                                     false);
+}
+
+int ds4_gpu_glm_routed_moe_batch_decode_exact_q2_q3_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              gate_type,
+        uint32_t              up_type,
+        uint32_t              down_type,
+        uint64_t              gate_expert_bytes,
+        uint64_t              gate_row_bytes,
+        uint64_t              up_expert_bytes,
+        uint64_t              up_row_bytes,
+        uint64_t              down_expert_bytes,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        uint32_t              layer_index,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tokens,
+        uint32_t              mid_token_stride) {
+    (void)layer_index;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const bool q2 = gate_type == DS4_METAL_TENSOR_Q2_K;
+    const bool q3 = gate_type == DS4_METAL_TENSOR_Q3_K;
+    if (!out || !mid || !model_map || !selected || !weights || !x ||
+        (!q2 && !q3) || up_type != gate_type || down_type != gate_type ||
+        n_tokens == 0u || n_tokens > 16u ||
+        n_total_expert == 0u || n_expert == 0u ||
+        n_expert > 256u ||
+        n_expert > n_total_expert ||
+        expert_in_dim == 0u || expert_mid_dim == 0u || out_dim == 0u ||
+        gate_expert_bytes == 0u || gate_row_bytes == 0u ||
+        up_expert_bytes == 0u || up_row_bytes == 0u ||
+        down_expert_bytes == 0u || down_row_bytes == 0u ||
+        (expert_in_dim % 256u) != 0u ||
+        (expert_mid_dim % 256u) != 0u) {
+        return 0;
+    }
+
+    const uint64_t per_token_mid =
+        (uint64_t)n_expert * expert_mid_dim;
+    if ((uint64_t)mid_token_stride < per_token_mid ||
+        per_token_mid > UINT32_MAX ||
+        (uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / up_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / down_expert_bytes ||
+        gate_expert_bytes !=
+            (uint64_t)expert_mid_dim * gate_row_bytes ||
+        up_expert_bytes !=
+            (uint64_t)expert_mid_dim * up_row_bytes ||
+        down_expert_bytes !=
+            (uint64_t)out_dim * down_row_bytes) {
+        return 0;
+    }
+
+    uint32_t first_expert = 0;
+    uint32_t n_bind_expert = 0;
+    ds4_gpu_tp_expert_range(
+        n_total_expert, &first_expert, &n_bind_expert);
+    if ((uint64_t)first_expert >
+            (UINT64_MAX - gate_offset) / gate_expert_bytes ||
+        (uint64_t)first_expert >
+            (UINT64_MAX - up_offset) / up_expert_bytes ||
+        (uint64_t)first_expert >
+            (UINT64_MAX - down_offset) / down_expert_bytes) {
+        return 0;
+    }
+    gate_offset += (uint64_t)first_expert * gate_expert_bytes;
+    up_offset += (uint64_t)first_expert * up_expert_bytes;
+    down_offset += (uint64_t)first_expert * down_expert_bytes;
+
+    const uint64_t gate_tensor_bytes =
+        (uint64_t)n_bind_expert * gate_expert_bytes;
+    const uint64_t up_tensor_bytes =
+        (uint64_t)n_bind_expert * up_expert_bytes;
+    const uint64_t down_tensor_bytes =
+        (uint64_t)n_bind_expert * down_expert_bytes;
+    const uint64_t x_values = (uint64_t)n_tokens * expert_in_dim;
+    const uint64_t out_values = (uint64_t)n_tokens * out_dim;
+    const uint64_t mid_values =
+        (uint64_t)(n_tokens - 1u) * mid_token_stride + per_token_mid;
+    const uint64_t selected_values =
+        (uint64_t)n_tokens * n_expert;
+    if (gate_offset > model_size ||
+        gate_tensor_bytes > model_size - gate_offset ||
+        up_offset > model_size ||
+        up_tensor_bytes > model_size - up_offset ||
+        down_offset > model_size ||
+        down_tensor_bytes > model_size - down_offset ||
+        x_values > UINT64_MAX / sizeof(float) ||
+        out_values > UINT64_MAX / sizeof(float) ||
+        mid_values > UINT64_MAX / sizeof(float) ||
+        selected_values > UINT64_MAX / sizeof(int32_t)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> midbuf = ds4_gpu_tensor_buffer(mid);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> selectedbuf =
+            ds4_gpu_tensor_buffer(selected);
+        id<MTLBuffer> weightsbuf =
+            ds4_gpu_tensor_buffer(weights);
+        if (!xbuf || !midbuf || !outbuf ||
+            !selectedbuf || !weightsbuf ||
+            ds4_gpu_tensor_bytes(x) <
+                x_values * sizeof(float) ||
+            ds4_gpu_tensor_bytes(mid) <
+                mid_values * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) <
+                out_values * sizeof(float) ||
+            ds4_gpu_tensor_bytes(selected) <
+                selected_values * sizeof(int32_t) ||
+            ds4_gpu_tensor_bytes(weights) <
+                selected_values * sizeof(float)) {
+            return 0;
+        }
+
+        uint64_t gate_inner = 0;
+        uint64_t up_inner = 0;
+        uint64_t down_inner = 0;
+        id<MTLBuffer> gatebuf = ds4_gpu_wrap_model_range(
+            model_map, model_size, gate_offset,
+            gate_tensor_bytes, &gate_inner);
+        id<MTLBuffer> upbuf = ds4_gpu_wrap_model_range(
+            model_map, model_size, up_offset,
+            up_tensor_bytes, &up_inner);
+        id<MTLBuffer> downbuf = ds4_gpu_wrap_model_range(
+            model_map, model_size, down_offset,
+            down_tensor_bytes, &down_inner);
+        id<MTLComputePipelineState> pair_pipeline =
+            q2 ? ds4_gpu_hot_pipeline(
+                     g_glm_q2_k_pair_swiglu_f32_pipeline,
+                     "kernel_glm_q2_K_pair_swiglu_f32") :
+                 ds4_gpu_hot_pipeline(
+                     g_glm_q3_k_pair_swiglu_f32_pipeline,
+                     "kernel_glm_q3_K_pair_swiglu_f32");
+        id<MTLComputePipelineState> down_pipeline =
+            q2 ? ds4_gpu_hot_pipeline(
+                     g_glm_q2_k_down_f32_pipeline,
+                     "kernel_glm_q2_K_down_f32") :
+                 ds4_gpu_hot_pipeline(
+                     g_glm_q3_k_down_f32_pipeline,
+                     "kernel_glm_q3_K_down_f32");
+        if (!gatebuf || !upbuf || !downbuf ||
+            !pair_pipeline || !down_pipeline) {
+            return 0;
+        }
+
+        ds4_gpu_glm_routed_moe_args args = {
+            .tp_rank = g_tp_split_rank,
+            .tp_world = g_tp_split_world,
+            .tp_expert_base = (int32_t)first_expert,
+            .in_dim = expert_in_dim,
+            .mid_dim = expert_mid_dim,
+            .out_dim = out_dim,
+            .n_total_expert = n_total_expert,
+            .n_expert_used = n_expert,
+            .n_tokens = 1u,
+            .mid_token_stride = (uint32_t)per_token_mid,
+            .down_type = down_type,
+            .gate_expert_bytes = gate_expert_bytes,
+            .gate_row_bytes = gate_row_bytes,
+            .up_expert_bytes = up_expert_bytes,
+            .up_row_bytes = up_row_bytes,
+            .down_expert_bytes = down_expert_bytes,
+            .down_row_bytes = down_row_bytes,
+        };
+        const NSUInteger pair_groups = q2 ?
+            ((NSUInteger)expert_mid_dim + 7u) / 8u :
+            ((NSUInteger)expert_mid_dim + 3u) / 4u;
+        const NSUInteger down_groups = q2 ?
+            ((NSUInteger)out_dim + 7u) / 8u :
+            ((NSUInteger)out_dim + 3u) / 4u;
+        const uint64_t x_row_bytes =
+            (uint64_t)expert_in_dim * sizeof(float);
+        const uint64_t mid_row_bytes =
+            (uint64_t)mid_token_stride * sizeof(float);
+        const uint64_t out_row_bytes =
+            (uint64_t)out_dim * sizeof(float);
+        const uint64_t selected_row_bytes =
+            (uint64_t)n_expert * sizeof(int32_t);
+        const uint64_t weights_row_bytes =
+            (uint64_t)n_expert * sizeof(float);
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb =
+            ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc =
+            ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pair_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:gatebuf
+                offset:(NSUInteger)gate_inner atIndex:1];
+        [enc setBuffer:upbuf
+                offset:(NSUInteger)up_inner atIndex:2];
+        for (uint32_t row = 0; row < n_tokens; row++) {
+            [enc setBuffer:xbuf
+                    offset:ds4_gpu_tensor_offset(x) +
+                           (NSUInteger)(row * x_row_bytes)
+                   atIndex:3];
+            [enc setBuffer:selectedbuf
+                    offset:ds4_gpu_tensor_offset(selected) +
+                           (NSUInteger)(row * selected_row_bytes)
+                   atIndex:4];
+            [enc setBuffer:weightsbuf
+                    offset:ds4_gpu_tensor_offset(weights) +
+                           (NSUInteger)(row * weights_row_bytes)
+                   atIndex:5];
+            [enc setBuffer:midbuf
+                    offset:ds4_gpu_tensor_offset(mid) +
+                           (NSUInteger)(row * mid_row_bytes)
+                   atIndex:6];
+            [enc dispatchThreadgroups:
+                    MTLSizeMake(pair_groups,
+                                (NSUInteger)n_expert, 1u)
+                 threadsPerThreadgroup:
+                    MTLSizeMake(64u, 1u, 1u)];
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:downbuf
+                offset:(NSUInteger)down_inner atIndex:1];
+        for (uint32_t row = 0; row < n_tokens; row++) {
+            [enc setBuffer:selectedbuf
+                    offset:ds4_gpu_tensor_offset(selected) +
+                           (NSUInteger)(row * selected_row_bytes)
+                   atIndex:2];
+            [enc setBuffer:midbuf
+                    offset:ds4_gpu_tensor_offset(mid) +
+                           (NSUInteger)(row * mid_row_bytes)
+                   atIndex:3];
+            [enc setBuffer:outbuf
+                    offset:ds4_gpu_tensor_offset(out) +
+                           (NSUInteger)(row * out_row_bytes)
+                   atIndex:4];
+            [enc dispatchThreadgroups:
+                    MTLSizeMake(down_groups, 1u, 1u)
+                 threadsPerThreadgroup:
+                    MTLSizeMake(64u, 1u, 1u)];
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "GLM exact Q2/Q3 verifier MoE");
+    }
+}
+
+int ds4_gpu_glm_routed_moe_batch_decode_exact_q4_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                up_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                up_expert_bytes,
+        uint64_t                up_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        uint32_t                layer_index,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_tokens,
+        uint32_t                mid_token_stride) {
+    return ds4_gpu_glm_routed_moe_batch_tensor_impl(out,
+                                                    mid,
+                                                    model_map,
+                                                    model_size,
+                                                    gate_offset,
+                                                    up_offset,
+                                                    down_offset,
+                                                    gate_type,
+                                                    up_type,
+                                                    down_type,
+                                                    gate_expert_bytes,
+                                                    gate_row_bytes,
+                                                    up_expert_bytes,
+                                                    up_row_bytes,
+                                                    down_expert_bytes,
+                                                    down_row_bytes,
+                                                    expert_in_dim,
+                                                    expert_mid_dim,
+                                                    out_dim,
+                                                    selected,
+                                                    weights,
+                                                    n_total_expert,
+                                                    n_expert,
+                                                    layer_index,
+                                                    x,
+                                                    n_tokens,
+                                                    mid_token_stride,
+                                                    false,
+                                                    true);
 }

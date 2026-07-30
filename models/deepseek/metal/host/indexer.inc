@@ -519,7 +519,8 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok,
         bool                    prefer_decode_mpp,
-        bool                    force_model_view) {
+        bool                    force_model_view,
+        int16_t                 short_row_nxpsg) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if ((in_dim & 31u) != 0 ||
         in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
@@ -646,7 +647,8 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_gpu_env_u64("DS4_METAL_Q8_MV_EXT_MAX_TOKENS", 16u, 2u, 128u);
         if (n_tok <= mv_ext_max_tokens && (in_dim % 128u) == 0) {
             const int16_t nsg = 2;
-            const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
+            const int16_t nxpsg = short_row_nxpsg != 0 ?
+                short_row_nxpsg : ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
             const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
             const char *fn_name = ds4_gpu_mv_ext_name(1, r1ptg);
             id<MTLComputePipelineState> pipeline =

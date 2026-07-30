@@ -2,6 +2,7 @@ enum {
     DS4_METAL_TENSOR_Q4_0    = 2,
     DS4_METAL_TENSOR_Q8_0    = 8,
     DS4_METAL_TENSOR_Q2_K    = 10,
+    DS4_METAL_TENSOR_Q3_K    = 11,
     DS4_METAL_TENSOR_Q4_K    = 12,
     DS4_METAL_TENSOR_Q5_K    = 13,
     DS4_METAL_TENSOR_Q6_K    = 14,
@@ -44,6 +45,7 @@ static id<MTLComputePipelineState> g_add2_pipeline;
 static id<MTLComputePipelineState> g_add3_pipeline;
 static id<MTLComputePipelineState> g_moe_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_sum8_pipeline;
+static id<MTLComputePipelineState> g_moe_sum10_pipeline;
 static id<MTLComputePipelineState> g_mul_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_plain_pipeline;
@@ -178,11 +180,13 @@ static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu4_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu2_mapped_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu2_mapped_row_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_pair_swiglu_f32_pipeline;
+static id<MTLComputePipelineState> g_glm_q3_k_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_pair_swiglu2_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_down_f32_pipeline;
+static id<MTLComputePipelineState> g_glm_q3_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_down_f32_pipeline;
@@ -191,6 +195,17 @@ static id<MTLComputePipelineState> g_glm_q5_k_pair_swiglu_mapped_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q5_k_pair_swiglu_mapped_row_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q5_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q6_k_down_f32_pipeline;
+static id<MTLComputePipelineState> g_laguna_routed_shared_pair_pipeline;
+static id<MTLComputePipelineState> g_laguna_routed_shared_q4_down_pipeline;
+static id<MTLComputePipelineState> g_laguna_routed_shared_q6_down_pipeline;
+static id<MTLComputePipelineState> g_laguna_head_norm_rope_pipeline;
+static id<MTLComputePipelineState> g_laguna_qk_head_norm_rope_pipeline;
+static id<MTLComputePipelineState> g_laguna_store_kv_pipeline;
+static id<MTLComputePipelineState> g_laguna_attention_pipeline;
+static id<MTLComputePipelineState> g_laguna_stage_kv_pipeline;
+static id<MTLComputePipelineState> g_laguna_prefill_attention_pipeline;
+static id<MTLComputePipelineState> g_laguna_commit_kv_pipeline;
+static id<MTLComputePipelineState> g_laguna_q6_k_matmul_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
@@ -455,6 +470,7 @@ static NSUInteger g_moe_q4_down_slots_bytes;
 static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
 static int g_quality_mode;
+static int g_tensor_matmul_suppressed;
 static int g_mpp_invalid_env_reported;
 #define DS4_METAL_MAX_ROUTED_EXPERT_USED 8
 static int32_t g_routed_moe_selected_override[DS4_METAL_MAX_ROUTED_EXPERT_USED];
@@ -1154,12 +1170,18 @@ static int ds4_gpu_ensure_scratch_buffer(
 }
 
 static int ds4_gpu_ensure_zero_attention_mask(NSUInteger bytes) {
-    const NSUInteger capacity = 8192u * sizeof(uint16_t);
-    if (bytes > capacity) return 0;
     if (g_flash_attn_zero_mask_buffer &&
-        g_flash_attn_zero_mask_bytes >= capacity) {
+        g_flash_attn_zero_mask_bytes >= bytes) {
         return 1;
     }
+
+    /* Grow in 8192-key chunks. Laguna contexts can exceed the old 8192-key
+     * fixed allocation, while exact-size growth would reallocate every decode
+     * token once that boundary is crossed. */
+    const NSUInteger quantum = 8192u * sizeof(uint16_t);
+    if (bytes > NSUIntegerMax - (quantum - 1u)) return 0;
+    const NSUInteger capacity =
+        ((bytes + quantum - 1u) / quantum) * quantum;
     if (!ds4_gpu_ensure_scratch_buffer(&g_flash_attn_zero_mask_buffer,
                                          &g_flash_attn_zero_mask_bytes,
                                          capacity,
@@ -2218,7 +2240,8 @@ static uint32_t ds4_gpu_glm_flash_attention_max_cache_len(void) {
 }
 
 static int ds4_gpu_mpp_available(void) {
-    return g_metal4_tensor_api_enabled && !g_quality_mode;
+    return g_metal4_tensor_api_enabled && !g_quality_mode &&
+           !g_tensor_matmul_suppressed;
 }
 
 /*
@@ -2780,6 +2803,56 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_pipeline(
 
     [g_pipeline_cache setObject:pipeline forKey:key];
     memo_dv = dv; memo_nwg = nwg; memo_pipeline = pipeline;
+    return pipeline;
+}
+
+static id<MTLComputePipelineState>
+ds4_gpu_get_laguna_flash_attn_reduce_gate_pipeline(int32_t dv, int32_t nwg) {
+    static int32_t memo_dv, memo_nwg;
+    static id<MTLComputePipelineState> memo_pipeline;
+    if (memo_pipeline && memo_dv == dv && memo_nwg == nwg) {
+        return memo_pipeline;
+    }
+
+    NSString *key = [NSString stringWithFormat:
+        @"kernel_laguna_flash_attn_reduce_gate_f32_dv=%d_nwg=%d",
+        (int)dv, (int)nwg];
+    id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
+    if (cached) {
+        memo_dv = dv;
+        memo_nwg = nwg;
+        memo_pipeline = cached;
+        return cached;
+    }
+
+    MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
+    [constants setConstantValue:&dv type:MTLDataTypeInt atIndex:500];
+    [constants setConstantValue:&nwg type:MTLDataTypeInt atIndex:501];
+
+    NSError *error = nil;
+    id<MTLFunction> fn = [g_library
+        newFunctionWithName:@"kernel_laguna_flash_attn_reduce_gate_f32"
+        constantValues:constants
+        error:&error];
+    if (!fn) {
+        fprintf(stderr,
+                "ds4: Metal Laguna attention reduce/gate function not found: %s\n",
+                [[error localizedDescription] UTF8String]);
+        return nil;
+    }
+    id<MTLComputePipelineState> pipeline =
+        [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!pipeline) {
+        fprintf(stderr,
+                "ds4: Metal Laguna attention reduce/gate pipeline failed: %s\n",
+                [[error localizedDescription] UTF8String]);
+        return nil;
+    }
+
+    [g_pipeline_cache setObject:pipeline forKey:key];
+    memo_dv = dv;
+    memo_nwg = nwg;
+    memo_pipeline = pipeline;
     return pipeline;
 }
 
@@ -3513,6 +3586,10 @@ void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
 }
 
+void ds4_gpu_set_tensor_matmul_suppressed(bool suppressed) {
+    g_tensor_matmul_suppressed = suppressed ? 1 : 0;
+}
+
 void ds4_gpu_set_glm_model(bool enabled) {
     g_glm_model_mode = enabled ? 1 : 0;
 }
@@ -3656,6 +3733,8 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_GLM_SOURCE",        @"models/glm/metal/shaders/kernels.metal"],
         @[@"DS4_METAL_DSV4_ATTN_INDEXER_SOURCE",
                                               @"models/deepseek/metal/shaders/attention_indexer.metal"],
+        @[@"DS4_METAL_LAGUNA_SOURCE",     @"models/laguna/metal/shaders/laguna.metal"],
+        @[@"DS4_METAL_DFLASH_SOURCE",     @"models/laguna/metal/shaders/dflash.metal"],
         @[@"DS4_METAL_ARGSORT_SOURCE",    @"metal/argsort.metal"],
         @[@"DS4_METAL_CPY_SOURCE",        @"metal/cpy.metal"],
         @[@"DS4_METAL_CONCAT_SOURCE",     @"metal/concat.metal"],
@@ -5336,6 +5415,71 @@ typedef struct {
 
 typedef struct {
     uint32_t n_tokens;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    uint32_t pos0;
+    uint32_t n_ctx_orig;
+    float    eps;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+    uint32_t pad0;
+} ds4_gpu_laguna_norm_rope_args;
+
+typedef struct {
+    uint32_t cache_cap;
+    uint32_t cache_row;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+} ds4_gpu_laguna_kv_store_args;
+
+typedef struct {
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t cache_cap;
+    uint32_t key_start;
+    uint32_t key_count;
+    float    scale;
+    uint32_t pad0;
+} ds4_gpu_laguna_attention_args;
+
+typedef struct {
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t key_count0;
+    uint32_t n_tokens;
+    uint32_t nsg;
+    uint32_t nwg;
+    float    scale;
+} ds4_gpu_laguna_gqa3_decode_args;
+
+typedef struct {
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t cache_cap;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    float    scale;
+    uint32_t pad0;
+} ds4_gpu_laguna_prefill_attention_args;
+
+typedef struct {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_tokens;
+    uint32_t pad0;
+    uint64_t row_bytes;
+} ds4_gpu_laguna_q6_matmul_args;
+
+typedef struct {
+    uint32_t n_tokens;
     uint32_t kv_raw_dim;
     uint32_t kv_lora_dim;
     float    eps;
@@ -6185,6 +6329,23 @@ int ds4_gpu_init(void) {
         g_moe_sum8_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_moe_sum8_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_moe_sum8_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_dsv4_moe_sum10_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_moe_sum10_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        g_moe_sum10_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_sum10_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_moe_sum10_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -7725,6 +7886,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu2_mapped_row_f32");
         g_glm_q2_k_pair_swiglu_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q2_K_pair_swiglu_f32");
+        g_glm_q3_k_pair_swiglu_f32_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_q3_K_pair_swiglu_f32");
         g_glm_q2_k_addr_pair_swiglu2_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q2_K_addr_pair_swiglu2_f32");
         g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline =
@@ -7735,6 +7898,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_q4_K_addr_pair_swiglu_f32_masked");
         g_glm_q2_k_down_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q2_K_down_f32");
+        g_glm_q3_k_down_f32_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_q3_K_down_f32");
         g_glm_q4_k_down_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32");
         g_glm_q2_k_addr_down_f32_pipeline =
@@ -7751,6 +7916,31 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_q5_K_down_f32");
         g_glm_q6_k_down_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q6_K_down_f32");
+        g_laguna_routed_shared_pair_pipeline =
+            ds4_gpu_get_pipeline(
+                "kernel_laguna_q4_K_routed_shared_pair_swiglu_f32");
+        g_laguna_routed_shared_q4_down_pipeline =
+            ds4_gpu_get_pipeline(
+                "kernel_laguna_q4_K_routed_shared_down_f32");
+        g_laguna_routed_shared_q6_down_pipeline =
+            ds4_gpu_get_pipeline(
+                "kernel_laguna_q6_K_routed_shared_down_f32");
+        g_laguna_head_norm_rope_pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_head_rms_norm_rope_neox");
+        g_laguna_qk_head_norm_rope_pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_qk_head_rms_norm_rope_neox");
+        g_laguna_store_kv_pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_store_kv_f16");
+        g_laguna_attention_pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_attention_decode_gqa_f16");
+        g_laguna_stage_kv_pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_stage_kv_f16");
+        g_laguna_prefill_attention_pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_attention_prefill_gqa_f16");
+        g_laguna_commit_kv_pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_commit_kv_f16");
+        g_laguna_q6_k_matmul_pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_q6_K_matmul_f32");
         g_dsv4_router_weights_batch_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_router_weights_batch");
         g_dsv4_hc_expand4_pipeline =
@@ -7809,11 +7999,13 @@ int ds4_gpu_init(void) {
             !g_glm_q4_k_pair_swiglu2_mapped_f32_pipeline ||
             !g_glm_q4_k_pair_swiglu2_mapped_row_f32_pipeline ||
             !g_glm_q2_k_pair_swiglu_f32_pipeline ||
+            !g_glm_q3_k_pair_swiglu_f32_pipeline ||
             !g_glm_q2_k_addr_pair_swiglu2_f32_pipeline ||
             !g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline ||
             !g_glm_q4_k_addr_pair_swiglu_f32_pipeline ||
             !g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline ||
             !g_glm_q2_k_down_f32_pipeline ||
+            !g_glm_q3_k_down_f32_pipeline ||
             !g_glm_q4_k_down_f32_pipeline ||
             !g_glm_q2_k_addr_down_f32_pipeline ||
             !g_glm_q4_k_addr_down_f32_pipeline ||
@@ -7822,6 +8014,17 @@ int ds4_gpu_init(void) {
             !g_glm_q5_k_pair_swiglu_mapped_row_f32_pipeline ||
             !g_glm_q5_k_down_f32_pipeline ||
             !g_glm_q6_k_down_f32_pipeline ||
+            !g_laguna_routed_shared_pair_pipeline ||
+            !g_laguna_routed_shared_q4_down_pipeline ||
+            !g_laguna_routed_shared_q6_down_pipeline ||
+            !g_laguna_head_norm_rope_pipeline ||
+            !g_laguna_qk_head_norm_rope_pipeline ||
+            !g_laguna_store_kv_pipeline ||
+            !g_laguna_attention_pipeline ||
+            !g_laguna_stage_kv_pipeline ||
+            !g_laguna_prefill_attention_pipeline ||
+            !g_laguna_commit_kv_pipeline ||
+            !g_laguna_q6_k_matmul_pipeline ||
             !g_dsv4_hc_expand4_pipeline) {
             g_queue = nil;
             g_device = nil;
@@ -8146,6 +8349,46 @@ int ds4_gpu_flush_commands(void) {
         (void)ds4_gpu_wait_pending_command_buffers("command batch");
         [g_transient_buffers removeAllObjects];
         return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_submit_commands(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_batch_cb) return 0;
+
+    ds4_gpu_close_batch_encoder();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
+    g_stream_expert_cache_batch_seq = 0;
+    [cb commit];
+    [g_pending_cbs addObject:cb];
+    ds4_gpu_stream_expert_cache_note_batch_committed();
+    return 1;
+}
+
+int ds4_gpu_wait_submitted_commands(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if ([g_pending_cbs count] == 0) return 1;
+    return ds4_gpu_wait_pending_command_buffers("submitted command batch");
+}
+
+int ds4_gpu_discard_commands(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_batch_cb) return 0;
+    ds4_gpu_close_batch_encoder();
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    const uint64_t discarded_seq = g_stream_expert_cache_batch_seq;
+    g_stream_expert_cache_batch_seq = 0;
+    if ([g_pending_cbs count] != 0 &&
+        ds4_gpu_wait_pending_command_buffers("discarded command batch") == 0) {
+        return 0;
+    }
+    if (discarded_seq > g_stream_expert_cache_done_seq) {
+        g_stream_expert_cache_done_seq = discarded_seq;
     }
     return 1;
 }
@@ -9021,6 +9264,7 @@ void ds4_gpu_cleanup(void) {
         g_add3_pipeline = nil;
         g_moe_sum6_pipeline = nil;
         g_moe_sum8_pipeline = nil;
+        g_moe_sum10_pipeline = nil;
         g_mul_pipeline = nil;
         g_bin_mul_scalar_pipeline = nil;
         g_bin_div_row_pipeline = nil;
@@ -9155,11 +9399,13 @@ void ds4_gpu_cleanup(void) {
         g_glm_q4_k_pair_swiglu2_mapped_f32_pipeline = nil;
         g_glm_q4_k_pair_swiglu2_mapped_row_f32_pipeline = nil;
         g_glm_q2_k_pair_swiglu_f32_pipeline = nil;
+        g_glm_q3_k_pair_swiglu_f32_pipeline = nil;
         g_glm_q2_k_addr_pair_swiglu2_f32_pipeline = nil;
         g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline = nil;
         g_glm_q4_k_addr_pair_swiglu_f32_pipeline = nil;
         g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline = nil;
         g_glm_q2_k_down_f32_pipeline = nil;
+        g_glm_q3_k_down_f32_pipeline = nil;
         g_glm_q4_k_down_f32_pipeline = nil;
         g_glm_q2_k_addr_down_f32_pipeline = nil;
         g_glm_q4_k_addr_down_f32_pipeline = nil;
@@ -9168,6 +9414,17 @@ void ds4_gpu_cleanup(void) {
         g_glm_q5_k_pair_swiglu_mapped_row_f32_pipeline = nil;
         g_glm_q5_k_down_f32_pipeline = nil;
         g_glm_q6_k_down_f32_pipeline = nil;
+        g_laguna_routed_shared_pair_pipeline = nil;
+        g_laguna_routed_shared_q4_down_pipeline = nil;
+        g_laguna_routed_shared_q6_down_pipeline = nil;
+        g_laguna_head_norm_rope_pipeline = nil;
+        g_laguna_qk_head_norm_rope_pipeline = nil;
+        g_laguna_store_kv_pipeline = nil;
+        g_laguna_attention_pipeline = nil;
+        g_laguna_stage_kv_pipeline = nil;
+        g_laguna_prefill_attention_pipeline = nil;
+        g_laguna_commit_kv_pipeline = nil;
+        g_laguna_q6_k_matmul_pipeline = nil;
         g_dsv4_router_weights_batch_pipeline = nil;
         g_dsv4_hc_expand4_pipeline = nil;
         g_flash_attn_mask_buffer = nil;

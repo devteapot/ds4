@@ -54,6 +54,13 @@ typedef struct {
 } cuda_block_q2_K;
 
 typedef struct {
+    uint8_t hmask[CUDA_QK_K / 8];
+    uint8_t qs[CUDA_QK_K / 4];
+    uint8_t scales[12];
+    uint16_t d;
+} cuda_block_q3_K;
+
+typedef struct {
     uint16_t d;
     uint16_t dmin;
     uint8_t scales[12];
@@ -71,8 +78,27 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+static_assert(sizeof(cuda_block_q3_K) == 110, "Q3_K block layout mismatch");
+
 #include "ds4_gpu_mgpu.h"
 #include "ds4_iq2_tables_cuda.inc"
+
+/* ds4_cuda.cu historically does not include ds4_gpu.h. Keep the descriptor
+ * layout used by the shared graph available to the CUDA compatibility hook. */
+typedef struct {
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint32_t gate_type;
+    uint32_t up_type;
+    uint32_t down_type;
+    uint64_t gate_expert_bytes;
+    uint64_t gate_row_bytes;
+    uint64_t up_expert_bytes;
+    uint64_t up_row_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t down_row_bytes;
+} ds4_gpu_laguna_moe_desc;
 
 typedef struct {
     ds4_gpu_attention_decode_row row[DS4_GPU_ATTENTION_DECODE_BATCH_MAX];
@@ -86,6 +112,7 @@ static const char *g_model_device_base;
 static uint64_t g_model_registered_size;
 static int g_model_registered;
 static thread_local bool g_glm_mtp_verify_mode;
+static thread_local bool g_laguna_dflash_verify_rows;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
@@ -242,3 +269,5 @@ static void routed_moe_decode_graph_destroy_one(int logical_tier);
 #include "models/deepseek/cuda/hc.inc"
 #include "cuda/runtime_services.inc"
 #include "models/glm/cuda/kernels.inc"
+#include "models/laguna/cuda/kernels.inc"
+#include "cuda/compat.inc"

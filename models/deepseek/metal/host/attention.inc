@@ -6837,7 +6837,7 @@ int ds4_gpu_attention_decode_heads_tensor(
     if (!heads || !model_map || !q || !raw_kv ||
         n_raw == 0 || n_head == 0 || head_dim == 0 ||
         raw_cap < n_raw || raw_start >= raw_cap ||
-        n_raw > UINT32_MAX - n_comp || n_raw + n_comp > 8192u ||
+        n_raw > UINT32_MAX - n_comp ||
         (n_comp != 0 && !comp_kv) ||
         (use_mask != 0 && !comp_mask)) {
         return 0;

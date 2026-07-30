@@ -8,6 +8,7 @@ models/<model>/
 ├── cpu.inc
 ├── graph.inc
 ├── cuda/
+├── gpu/        # optional CUDA/ROCm-shared kernels
 ├── metal/
 │   ├── host/
 │   └── shaders/

@@ -1594,6 +1594,18 @@ static int cuda_q8_mma_try_launch(
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= DS4_MAX_GPUS) return 0;
+    int major = 0;
+    if (cudaDeviceGetAttribute(
+            &major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    /* This legacy mma.sync INT8 implementation produces invalid results when
+     * compiled for sm_12x with CUDA 13 (including DGX Spark's GB10). The
+     * native Q8 batch kernels are exact and are faster at Laguna's short-batch
+     * sizes; large prompts use the separate dequant-once GEMM path. Keep the
+     * MMA path for architectures on which its fragment mapping is verified. */
+    if (major >= 12) return 0;
     const int ti = T == 32u ? 0 : (T == 64u ? 1 : (T == 128u ? 2 : 3));
     dim3 grid(((unsigned)out_dim + 63u) / 64u, ((unsigned)n_tok + 15u) / 16u, 1);
 #define DS4_Q8_MMA_LAUNCH(TT) \

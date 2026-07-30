@@ -72,6 +72,11 @@ static std::string render_glm_ds4_prompt(const std::string &prompt) {
            "<|assistant|><think></think>";
 }
 
+static std::string render_laguna_ds4_prompt(const std::string &prompt) {
+    return std::string("\xE3\x80\x88|EOS|\xE3\x80\x89<user>") + prompt +
+           "</user>\n<assistant></think>";
+}
+
 static std::string render_template_prompt(
         const char *tmpl,
         const std::string &prompt,
@@ -156,7 +161,8 @@ static double token_logprob(
 int main(int argc, char **argv) {
     if (argc != 4 && argc != 5 && argc != 6) {
         std::fprintf(stderr,
-                     "usage: %s MODEL manifest.tsv OUT.tsv [ctx] [auto|glm-ds4]\n",
+                     "usage: %s MODEL manifest.tsv OUT.tsv "
+                     "[ctx] [auto|glm-ds4|laguna-ds4]\n",
                      argv[0]);
         return 2;
     }
@@ -167,8 +173,10 @@ int main(int argc, char **argv) {
     int ctx_size = argc >= 5 ? std::atoi(argv[4]) : 4096;
     if (ctx_size < 1024) ctx_size = 1024;
     const std::string template_mode = argc == 6 ? argv[5] : "auto";
-    if (template_mode != "auto" && template_mode != "glm-ds4") {
-        die("template mode must be auto or glm-ds4");
+    if (template_mode != "auto" &&
+        template_mode != "glm-ds4" &&
+        template_mode != "laguna-ds4") {
+        die("template mode must be auto, glm-ds4, or laguna-ds4");
     }
 
     ggml_backend_load_all();
@@ -234,7 +242,9 @@ int main(int argc, char **argv) {
         if (template_mode == "auto" && tmpl) {
             rendered = render_template_prompt(tmpl, prompt_text, &used_template);
         }
-        if (!used_template) {
+        if (template_mode == "laguna-ds4") {
+            rendered = render_laguna_ds4_prompt(prompt_text);
+        } else if (!used_template) {
             if (template_mode == "auto" && !warned_template_fallback) {
                 std::fprintf(stderr,
                              "score_llama: llama.cpp chat template unavailable; "

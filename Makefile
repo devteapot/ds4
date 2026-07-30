@@ -16,11 +16,12 @@ QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal models/*/metal/shaders/*.metal)
-ROCM_SRCS := $(wildcard rocm/*.cuh models/*/rocm/*.cuh)
+ROCM_SRCS := $(wildcard rocm/*.cuh models/*/rocm/*.cuh models/*/gpu/*.cuh)
 MODEL_PROVIDER_OBJS := \
 	ds4_model_provider.o \
 	models/deepseek/provider.o \
-	models/glm/provider.o
+	models/glm/provider.o \
+	models/laguna/provider.o
 CUDA_IMPL_FRAGMENTS := \
 	cuda/runtime.inc \
 	models/deepseek/cuda/dense_attention.inc \
@@ -29,7 +30,9 @@ CUDA_IMPL_FRAGMENTS := \
 	models/deepseek/cuda/moe.inc \
 	models/deepseek/cuda/hc.inc \
 	cuda/runtime_services.inc \
-	models/glm/cuda/kernels.inc
+	models/glm/cuda/kernels.inc \
+	models/laguna/cuda/kernels.inc \
+	cuda/compat.inc
 METAL_IMPL_FRAGMENTS := \
 	metal/runtime.inc \
 	metal/embedding.inc \
@@ -41,6 +44,7 @@ METAL_IMPL_FRAGMENTS := \
 	metal/elementwise.inc \
 	metal/moe_dispatch.inc \
 	models/glm/metal/host/kernels.inc \
+	models/laguna/metal/host/kernels.inc \
 	models/deepseek/metal/host/moe.inc \
 	models/deepseek/metal/host/hc.inc \
 	metal/compat.inc
@@ -50,7 +54,8 @@ DS4_IMPL_FRAGMENTS := \
 	models/deepseek/cpu.inc \
 	models/deepseek/graph.inc \
 	models/glm/cpu.inc \
-	models/glm/graph.inc
+	models/glm/graph.inc \
+	models/laguna/graph.inc
 DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
@@ -212,7 +217,7 @@ endif
 test-session-snapshot: tests/test_session_snapshot
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_session_snapshot
 
-ds4.o: ds4.c $(DS4_IMPL_FRAGMENTS) ds4.h ds4_model_provider.h ds4_model_provider_builtin.h models/deepseek/provider.h models/glm/provider.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c $(DS4_IMPL_FRAGMENTS) ds4.h ds4_model_provider.h ds4_model_provider_builtin.h models/deepseek/provider.h models/glm/provider.h models/laguna/provider.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_model_provider.o: ds4_model_provider.c ds4_model_provider.h ds4_model_provider_builtin.h ds4.h
@@ -223,6 +228,9 @@ models/deepseek/provider.o: models/deepseek/provider.c models/deepseek/provider.
 
 models/glm/provider.o: models/glm/provider.c models/glm/provider.h ds4_model_provider.h ds4_model_provider_builtin.h ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ models/glm/provider.c
+
+models/laguna/provider.o: models/laguna/provider.c models/laguna/provider.h ds4_model_provider.h ds4_model_provider_builtin.h ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ models/laguna/provider.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
@@ -275,7 +283,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c $(DS4_IMPL_FRAGMENTS) ds4.h ds4_model_provider.h ds4_model_provider_builtin.h models/deepseek/provider.h models/glm/provider.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c $(DS4_IMPL_FRAGMENTS) ds4.h ds4_model_provider.h ds4_model_provider_builtin.h models/deepseek/provider.h models/glm/provider.h models/laguna/provider.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
@@ -299,7 +307,8 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kv
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_IMPL_FRAGMENTS) $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc $(CUDA_IMPL_FRAGMENTS)
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc \
+	$(CUDA_IMPL_FRAGMENTS)
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
@@ -326,7 +335,7 @@ tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4_cpu_test_hooks.o: ds4.c $(DS4_IMPL_FRAGMENTS) ds4.h ds4_model_provider.h ds4_model_provider_builtin.h models/deepseek/provider.h models/glm/provider.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+ds4_cpu_test_hooks.o: ds4.c $(DS4_IMPL_FRAGMENTS) ds4.h ds4_model_provider.h ds4_model_provider_builtin.h models/deepseek/provider.h models/glm/provider.h models/laguna/provider.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
@@ -354,7 +363,7 @@ tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_g
 tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_cuda_test_hooks.o: ds4.c $(DS4_IMPL_FRAGMENTS) ds4.h ds4_model_provider.h ds4_model_provider_builtin.h models/deepseek/provider.h models/glm/provider.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+ds4_cuda_test_hooks.o: ds4.c $(DS4_IMPL_FRAGMENTS) ds4.h ds4_model_provider.h ds4_model_provider_builtin.h models/deepseek/provider.h models/glm/provider.h models/laguna/provider.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ ds4.c
 
 tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h
@@ -458,4 +467,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_session_snapshot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o models/deepseek/provider.o models/glm/provider.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_session_snapshot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o models/deepseek/provider.o models/glm/provider.o models/laguna/provider.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

@@ -832,11 +832,48 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                  "q8_0 decode rows exact quantize launch")) {
         return 0;
     }
-    dim3 grid(((unsigned)out_dim + 7u) / 8u, n_rows, 1u);
+    const int use_dp4a = cuda_q8_use_dp4a();
+    const unsigned row_blocks = ((unsigned)out_dim + 7u) / 8u;
+    if (getenv("DS4_CUDA_DFLASH_NO_Q8_ROW_REUSE") == NULL) {
+        /*
+         * Every verifier row uses the same weight matrix.  Keep the reference
+         * warp reduction and DP4A order, but evaluate up to eight activation
+         * rows while each Q8 block is resident in registers/L2.  Unlike the
+         * general prefill selector this is valid for blocks > 32: each lane
+         * still walks b = lane, lane + 32, ... in exactly decode order.
+         */
+        if (n_rows >= 8u) {
+            dim3 grid(row_blocks, (n_rows + 7u) / 8u, 1u);
+            matmul_q8_0_preq_batch_warp8_tok8_kernel<<<grid, 256>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
+            return cuda_ok(cudaGetLastError(),
+                           "q8_0 decode rows exact tok8 launch");
+        }
+        if (n_rows >= 4u) {
+            dim3 grid(row_blocks, (n_rows + 3u) / 4u, 1u);
+            matmul_q8_0_preq_batch_warp8_tok4_kernel<<<grid, 256>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
+            return cuda_ok(cudaGetLastError(),
+                           "q8_0 decode rows exact tok4 launch");
+        }
+        if (n_rows == 2u) {
+            matmul_q8_0_preq_batch_warp8_tok2_kernel<<<row_blocks, 256>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    xq, xscale, in_dim, out_dim, blocks, use_dp4a);
+            return cuda_ok(cudaGetLastError(),
+                           "q8_0 decode rows exact tok2 launch");
+        }
+    }
+    dim3 grid(row_blocks, n_rows, 1u);
     matmul_q8_0_preq_warp8_kernel<<<grid, 256>>>(
             (float *)out->ptr,
             reinterpret_cast<const unsigned char *>(wptr),
-            xq, xscale, in_dim, out_dim, blocks, cuda_q8_use_dp4a());
+            xq, xscale, in_dim, out_dim, blocks, use_dp4a);
     return cuda_ok(cudaGetLastError(),
                    "q8_0 decode rows exact warp launch");
 }
@@ -902,6 +939,63 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
                  "q8_0 pair decode rows exact quantize launch")) {
         return 0;
     }
+    const int use_dp4a = cuda_q8_use_dp4a();
+    const unsigned grid0_x = ((unsigned)out0_dim + 7u) / 8u;
+    const unsigned grid1_x = ((unsigned)out1_dim + 7u) / 8u;
+    if (getenv("DS4_CUDA_DFLASH_NO_Q8_ROW_REUSE") == NULL) {
+        if (n_rows >= 8u) {
+            dim3 grid0(grid0_x, (n_rows + 7u) / 8u, 1u);
+            matmul_q8_0_preq_batch_warp8_tok8_kernel<<<grid0, 256>>>(
+                    (float *)out0->ptr,
+                    reinterpret_cast<const unsigned char *>(w0),
+                    xq, xscale, in_dim, out0_dim, n_rows, blocks, use_dp4a);
+            if (!cuda_ok(cudaGetLastError(),
+                         "q8_0 pair decode rows exact gate tok8 launch")) {
+                return 0;
+            }
+            dim3 grid1(grid1_x, (n_rows + 7u) / 8u, 1u);
+            matmul_q8_0_preq_batch_warp8_tok8_kernel<<<grid1, 256>>>(
+                    (float *)out1->ptr,
+                    reinterpret_cast<const unsigned char *>(w1),
+                    xq, xscale, in_dim, out1_dim, n_rows, blocks, use_dp4a);
+            return cuda_ok(cudaGetLastError(),
+                           "q8_0 pair decode rows exact up tok8 launch");
+        }
+        if (n_rows >= 4u) {
+            dim3 grid0(grid0_x, (n_rows + 3u) / 4u, 1u);
+            matmul_q8_0_preq_batch_warp8_tok4_kernel<<<grid0, 256>>>(
+                    (float *)out0->ptr,
+                    reinterpret_cast<const unsigned char *>(w0),
+                    xq, xscale, in_dim, out0_dim, n_rows, blocks, use_dp4a);
+            if (!cuda_ok(cudaGetLastError(),
+                         "q8_0 pair decode rows exact gate tok4 launch")) {
+                return 0;
+            }
+            dim3 grid1(grid1_x, (n_rows + 3u) / 4u, 1u);
+            matmul_q8_0_preq_batch_warp8_tok4_kernel<<<grid1, 256>>>(
+                    (float *)out1->ptr,
+                    reinterpret_cast<const unsigned char *>(w1),
+                    xq, xscale, in_dim, out1_dim, n_rows, blocks, use_dp4a);
+            return cuda_ok(cudaGetLastError(),
+                           "q8_0 pair decode rows exact up tok4 launch");
+        }
+        if (n_rows == 2u) {
+            matmul_q8_0_preq_batch_warp8_tok2_kernel<<<grid0_x, 256>>>(
+                    (float *)out0->ptr,
+                    reinterpret_cast<const unsigned char *>(w0),
+                    xq, xscale, in_dim, out0_dim, blocks, use_dp4a);
+            if (!cuda_ok(cudaGetLastError(),
+                         "q8_0 pair decode rows exact gate tok2 launch")) {
+                return 0;
+            }
+            matmul_q8_0_preq_batch_warp8_tok2_kernel<<<grid1_x, 256>>>(
+                    (float *)out1->ptr,
+                    reinterpret_cast<const unsigned char *>(w1),
+                    xq, xscale, in_dim, out1_dim, blocks, use_dp4a);
+            return cuda_ok(cudaGetLastError(),
+                           "q8_0 pair decode rows exact up tok2 launch");
+        }
+    }
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     dim3 grid(((unsigned)max_out + 7u) / 8u, n_rows, 1u);
     matmul_q8_0_pair_preq_warp8_kernel<<<grid, 256>>>(
@@ -909,8 +1003,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
             (float *)out1->ptr,
             reinterpret_cast<const unsigned char *>(w0),
             reinterpret_cast<const unsigned char *>(w1),
-            xq, xscale, in_dim, out0_dim, out1_dim, blocks,
-            cuda_q8_use_dp4a());
+            xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a);
     return cuda_ok(cudaGetLastError(),
                    "q8_0 pair decode rows exact warp launch");
 }
@@ -1394,6 +1487,43 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_f32_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
+}
+
+extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_rows == 0u || n_rows > 16u || in_dim > UINT32_MAX ||
+        out_dim > UINT32_MAX || out_dim > UINT64_MAX / in_dim) {
+        return 0;
+    }
+    const uint64_t weight_elems = out_dim * in_dim;
+    if (weight_elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(float);
+    if (weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    if (ds4_tensor_device_idx(x) != logical_tier) return 0;
+    const char *wptr = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier,
+        "DFlash exact F32 router");
+    if (!wptr) return 0;
+    const dim3 grid((unsigned)out_dim, n_rows, 1u);
+    matmul_f32_kernel<<<grid, 256>>>(
+        (float *)out->ptr, (const float *)wptr, (const float *)x->ptr,
+        in_dim, out_dim, n_rows);
+    return cuda_ok(cudaGetLastError(),
+                   "DFlash exact F32 router rows launch");
 }
 
 extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {

@@ -413,6 +413,41 @@ static float ds4_vec_dot_q2_K_f32(int n, const block_q2_K *x, const float *y) {
     return sum;
 }
 
+static inline int q3_k_scale(const block_q3_K *block, uint32_t group) {
+    const uint32_t low =
+        (block->scales[group & 7u] >> (4u * (group >> 3u))) & 0x0fu;
+    const uint32_t high =
+        (block->scales[8u + (group & 3u)] >>
+         (2u * (group >> 2u))) & 0x03u;
+    return (int)(low | (high << 4u)) - 32;
+}
+
+static inline float q3_k_value_f32(const block_q3_K *blocks, uint32_t k) {
+    const uint32_t block_index = k / QK_K;
+    const uint32_t index = k - block_index * QK_K;
+    const block_q3_K *block = blocks + block_index;
+    const uint32_t group = index >> 4u;
+    const uint32_t lane = index & 15u;
+    const uint32_t q_index =
+        (group >> 3u) * 32u + (group & 1u) * 16u + lane;
+    const uint32_t q_shift = ((group >> 1u) & 3u) * 2u;
+    const uint32_t high_bit = 1u << (group >> 1u);
+    const int q = (int)((block->qs[q_index] >> q_shift) & 3u) -
+                  ((block->hmask[(group & 1u) * 16u + lane] & high_bit)
+                       ? 0
+                       : 4);
+    return f16_to_f32(block->d) * (float)q3_k_scale(block, group) *
+           (float)q;
+}
+
+static float ds4_vec_dot_q3_K_f32(int n, const block_q3_K *x, const float *y) {
+    float sum = 0.0f;
+    for (int k = 0; k < n; k++) {
+        sum += q3_k_value_f32(x, (uint32_t)k) * y[k];
+    }
+    return sum;
+}
+
 static inline void q4_k_get_scale_min(int j, const uint8_t *q, uint8_t *sc, uint8_t *m) {
     if (j < 4) {
         *sc = q[j] & 63;
@@ -974,6 +1009,12 @@ typedef struct {
     ds4_tensor *hc_attn_scale;
     ds4_tensor *hc_attn_base;
     ds4_tensor *attn_norm;
+    ds4_tensor *attn_q;
+    ds4_tensor *attn_k;
+    ds4_tensor *attn_v;
+    ds4_tensor *attn_gate;
+    ds4_tensor *attn_q_norm;
+    ds4_tensor *attn_k_norm;
     ds4_tensor *attn_q_a;
     ds4_tensor *attn_q_a_norm;
     ds4_tensor *attn_q_b;

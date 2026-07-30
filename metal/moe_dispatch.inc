@@ -229,6 +229,7 @@ static const char *ds4_gpu_metal_tensor_type_name(uint32_t type) {
     switch (type) {
     case DS4_METAL_TENSOR_IQ2_XXS: return "iq2_xxs";
     case DS4_METAL_TENSOR_Q2_K:    return "q2_k";
+    case DS4_METAL_TENSOR_Q3_K:    return "q3_k";
     case DS4_METAL_TENSOR_Q4_K:    return "q4_k";
     case DS4_METAL_TENSOR_Q5_K:    return "q5_k";
     case DS4_METAL_TENSOR_Q6_K:    return "q6_k";
@@ -351,6 +352,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false);
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
+    case DS4_METAL_TENSOR_Q3_K:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q3_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
     case DS4_METAL_TENSOR_Q5_K:
@@ -383,6 +386,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16", false);
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
+    case DS4_METAL_TENSOR_Q3_K:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q3_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
     case DS4_METAL_TENSOR_Q5_K:
@@ -2190,6 +2195,41 @@ static int ds4_gpu_encode_moe_sum8(
     return 1;
 }
 
+static int ds4_gpu_encode_moe_sum10(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>        experts,
+        NSUInteger           experts_off,
+        id<MTLBuffer>        out,
+        NSUInteger           out_off,
+        uint32_t             out_dim,
+        uint32_t             n_tokens) {
+    if (!cb || !experts || !out || out_dim == 0 || n_tokens == 0) return 0;
+    if (!g_moe_sum10_pipeline) return 0;
+
+    const uint64_t out_row_bytes = (uint64_t)out_dim * sizeof(float);
+    ds4_gpu_dsv4_moe_sum6_args args = {
+        .width = out_dim,
+        .tokens = n_tokens,
+        .src_token_stride = 10u * out_row_bytes,
+        .dst_token_stride = out_row_bytes,
+    };
+
+    NSUInteger nth = g_moe_sum10_pipeline.maxTotalThreadsPerThreadgroup;
+    if (nth > 256u) nth = 256u;
+    if (nth > out_dim) nth = out_dim;
+    if (nth == 0) nth = 1u;
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_moe_sum10_pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:experts offset:experts_off atIndex:1];
+    [enc setBuffer:out offset:out_off atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static ds4_gpu_bin_args ds4_gpu_make_moe_add_args(
         uint32_t out_dim,
         uint32_t n_tokens,
@@ -2253,6 +2293,17 @@ static int ds4_gpu_encode_moe_sum_experts(
 
     if (n_expert == 8 &&
         ds4_gpu_encode_moe_sum8(cb,
+                                  experts,
+                                  experts_off,
+                                  out,
+                                  out_off,
+                                  out_dim,
+                                  n_tokens)) {
+        return 1;
+    }
+
+    if (n_expert == 10 &&
+        ds4_gpu_encode_moe_sum10(cb,
                                   experts,
                                   experts_off,
                                   out,

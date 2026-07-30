@@ -257,6 +257,8 @@ __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint
     __shared__ int32_t sm_idx[THREADS];
 
     const uint32_t tid = threadIdx.x;
+    const uint32_t row = blockIdx.x;
+    logits += (uint64_t)row * n_vocab;
     float local_v = -INFINITY;
     int32_t local_i = 0;
     for (uint32_t i = tid; i < n_vocab; i += THREADS) {
@@ -284,7 +286,7 @@ __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint
         __syncthreads();
     }
 
-    if (tid == 0u) *out_idx = sm_idx[0];
+    if (tid == 0u) out_idx[row] = sm_idx[0];
 }
 
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
@@ -1100,6 +1102,25 @@ extern "C" int ds4_gpu_argmax_tensor(
                                (const float *)logits->ptr,
                                n_vocab);
     return cuda_ok(cudaGetLastError(), "argmax launch");
+}
+
+extern "C" int ds4_gpu_argmax_rows_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_vocab,
+        uint32_t              n_rows) {
+    uint64_t logits_bytes = 0;
+    if (!out_idx || !logits || n_vocab == 0u || n_rows == 0u ||
+        out_idx->bytes < (uint64_t)n_rows * sizeof(int32_t) ||
+        !cuda_u64_mul3_checked(n_rows, n_vocab, sizeof(float),
+                               &logits_bytes) ||
+        logits->bytes < logits_bytes) {
+        return 0;
+    }
+    argmax_kernel<<<n_rows, 1024>>>((int32_t *)out_idx->ptr,
+                                    (const float *)logits->ptr,
+                                    n_vocab);
+    return cuda_ok(cudaGetLastError(), "row argmax launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(

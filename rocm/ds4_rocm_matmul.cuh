@@ -308,7 +308,17 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
                                                      x, n_tok, "q8_f16_out");
 }
 
-static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
+static int cuda_matmul_q8_0_tensor_labeled(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok,
+        const char *label,
+        bool decode_preq = false) {
     if (!out || !x || !model_map ||
         in_dim == 0u || out_dim == 0u || n_tok == 0u ||
         in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
@@ -329,6 +339,35 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
+    if (n_tok == 1u && decode_preq) {
+        const uint64_t xq_bytes = blocks * 32u;
+        const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+        const uint64_t tmp_bytes =
+            scale_offset + blocks * sizeof(float);
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 decode prequant");
+        if (!tmp) return 0;
+        int8_t *xq = (int8_t *)tmp;
+        float *xscale = (float *)((char *)tmp + scale_offset);
+        quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(
+                xq, xscale, (const float *)x->ptr, in_dim, blocks);
+        if (!cuda_ok(cudaGetLastError(),
+                     "matmul_q8_0 decode quantize launch")) {
+            return 0;
+        }
+        matmul_q8_0_preq_rows_w32_kernel<<<
+                ((unsigned)out_dim + 7u) / 8u, 256>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq,
+                xscale,
+                in_dim,
+                out_dim,
+                blocks,
+                8u,
+                1);
+        return cuda_ok(cudaGetLastError(),
+                       "matmul_q8_0 decode prequant launch");
+    }
     if (n_tok == 1) {
         const bool extended_sharedx =
             in_dim > 8192u &&
@@ -511,6 +550,174 @@ extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model
                                            in_dim, out_dim, x, n_tok, "q8_0");
 }
 
+extern "C" int ds4_gpu_matmul_q8_0_decode_preq_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    return cuda_matmul_q8_0_tensor_labeled(
+        out, model_map, model_size, weight_offset, in_dim, out_dim, x,
+        n_tok, "q8_0_decode_preq", true);
+}
+
+/* DFlash verifier entry points.  The ordinary decode kernels use grid.y for
+ * verifier rows, so batched verification and single-token decode execute the
+ * same arithmetic implementation. */
+extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_rows == 0u || n_rows > DS4_ROCM_VERIFY_MAX_ROWS ||
+        (in_dim & 3u) != 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        return 0;
+    }
+    uint64_t weight_bytes = 0;
+    if (weight_offset > model_size ||
+        !cuda_u64_mul3_checked(out_dim, in_dim, sizeof(float), &weight_bytes) ||
+        weight_bytes > model_size - weight_offset ||
+        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset,
+                                            weight_bytes, "f32_rows_exact");
+    if (!wptr) return 0;
+    const dim3 grid((unsigned)out_dim, n_rows, 1u);
+    matmul_f32_kernel<<<grid, 256>>>(
+            (float *)out->ptr, (const float *)wptr, (const float *)x->ptr,
+            in_dim, out_dim, n_rows);
+    return cuda_ok(cudaGetLastError(), "matmul_f32 rows exact launch");
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_rows == 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        return 0;
+    }
+    if (n_rows > DS4_ROCM_VERIFY_MAX_ROWS) {
+        return cuda_matmul_q8_0_tensor_labeled(
+            out, model_map, model_size, weight_offset, in_dim, out_dim, x,
+            n_rows, "q8_0_rows_exact_overflow");
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    uint64_t row_bytes = 0, weight_bytes = 0;
+    if (weight_offset > model_size ||
+        !cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        weight_bytes > model_size - weight_offset ||
+        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset,
+                                            weight_bytes, "q8_0_rows_exact");
+    if (!wptr) return 0;
+    const uint64_t xq_bytes = (uint64_t)n_rows * blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes =
+        scale_offset + (uint64_t)n_rows * blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 rows exact prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    const dim3 qgrid((unsigned)blocks, n_rows, 1);
+    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(),
+                 "matmul_q8_0 rows exact quantize launch")) {
+        return 0;
+    }
+    const dim3 grid((unsigned)((out_dim + 7u) / 8u), n_rows, 1u);
+    matmul_q8_0_preq_rows_w32_kernel<<<grid, 256>>>(
+            (float *)out->ptr,
+            reinterpret_cast<const unsigned char *>(wptr),
+            xq, xscale, in_dim, out_dim, blocks, 8u, 1);
+    return cuda_ok(cudaGetLastError(), "matmul_q8_0 rows exact launch");
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight0_offset,
+        uint64_t              weight1_offset,
+        uint64_t              in_dim,
+        uint64_t              out0_dim,
+        uint64_t              out1_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!out0 || !out1 || !x || !model_map || in_dim == 0u ||
+        out0_dim == 0u || out1_dim == 0u || n_rows == 0u ||
+        (in_dim & 31u) != 0u || in_dim > UINT32_MAX ||
+        out0_dim > UINT32_MAX || out1_dim > UINT32_MAX) {
+        return 0;
+    }
+    if (n_rows > DS4_ROCM_VERIFY_MAX_ROWS) {
+        return ds4_gpu_matmul_q8_0_pair_tensor(
+            out0, out1, model_map, model_size, weight0_offset, weight1_offset,
+            in_dim, out0_dim, out1_dim, x, n_rows);
+    }
+    const uint64_t blocks = in_dim / 32u;
+    uint64_t row_bytes = 0, weight0_bytes = 0, weight1_bytes = 0;
+    if (weight0_offset > model_size || weight1_offset > model_size ||
+        !cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out0_dim, row_bytes, &weight0_bytes) ||
+        !cuda_u64_mul_checked(out1_dim, row_bytes, &weight1_bytes) ||
+        weight0_bytes > model_size - weight0_offset ||
+        weight1_bytes > model_size - weight1_offset ||
+        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out0->bytes < (uint64_t)n_rows * out0_dim * sizeof(float) ||
+        out1->bytes < (uint64_t)n_rows * out1_dim * sizeof(float)) {
+        return 0;
+    }
+    const unsigned char *w0 = (const unsigned char *)cuda_model_range_ptr(
+        model_map, weight0_offset, weight0_bytes, "q8_0 rows exact pair0");
+    const unsigned char *w1 = (const unsigned char *)cuda_model_range_ptr(
+        model_map, weight1_offset, weight1_bytes, "q8_0 rows exact pair1");
+    if (!w0 || !w1) return 0;
+    const uint64_t xq_bytes = (uint64_t)n_rows * blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes =
+        scale_offset + (uint64_t)n_rows * blocks * 4u * sizeof(float);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 pair rows exact prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    const dim3 qgrid((unsigned)blocks, n_rows, 1);
+    quantize_q8_0_f32_groups8_kernel<<<qgrid, 32>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(),
+                 "matmul_q8_0 pair rows exact quantize launch")) {
+        return 0;
+    }
+    const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    const dim3 grid((unsigned)((max_out + 7u) / 8u), n_rows, 1u);
+    matmul_q8_0_pair_preq_groups8_warp8_kernel<<<grid, 256>>>(
+            (float *)out0->ptr, (float *)out1->ptr, w0, w1, xq, xscale,
+            out0_dim, out1_dim, blocks);
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_q8_0 pair rows exact launch");
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -638,6 +845,68 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair f32 warp launch");
 }
 
+extern "C" int ds4_gpu_matmul_q8_0_pair_decode_preq8_tensor(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        const ds4_gpu_tensor *x) {
+    if (!out0 || !out1 || !x || !model_map || in_dim == 0u ||
+        out0_dim == 0u || out1_dim == 0u || (in_dim & 31u) != 0u ||
+        in_dim > UINT32_MAX || out0_dim > UINT32_MAX ||
+        out1_dim > UINT32_MAX) {
+        return 0;
+    }
+    const uint64_t blocks = in_dim / 32u;
+    uint64_t row_bytes = 0, weight0_bytes = 0, weight1_bytes = 0;
+    if (weight0_offset > model_size || weight1_offset > model_size ||
+        !cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out0_dim, row_bytes, &weight0_bytes) ||
+        !cuda_u64_mul_checked(out1_dim, row_bytes, &weight1_bytes) ||
+        weight0_bytes > model_size - weight0_offset ||
+        weight1_bytes > model_size - weight1_offset ||
+        x->bytes < in_dim * sizeof(float) ||
+        out0->bytes < out0_dim * sizeof(float) ||
+        out1->bytes < out1_dim * sizeof(float)) {
+        return 0;
+    }
+    const unsigned char *w0 =
+        (const unsigned char *)cuda_model_range_ptr(
+            model_map, weight0_offset, weight0_bytes, "q8_0 preq8 pair0");
+    const unsigned char *w1 =
+        (const unsigned char *)cuda_model_range_ptr(
+            model_map, weight1_offset, weight1_bytes, "q8_0 preq8 pair1");
+    if (!w0 || !w1) return 0;
+
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes =
+        scale_offset + blocks * 4u * sizeof(float);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 pair decode prequant8");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    quantize_q8_0_f32_groups8_kernel<<<(unsigned)blocks, 32>>>(
+        xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(),
+                 "matmul_q8_0 pair decode prequant8 launch")) {
+        return 0;
+    }
+    const uint64_t max_out =
+        out0_dim > out1_dim ? out0_dim : out1_dim;
+    matmul_q8_0_pair_preq_groups8_warp8_kernel<<<
+        ((unsigned)max_out + 7u) / 8u, 256>>>(
+        (float *)out0->ptr, (float *)out1->ptr, w0, w1, xq, xscale,
+        out0_dim, out1_dim, blocks);
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_q8_0 pair decode prequant8 matmul launch");
+}
+
 static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
@@ -728,6 +997,12 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
     const int ordered_decode = n_tok == 1u;
+    if (n_tok > 1 && n_tok <= DS4_ROCM_VERIFY_MAX_ROWS) {
+        matmul_f16_rows_kernel<<<(unsigned)((out_dim + 1u) / 2u), 64>>>(
+                (float *)out->ptr, w, (const float *)x->ptr,
+                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        return cuda_ok(cudaGetLastError(), "matmul_f16 rows launch");
+    }
     if (g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");

@@ -25,7 +25,8 @@ static int g_quality_mode;
 enum {
     DS4_ROCM_N_EXPERT = 256u,
     DS4_ROCM_MAX_N_EXPERT = 384u,
-    DS4_ROCM_N_EXPERT_USED = 8u,
+    DS4_ROCM_DEFAULT_N_EXPERT_USED = 8u,
+    DS4_ROCM_N_EXPERT_USED = 10u,
     DS4_ROCM_STREAM_READ_WORKERS = DS4_ROCM_N_EXPERT_USED * 3u,
     DS4_ROCM_STREAM_READ_DEFAULT_WORKERS = 16u,
     DS4_ROCM_STREAM_READ_MAX_JOBS = DS4_ROCM_MAX_N_EXPERT * 3u,
@@ -278,6 +279,10 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+/* Routed MoE can be called from wrappers whose output temporaries already
+ * occupy g_cuda_tmp. Keep its internal sort/tile workspace disjoint. */
+static void *g_cuda_moe_tmp;
+static uint64_t g_cuda_moe_tmp_bytes;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -583,6 +588,27 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     g_cuda_tmp = ptr;
     g_cuda_tmp_bytes = bytes;
     return g_cuda_tmp;
+}
+
+static void *cuda_moe_tmp_alloc(uint64_t bytes, const char *what) {
+    if (bytes == 0) return NULL;
+    if (g_cuda_moe_tmp_bytes >= bytes) return g_cuda_moe_tmp;
+    if (g_cuda_moe_tmp) {
+        (void)cudaFree(g_cuda_moe_tmp);
+        g_cuda_moe_tmp = NULL;
+        g_cuda_moe_tmp_bytes = 0;
+    }
+    void *ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "MoE temp alloc failed for %s (%.2f MiB): %s\n",
+                what ? what : "scratch", (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    g_cuda_moe_tmp = ptr;
+    g_cuda_moe_tmp_bytes = bytes;
+    return g_cuda_moe_tmp;
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -4749,7 +4775,6 @@ static uint32_t cuda_rows_per_block_env_or_default(const char *name, uint32_t de
 struct ds4_rocm_runtime_config {
     int initialized;
     int disable_splitk_attn_out_low;
-    int disable_shared_gate_up_fused_w32;
     int attention_output_cublas_all;
     int shared_down_cublas;
     int glm_grouped_value_project;
@@ -4767,7 +4792,6 @@ static ds4_rocm_runtime_config g_rocm_cfg;
 static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
     if (!g_rocm_cfg.initialized) {
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
-        g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
         g_rocm_cfg.shared_down_cublas = !g_quality_mode;
         const char *glm_grouped_value_project_env =
@@ -5844,6 +5868,11 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
+    if (g_cuda_moe_tmp) {
+        (void)cudaFree(g_cuda_moe_tmp);
+        g_cuda_moe_tmp = NULL;
+        g_cuda_moe_tmp_bytes = 0;
+    }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -6014,6 +6043,11 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+extern "C" int ds4_gpu_submit_commands(void) { return ds4_gpu_end_commands(); }
+extern "C" int ds4_gpu_wait_submitted_commands(void) {
+    return cuda_ok(cudaStreamSynchronize(0), "wait submitted commands");
+}
+extern "C" int ds4_gpu_discard_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_encoder(void) { return ds4_gpu_flush_commands(); }
 extern "C" int ds4_gpu_commands_active(void) { return 0; }
 extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
@@ -6326,7 +6360,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX "memory %s: used=%.2f GiB free=%.2f GiB total=%.2f GiB "
             "placement=%s model_image=%.2f GiB range_cache=%.2f GiB "
-            "q8_f16_cache=%.2f GiB scratch=%.2f GiB",
+            "q8_f16_cache=%.2f GiB scratch=%.2f GiB moe_scratch=%.2f GiB",
             label ? label : "",
             (double)used_b / 1073741824.0,
             (double)free_b / 1073741824.0,
@@ -6335,7 +6369,8 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             (double)cuda_model_image_bytes() / 1073741824.0,
             (double)g_model_range_bytes / 1073741824.0,
             (double)g_q8_f16_bytes / 1073741824.0,
-            (double)g_cuda_tmp_bytes / 1073741824.0);
+            (double)g_cuda_tmp_bytes / 1073741824.0,
+            (double)g_cuda_moe_tmp_bytes / 1073741824.0);
     fprintf(stderr, "\n");
 }
 
@@ -6349,4 +6384,8 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
         const cublasMath_t math_mode = g_quality_mode ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
     }
+}
+
+extern "C" void ds4_gpu_set_tensor_matmul_suppressed(bool suppressed) {
+    (void)suppressed;
 }
