@@ -1988,6 +1988,7 @@ extern "C" int ds4_gpu_init(void) {
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     g_current_logical_tier = -1;
+    cuda_native_nvfp4_cache_release_all();
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
      * slabs, per-pair bounce buffers. */
@@ -2896,6 +2897,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
+    cuda_native_nvfp4_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
@@ -2993,6 +2995,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
+    cuda_native_nvfp4_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {

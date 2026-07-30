@@ -78,7 +78,14 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+typedef struct {
+    uint8_t qs[32];
+    uint8_t d[4];
+} cuda_block_nvfp4;
+
 static_assert(sizeof(cuda_block_q3_K) == 110, "Q3_K block layout mismatch");
+static_assert(sizeof(cuda_block_nvfp4) == 36u,
+              "NVFP4 compatibility block layout mismatch");
 
 #include "ds4_gpu_mgpu.h"
 #include "ds4_iq2_tables_cuda.inc"
@@ -86,9 +93,21 @@ static_assert(sizeof(cuda_block_q3_K) == 110, "Q3_K block layout mismatch");
 /* ds4_cuda.cu historically does not include ds4_gpu.h. Keep the descriptor
  * layout used by the shared graph available to the CUDA compatibility hook. */
 typedef struct {
+    const uint64_t *packed_offsets;
+    const uint64_t *scale_offsets;
+    const uint64_t *weight_global_scale_offsets;
+    const uint64_t *input_global_scale_offsets;
+    uint64_t packed_bytes;
+    uint64_t scale_bytes;
+} ds4_gpu_nvfp4_matrix_desc;
+
+typedef struct {
     uint64_t gate_offset;
     uint64_t up_offset;
     uint64_t down_offset;
+    uint64_t gate_scale_offset;
+    uint64_t up_scale_offset;
+    uint64_t down_scale_offset;
     uint32_t gate_type;
     uint32_t up_type;
     uint32_t down_type;
@@ -98,7 +117,15 @@ typedef struct {
     uint64_t up_row_bytes;
     uint64_t down_expert_bytes;
     uint64_t down_row_bytes;
+    ds4_gpu_nvfp4_matrix_desc gate_nvfp4;
+    ds4_gpu_nvfp4_matrix_desc up_nvfp4;
+    ds4_gpu_nvfp4_matrix_desc down_nvfp4;
 } ds4_gpu_laguna_moe_desc;
+
+static_assert(sizeof(ds4_gpu_nvfp4_matrix_desc) == 48u,
+              "NVFP4 matrix descriptor ABI mismatch");
+static_assert(sizeof(ds4_gpu_laguna_moe_desc) == 256u,
+              "Laguna MoE descriptor ABI mismatch");
 
 typedef struct {
     ds4_gpu_attention_decode_row row[DS4_GPU_ATTENTION_DECODE_BATCH_MAX];
@@ -258,6 +285,7 @@ static int cuda_q4_mma_ok(void) {
 
 static int cuda_q4_mma_tile16_shmem_ok(int which_down);
 
+static void cuda_native_nvfp4_cache_release_all(void);
 
 static void routed_moe_decode_graph_destroy_one(int logical_tier);
 

@@ -146,7 +146,8 @@ static const char *tool_summary(ds4_help_tool tool) {
 static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
-    opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+    opt(fp, c, "-m, --model PATH",
+        "GGUF file or native checkpoint directory. Default: ds4flash.gguf");
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
@@ -178,10 +179,14 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         if (tool != DS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
         }
-        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
-            opt(fp, c, "--dflash FILE", "Laguna DFlash support GGUF for greedy speculative decoding.");
-            opt(fp, c, "--dflash-draft N", "Maximum adaptive DFlash draft positions, 1..15. CUDA default: 15; other backends: 3");
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT ||
+            tool == DS4_HELP_SERVER || tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--dflash FILE", "Laguna DFlash support model (GGUF or native checkpoint directory) for greedy speculative decoding.");
+            opt(fp, c, "--dflash-draft N", "Maximum adaptive DFlash draft positions, 1..15. Defaults: native NVFP4 7, other CUDA 15, Metal/ROCm 3");
             opt(fp, c, "--dflash-p-min P", "Stop before proposals below probability P, 0..1. Default: 0.4; 0 keeps fixed verifier width");
+        }
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT ||
+            tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
@@ -371,6 +376,11 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--prompt-file FILE", "Raw benchmark text; token sequence is sliced at each frontier.");
     opt(fp, c, "--chat-prompt-file FILE", "Render FILE as one no-thinking chat user message.");
     opt(fp, c, "-sys, --system TEXT", "System prompt used only with --chat-prompt-file.");
+    fputc('\n', fp);
+    title(fp, c, "Benchmark Speculation");
+    opt(fp, c, "--dflash FILE", "Laguna DFlash support model (GGUF or native checkpoint directory).");
+    opt(fp, c, "--dflash-draft N", "Maximum DFlash draft positions, 1..15. Defaults: native NVFP4 7, other CUDA 15, Metal/ROCm 3.");
+    opt(fp, c, "--dflash-p-min P", "Proposal confidence cutoff, 0..1. Default: 0.4; use 0 for fixed verifier width.");
     fputc('\n', fp);
     title(fp, c, "Benchmark Sweep");
     opt(fp, c, "--ctx-start N", "First measured frontier. Default: 2048");

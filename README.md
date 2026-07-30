@@ -90,18 +90,20 @@ next sections.
 ## Model Weights
 
 This implementation only works with the DeepSeek V4, GLM 5.2, and Laguna S 2.1
-GGUFs listed below. It is not a general GGUF loader, and arbitrary GGUF files
-will not have the tensor layout, quantization mix, metadata, or optional MTP
-state expected by the engine. The 2 bit DeepSeek and GLM quantizations provided
-here are verified to be actually high quality: they behave well, work under
-coding agents, and call tools reliably.
+models listed below. Most are GGUFs; CUDA also supports Poolside's pinned,
+official Laguna S 2.1 NVFP4 safetensors checkpoint directly. It is not a
+general GGUF or safetensors loader: arbitrary models will not have the tensor
+layout, quantization mix, metadata, or optional speculative-decoding state
+expected by the engine. The 2 bit DeepSeek and GLM quantizations provided here
+are verified to be actually high quality: they behave well, work under coding
+agents, and call tools reliably.
 
 The 2 bit quants use a very asymmetrical quantization: only the routed MoE
 experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
-Download one main model. **Prefer the imatrix versions.**
+Download one main model. **For GGUF, prefer the imatrix versions.**
 
 ```sh
 ./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
@@ -110,6 +112,7 @@ Download one main model. **Prefer the imatrix versions.**
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ./download_model.sh laguna-q4  # >= 96 GB unified memory, official Poolside Q4_K_M
 ./download_model.sh laguna-q2-q3  # 64 GB class, mixed routed Q2_K/Q3_K
+./download_model.sh laguna-nvfp4  # >= 96 GB, official native CUDA NVFP4
 ```
 
 For the full PRO Q4 distributed run, download one half on each machine:
@@ -119,11 +122,11 @@ For the full PRO Q4 distributed run, download one half on each machine:
 ./download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
 ```
 
-The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
-stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected main model.
-The `pro-q4-layers00-30`, `pro-q4-layers31-output`, and `pro-q4-split` targets
-download distributed PRO Q4 pieces and do not update `./ds4flash.gguf`.
+The script stores downloads under `./gguf/`. Smaller DeepSeek files resume with
+`curl -C -`; large files and pinned native-checkpoint directories use the
+official Hugging Face downloader. Single-file main-model targets update
+`./ds4flash.gguf`. The distributed PRO targets and native Laguna NVFP4
+directory targets do not.
 Authentication is optional for public downloads, but `--token TOKEN`,
 `HF_TOKEN`, or the local Hugging Face token cache are used when present.
 
@@ -226,7 +229,61 @@ floating-point reductions are not batch-invariant. Use `0` when fixed-width
 reproducibility matters. DwarfStar automatically falls back to ordinary
 Laguna decoding when sampling is stochastic or when speculation is slower for
 the current turn. Set `DS4_DFLASH_TIMING=1` to print per-cycle draft and
-verify timings.
+verify timings. For controlled benchmarks, `DS4_DFLASH_ADAPTIVE=0` keeps the
+requested draft depth fixed instead of running the adaptive depth guard.
+
+### Native Laguna NVFP4 on CUDA
+
+CUDA can load Poolside's official `Laguna-S-2.1-NVFP4` checkpoint directly
+from its pinned sharded safetensors directory. Routed expert weights and their
+scales stay in the checkpoint's native NVFP4 layout; there is no GGUF
+conversion, tensor translation, or repacking:
+
+```sh
+./download_model.sh laguna-nvfp4
+make cuda-spark       # GB10 / sm_121 Blackwell family target
+./ds4 --cuda -m gguf/Laguna-S-2.1-NVFP4 -c 32768 \
+  -p "Explain this repository"
+```
+
+The Spark build emits native `compute_121f`/`sm_121` code. Prompt-sized routed
+batches use Blackwell block-scaled `m16n8k64` FP4 MMA directly on the
+checkpoint's E2M1 weights and UE4M3 scales. Single-token decode and the
+eight-row verifier produced by a seven-token DFlash draft deliberately use
+the integer-dot kernel instead:
+the SM121 FP4 MMA tile has eight columns, so those narrow shapes leave most of
+the tile idle. The checkpoint's routed experts are NVFP4; attention and the
+remaining dense projections are BF16.
+
+This native path is Blackwell-only and CUDA-only. Use the Laguna GGUF models
+for pre-Blackwell CUDA, Metal, ROCm, SSD streaming, distributed inference, or
+tensor parallelism.
+
+Poolside also publishes a separate BF16 DFlash drafter trained for this NVFP4
+target. Download and load its safetensors directory directly, using the
+native seven-token default for greedy decoding:
+
+```sh
+./download_model.sh laguna-nvfp4-dflash
+./ds4 --cuda -m gguf/Laguna-S-2.1-NVFP4 \
+  --dflash gguf/Laguna-S-2.1-DFlash-NVFP4 \
+  --dflash-draft 7 --temp 0 -p "Explain this repository"
+```
+
+On the development GB10, one 2,048-token `ds4.c` prompt followed by 256 greedy
+tokens measured 15.58 token/s without speculation and 35.05 token/s with the
+official native drafter at fixed depth 7, a 2.25x speedup. The drafter
+accepted 212 of 280 proposals (75.7%) across 40 verifier blocks and committed
+6.30 tokens per block on average. In the same run shape, Q4_K_M measured
+22.32 token/s normally and 23.42 token/s with its warmed BF16 DFlash drafter
+at fixed depth 15. Native NVFP4 is slower for ordinary single-token decode,
+but its native batched verifier reaches 1.50x the warmed Q4_K_M+DFlash
+throughput. See
+[`laguna_s21_nvfp4_dflash_gb10.csv`](speed-bench/laguna_s21_nvfp4_dflash_gb10.csv)
+and
+[`laguna_s21_dflash_quant_comparison_gb10.csv`](speed-bench/laguna_s21_dflash_quant_comparison_gb10.csv)
+for the measured counters and warmup annotation. Speculative results are
+prompt-sensitive.
 
 For Strix Halo:
 

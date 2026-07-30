@@ -145,6 +145,16 @@ __global__ static void glm_embed_token_q8_0_kernel(
     out[d] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
 }
 
+__global__ static void laguna_embed_token_bf16_kernel(
+        float *out,
+        const __nv_bfloat16 *w,
+        uint32_t token,
+        uint32_t n_embd) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d < n_embd)
+        out[d] = __bfloat162float(w[(uint64_t)token * n_embd + d]);
+}
+
 extern "C" int ds4_gpu_embed_token_quant_tensor(
         ds4_gpu_tensor *out,
         const void       *model_map,
@@ -158,12 +168,15 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
         token >= n_vocab) {
         return 0;
     }
-    if (weight_type != 8u) {   /* DS4_TENSOR_Q8_0 */
+    if (weight_type != 8u && weight_type != 30u) {
         fprintf(stderr, "ds4: embed_token_quant: unsupported type %u\n",
                 weight_type);
         return 0;
     }
-    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    const uint64_t row_bytes =
+        weight_type == 30u ?
+            (uint64_t)n_embd * sizeof(uint16_t) :
+            ((uint64_t)n_embd / 32u) * 34u;
     if (weight_offset > model_size ||
         (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
         out->bytes < (uint64_t)n_embd * sizeof(float)) {
@@ -174,6 +187,13 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
             model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
             logical_tier, "glm_token_embd");
     if (!w) return 0;
+    if (weight_type == 30u) {
+        laguna_embed_token_bf16_kernel<<<(n_embd + 255u) / 256u, 256>>>(
+                (float *)out->ptr, (const __nv_bfloat16 *)w,
+                token, n_embd);
+        return cuda_ok(cudaGetLastError(),
+                       "Laguna BF16 embed token launch");
+    }
     glm_embed_token_q8_0_kernel<<<(n_embd + 255) / 256, 256>>>(
             (float *)out->ptr, w, token, n_embd);
     return cuda_ok(cudaGetLastError(), "glm embed token launch");
@@ -197,6 +217,23 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
     out[gid] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
 }
 
+__global__ static void laguna_embed_tokens_bf16_kernel(
+        float *out,
+        const int32_t *tokens,
+        const __nv_bfloat16 *w,
+        uint32_t n_tokens,
+        uint32_t n_embd) {
+    const uint64_t gid =
+        (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t values = (uint64_t)n_tokens * n_embd;
+    if (gid >= values) return;
+    const uint32_t token_row = (uint32_t)(gid / n_embd);
+    const uint32_t d =
+        (uint32_t)(gid - (uint64_t)token_row * n_embd);
+    out[gid] = __bfloat162float(
+        w[(uint64_t)(uint32_t)tokens[token_row] * n_embd + d]);
+}
+
 extern "C" int ds4_gpu_embed_tokens_quant_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *tokens,
@@ -211,12 +248,15 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
         (n_embd & 31u) != 0u) {
         return 0;
     }
-    if (weight_type != 8u) {   /* DS4_TENSOR_Q8_0 */
+    if (weight_type != 8u && weight_type != 30u) {
         fprintf(stderr, "ds4: embed_tokens_quant: unsupported type %u\n",
                 weight_type);
         return 0;
     }
-    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    const uint64_t row_bytes =
+        weight_type == 30u ?
+            (uint64_t)n_embd * sizeof(uint16_t) :
+            ((uint64_t)n_embd / 32u) * 34u;
     if (weight_offset > model_size ||
         (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
         out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
@@ -229,6 +269,13 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
             logical_tier, "glm_token_embd");
     if (!w) return 0;
     uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (weight_type == 30u) {
+        laguna_embed_tokens_bf16_kernel<<<(n + 255u) / 256u, 256>>>(
+                (float *)out->ptr, (const int32_t *)tokens->ptr,
+                (const __nv_bfloat16 *)w, n_tokens, n_embd);
+        return cuda_ok(cudaGetLastError(),
+                       "Laguna BF16 embed tokens launch");
+    }
     glm_embed_tokens_q8_0_kernel<<<(n + 255) / 256, 256>>>(
             (float *)out->ptr,
             (const int32_t *)tokens->ptr,

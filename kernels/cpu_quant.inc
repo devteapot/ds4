@@ -1053,6 +1053,9 @@ typedef struct {
     ds4_tensor *ffn_gate_exps;
     ds4_tensor *ffn_up_exps;
     ds4_tensor *ffn_down_exps;
+    ds4_tensor *ffn_gate_exps_scale;
+    ds4_tensor *ffn_up_exps_scale;
+    ds4_tensor *ffn_down_exps_scale;
     ds4_tensor *ffn_gate_shexp;
     ds4_tensor *ffn_up_shexp;
     ds4_tensor *ffn_down_shexp;

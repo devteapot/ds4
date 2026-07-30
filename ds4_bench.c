@@ -27,6 +27,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *dflash_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -41,6 +42,7 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int dflash_draft_tokens;
     int power_percent;
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
@@ -49,6 +51,7 @@ typedef struct {
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
+    float dflash_p_min;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
     bool warm_weights;
@@ -56,6 +59,7 @@ typedef struct {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
+    bool dflash_p_min_set;
     bool cuda_tensor_parallel;
     bool show_output;
 } bench_config;
@@ -121,6 +125,18 @@ static double parse_double_arg(const char *s, const char *opt) {
         exit(2);
     }
     return v;
+}
+
+static float parse_float_range(const char *s, const char *opt,
+                               float min_value, float max_value) {
+    char *end = NULL;
+    const float value = strtof(s, &end);
+    if (s[0] == '\0' || *end != '\0' || !isfinite(value) ||
+        value < min_value || value > max_value) {
+        fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return value;
 }
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
@@ -236,6 +252,15 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dflash")) {
+            c.dflash_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dflash-draft")) {
+            c.dflash_draft_tokens =
+                parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dflash-p-min")) {
+            c.dflash_p_min = parse_float_range(
+                need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.dflash_p_min_set = true;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -576,10 +601,13 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .dflash_path = cfg.dflash_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
         .prefill_chunk = cfg.prefill_chunk,
+        .dflash_draft_tokens = cfg.dflash_draft_tokens,
+        .dflash_p_min = cfg.dflash_p_min,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
         .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
@@ -592,6 +620,7 @@ int main(int argc, char **argv) {
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
+        .dflash_p_min_set = cfg.dflash_p_min_set,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };
@@ -647,6 +676,10 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
+    ds4_session_set_speculative_enabled(
+        session,
+        ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        getenv("DS4_MTP_SPEC_DISABLE") == NULL);
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
         wait_distributed_route(session) != 0)
     {
@@ -732,12 +765,13 @@ int main(int argc, char **argv) {
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
+        int gen_first_tokens = 0;
         int gen_done = 0;
         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
         int gen_token_count = 0;
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        while (gen_done < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -750,16 +784,48 @@ int main(int argc, char **argv) {
                 break;
             }
             const double token_t0 = bench_now_sec();
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            int cycle_tokens[17];
+            int cycle_n = 1;
+            cycle_tokens[0] = token;
+            if (ds4_engine_mtp_draft_tokens(engine) > 1) {
+                cycle_n = ds4_session_eval_speculative_argmax(
+                    session,
+                    token,
+                    cfg.gen_tokens - gen_done,
+                    -1,
+                    cycle_tokens,
+                    (int)(sizeof(cycle_tokens) /
+                          sizeof(cycle_tokens[0])),
+                    err,
+                    sizeof(err));
+                if (cycle_n < 0) {
+                    fprintf(stderr,
+                            "ds4-bench: speculative decode at frontier %d "
+                            "failed: %s\n",
+                            frontier,
+                            err);
+                    rc = 1;
+                    break;
+                }
+            } else if (ds4_session_eval(
+                           session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
             const double token_t1 = bench_now_sec();
-            if (i == 0) gen_first_sec = token_t1 - token_t0;
-            else gen_steady_sec += token_t1 - token_t0;
-            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
-            gen_done++;
+            if (gen_done == 0) {
+                gen_first_sec = token_t1 - token_t0;
+                gen_first_tokens = cycle_n;
+            } else {
+                gen_steady_sec += token_t1 - token_t0;
+            }
+            for (int i = 0; i < cycle_n; i++) {
+                if (gen_token_buf && gen_token_count < cfg.gen_tokens) {
+                    gen_token_buf[gen_token_count++] = cycle_tokens[i];
+                }
+            }
+            gen_done += cycle_n;
         }
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
@@ -795,7 +861,8 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
-        const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
+        const int gen_steady_tokens =
+            gen_done > gen_first_tokens ? gen_done - gen_first_tokens : 0;
         fprintf(out,
                 "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                 frontier,

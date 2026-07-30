@@ -32,6 +32,8 @@ CUDA_IMPL_FRAGMENTS := \
 	cuda/runtime_services.inc \
 	models/glm/cuda/kernels.inc \
 	models/laguna/cuda/kernels.inc \
+	models/laguna/cuda/nvfp4.inc \
+	models/laguna/cuda/bf16.inc \
 	cuda/compat.inc
 METAL_IMPL_FRAGMENTS := \
 	metal/runtime.inc \
@@ -70,8 +72,16 @@ CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
+CUDA_CODE ?=
+CUDA_NVFP4_MMA ?= 0
 ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
+endif
+ifneq ($(strip $(CUDA_CODE)),)
+NVCC_ARCH_FLAGS += -code=$(CUDA_CODE)
+endif
+ifeq ($(CUDA_NVFP4_MMA),1)
+NVCC_ARCH_FLAGS += -DDS4_CUDA_NVFP4_MMA=1
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CORE_OBJS = ds4.o $(MODEL_PROVIDER_OBJS) ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o
@@ -153,7 +163,8 @@ help:
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+		CUDA_ARCH=compute_121f CUDA_CODE=sm_121 CUDA_NVFP4_MMA=1
 
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
@@ -200,8 +211,9 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
-cuda-regression: tests/cuda_long_context_smoke
+cuda-regression: tests/cuda_long_context_smoke tests/cuda_laguna_nvfp4_smoke
 	./tests/cuda_long_context_smoke
+	./tests/cuda_laguna_nvfp4_smoke
 endif
 
 tests/test_session_snapshot.o: tests/test_session_snapshot.c ds4.h
@@ -277,6 +289,9 @@ ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_ssd.h ds4_distrib
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
 
+tests/cuda_laguna_nvfp4_smoke.o: tests/cuda_laguna_nvfp4_smoke.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
 
@@ -321,6 +336,9 @@ ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/cuda_laguna_nvfp4_smoke: tests/cuda_laguna_nvfp4_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
@@ -467,4 +485,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_session_snapshot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o models/deepseek/provider.o models/glm/provider.o models/laguna/provider.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_session_snapshot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o models/deepseek/provider.o models/glm/provider.o models/laguna/provider.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cuda_laguna_nvfp4_smoke

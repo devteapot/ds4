@@ -1,3 +1,64 @@
+#include <cuda_bf16.h>
+
+__global__ static void f32_to_bf16_kernel(
+        __nv_bfloat16 *out, const float *x, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16(x[i]);
+}
+
+__global__ static void matmul_bf16_kernel(
+        float *out,
+        const __nv_bfloat16 *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    float sum = 0.0f;
+    const __nv_bfloat16 *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        sum += __bfloat162float(wr[i]) * xr[i];
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+}
+
+__global__ static void rms_norm_bf16_weight_kernel(
+        float *out, const float *x, const __nv_bfloat16 *w,
+        uint32_t n, uint32_t rows, float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+        orow[i] = xr[i] * scale * __bfloat162float(w[i]);
+}
+
 /* GLM opt-in: batched q8_0 matmuls with blocks > 32 may run as a
  * streaming dequant-to-f16 GEMM (exact-q8 native kernels only cover
  * blocks <= 32). Never enabled on DS4 paths, keeping them byte-stable. */
@@ -1201,6 +1262,75 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
+extern "C" int ds4_gpu_matmul_bf16_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!out || !x || !model_map ||
+        in_dim == 0u || out_dim == 0u || n_tok == 0u ||
+        out_dim > UINT64_MAX / in_dim) {
+        return 0;
+    }
+    const uint64_t weight_values = out_dim * in_dim;
+    if (weight_values > UINT64_MAX / sizeof(__nv_bfloat16))
+        return 0;
+    const uint64_t weight_bytes =
+        weight_values * sizeof(__nv_bfloat16);
+    if (weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    if (ds4_tensor_device_idx(x) != logical_tier) return 0;
+    const char *wptr = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier, "bf16");
+    if (!wptr) return 0;
+
+    cudaDeviceProp prop = {};
+    int physical = 0;
+    const bool tensor_core =
+        cudaGetDevice(&physical) == cudaSuccess &&
+        cudaGetDeviceProperties(&prop, physical) == cudaSuccess &&
+        prop.major >= 8 && g_cublas_ready &&
+        getenv("DS4_CUDA_DFLASH_NO_BF16_CUBLAS") == NULL;
+    if (tensor_core) {
+        const uint64_t xn = n_tok * in_dim;
+        __nv_bfloat16 *xb = (__nv_bfloat16 *)cuda_tmp_alloc_on(
+                logical_tier, xn * sizeof(__nv_bfloat16),
+                "Laguna BF16 activations");
+        if (!xb) return 0;
+        f32_to_bf16_kernel<<<(xn + 255u) / 256u, 256>>>(
+                xb, (const float *)x->ptr, xn);
+        if (!cuda_ok(cudaGetLastError(), "Laguna BF16 activation convert")) {
+            return 0;
+        }
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        const cublasStatus_t st = cublasGemmEx(
+                cuda_cublas_for_tier(logical_tier),
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)out_dim, (int)n_tok, (int)in_dim,
+                &alpha,
+                wptr, CUDA_R_16BF, (int)in_dim,
+                xb, CUDA_R_16BF, (int)in_dim,
+                &beta,
+                out->ptr, CUDA_R_32F, (int)out_dim,
+                CUDA_R_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        return cublas_ok(st, "Laguna BF16 matmul");
+    }
+
+    const dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1u);
+    matmul_bf16_kernel<<<grid, 256>>>(
+            (float *)out->ptr,
+            (const __nv_bfloat16 *)wptr,
+            (const float *)x->ptr,
+            in_dim, out_dim, n_tok);
+    return cuda_ok(cudaGetLastError(), "Laguna portable BF16 matmul");
+}
+
 extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
         ds4_gpu_tensor *out,
         const void *model_map,
@@ -1765,6 +1895,29 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const float *w = (const float *)wptr;
     rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
+}
+
+extern "C" int ds4_gpu_rms_norm_bf16_weight_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+    const uint64_t weight_bytes = (uint64_t)n * sizeof(__nv_bfloat16);
+    if (!out || !x || !model_map || n == 0u || rows == 0u ||
+        weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        out->bytes < (uint64_t)n * rows * sizeof(float) ||
+        x->bytes < (uint64_t)n * rows * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const __nv_bfloat16 *w =
+        (const __nv_bfloat16 *)cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            "bf16_rms_weight");
+    if (!w) return 0;
+    rms_norm_bf16_weight_kernel<<<rows, 256>>>(
+        (float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "bf16 RMSNorm launch");
 }
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,

@@ -19,6 +19,7 @@
 #include <float.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
@@ -478,6 +479,13 @@ enum {
     DS4_DFLASH_N_AUX          = 6,
     DS4_DFLASH_BLOCK_SIZE     = 16,
     DS4_DFLASH_CACHE_CAP      = 512,
+    DS4_DFLASH_MASK_TOKEN     = 12,
+    DS4_DFLASH_N_HEAD         = 72,
+    DS4_DFLASH_N_HEAD_KV      = 8,
+    DS4_DFLASH_HEAD_DIM       = 128,
+    DS4_DFLASH_N_FF           = 12288,
+    DS4_DFLASH_SWA            = 512,
+    DS4_DFLASH_NVFP4_DEFAULT_DRAFT = 7,
 };
 
 typedef enum {
@@ -2119,6 +2127,7 @@ static const gguf_type_info gguf_types[] = {
     [28] = {"f64",      1,   8},
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
+    [40] = {"nvfp4",   64,  36},
 };
 
 enum {
@@ -2135,6 +2144,7 @@ enum {
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
+    DS4_TENSOR_NVFP4    = 40,
 };
 
 typedef struct {
@@ -2142,6 +2152,15 @@ typedef struct {
     uint32_t type;
     uint64_t value_pos;
 } ds4_kv;
+
+typedef struct {
+    uint64_t packed_offset[256];
+    uint64_t scale_offset[256];
+    uint64_t weight_global_scale_offset[256];
+    uint64_t input_global_scale_offset[256];
+    uint64_t packed_bytes;
+    uint64_t scale_bytes;
+} ds4_native_nvfp4_matrix;
 
 typedef struct {
     ds4_str name;
@@ -2152,6 +2171,7 @@ typedef struct {
     uint64_t abs_offset;
     uint64_t elements;
     uint64_t bytes;
+    const ds4_native_nvfp4_matrix *native_nvfp4;
 } ds4_tensor;
 
 typedef struct {
@@ -2168,6 +2188,16 @@ typedef struct {
 
     ds4_kv *kv;
     ds4_tensor *tensors;
+
+    bool native_safetensors;
+    bool native_dflash;
+    char *native_dir;
+    int *native_fds;
+    uint32_t native_n_fds;
+    uint64_t native_tensor_cap;
+    ds4_native_nvfp4_matrix *native_nvfp4;
+    uint64_t native_dflash_aux_offset[DS4_DFLASH_N_AUX];
+    uint32_t native_dflash_aux_mask;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -2389,10 +2419,816 @@ static bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *
     return true;
 }
 
+typedef struct {
+    const char *p;
+    const char *end;
+} ds4_json_cursor;
+
+static void utf8_put(char **p, uint32_t cp);
+
+static void json_skip_ws(ds4_json_cursor *j) {
+    while (j->p < j->end && isspace((unsigned char)*j->p)) j->p++;
+}
+
+static bool json_take(ds4_json_cursor *j, char want) {
+    json_skip_ws(j);
+    if (j->p >= j->end || *j->p != want) return false;
+    j->p++;
+    return true;
+}
+
+static int json_hex4(const char *p) {
+    int out = 0;
+    for (int i = 0; i < 4; i++) {
+        const unsigned char c = (unsigned char)p[i];
+        int v = c >= '0' && c <= '9' ? c - '0' :
+                c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (v < 0) return -1;
+        out = (out << 4) | v;
+    }
+    return out;
+}
+
+static char *json_string_dup(ds4_json_cursor *j) {
+    json_skip_ws(j);
+    if (j->p >= j->end || *j->p++ != '"') return NULL;
+    const char *src = j->p;
+    size_t cap = (size_t)(j->end - src) + 1u;
+    char *out = xmalloc(cap);
+    char *dst = out;
+    while (j->p < j->end) {
+        unsigned char c = (unsigned char)*j->p++;
+        if (c == '"') {
+            *dst = '\0';
+            return out;
+        }
+        if (c != '\\') {
+            *dst++ = (char)c;
+            continue;
+        }
+        if (j->p >= j->end) break;
+        c = (unsigned char)*j->p++;
+        switch (c) {
+        case '"': case '\\': case '/': *dst++ = (char)c; break;
+        case 'b': *dst++ = '\b'; break;
+        case 'f': *dst++ = '\f'; break;
+        case 'n': *dst++ = '\n'; break;
+        case 'r': *dst++ = '\r'; break;
+        case 't': *dst++ = '\t'; break;
+        case 'u': {
+            if (j->end - j->p < 4) goto bad;
+            int h = json_hex4(j->p);
+            if (h < 0) goto bad;
+            j->p += 4;
+            uint32_t cp = (uint32_t)h;
+            if (cp >= 0xd800u && cp <= 0xdbffu &&
+                j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
+                int lo = json_hex4(j->p + 2);
+                if (lo >= 0xdc00 && lo <= 0xdfff) {
+                    cp = 0x10000u + ((cp - 0xd800u) << 10u) +
+                         ((uint32_t)lo - 0xdc00u);
+                    j->p += 6;
+                }
+            }
+            utf8_put(&dst, cp);
+            break;
+        }
+        default: goto bad;
+        }
+    }
+bad:
+    free(out);
+    return NULL;
+}
+
+static bool json_skip_value(ds4_json_cursor *j);
+
+static bool json_skip_compound(ds4_json_cursor *j, char open, char close) {
+    if (!json_take(j, open)) return false;
+    json_skip_ws(j);
+    if (j->p < j->end && *j->p == close) {
+        j->p++;
+        return true;
+    }
+    for (;;) {
+        if (open == '{') {
+            char *key = json_string_dup(j);
+            if (!key) return false;
+            free(key);
+            if (!json_take(j, ':')) return false;
+        }
+        if (!json_skip_value(j)) return false;
+        json_skip_ws(j);
+        if (j->p < j->end && *j->p == close) {
+            j->p++;
+            return true;
+        }
+        if (!json_take(j, ',')) return false;
+    }
+}
+
+static bool json_skip_value(ds4_json_cursor *j) {
+    json_skip_ws(j);
+    if (j->p >= j->end) return false;
+    if (*j->p == '"') {
+        char *s = json_string_dup(j);
+        if (!s) return false;
+        free(s);
+        return true;
+    }
+    if (*j->p == '{') return json_skip_compound(j, '{', '}');
+    if (*j->p == '[') return json_skip_compound(j, '[', ']');
+    const char *start = j->p;
+    while (j->p < j->end &&
+           !isspace((unsigned char)*j->p) &&
+           *j->p != ',' && *j->p != '}' && *j->p != ']') {
+        j->p++;
+    }
+    return j->p != start;
+}
+
+static bool json_u64(ds4_json_cursor *j, uint64_t *out) {
+    json_skip_ws(j);
+    if (j->p >= j->end || !isdigit((unsigned char)*j->p)) return false;
+    uint64_t v = 0;
+    do {
+        const uint32_t d = (uint32_t)(*j->p++ - '0');
+        if (v > (UINT64_MAX - d) / 10u) return false;
+        v = v * 10u + d;
+    } while (j->p < j->end && isdigit((unsigned char)*j->p));
+    *out = v;
+    return true;
+}
+
+static void native_tensor_add(
+        ds4_model                      *m,
+        const char                     *name,
+        uint32_t                        type,
+        const uint64_t                 *hf_dim,
+        uint32_t                        ndim,
+        uint64_t                        abs_offset,
+        uint64_t                        bytes,
+        const ds4_native_nvfp4_matrix  *native_nvfp4) {
+    if (ndim == 0 || ndim > DS4_MAX_DIMS) {
+        ds4_die("native tensor has an unsupported number of dimensions");
+    }
+    if (m->n_tensors == m->native_tensor_cap) {
+        uint64_t cap = m->native_tensor_cap ?
+            m->native_tensor_cap * 2u : 1024u;
+        if (cap < m->native_tensor_cap ||
+            cap > SIZE_MAX / sizeof(m->tensors[0])) {
+            ds4_die("native tensor table size overflow");
+        }
+        m->tensors = xrealloc(
+            m->tensors, (size_t)cap * sizeof(m->tensors[0]));
+        memset(m->tensors + m->native_tensor_cap, 0,
+               (size_t)(cap - m->native_tensor_cap) *
+                   sizeof(m->tensors[0]));
+        m->native_tensor_cap = cap;
+    }
+    ds4_tensor *t = &m->tensors[m->n_tensors++];
+    char *owned = ds4_strdup(name);
+    t->name.ptr = owned;
+    t->name.len = strlen(owned);
+    t->type = type;
+    t->ndim = ndim;
+    t->elements = 1;
+    for (uint32_t d = 0; d < ndim; d++) {
+        t->dim[d] = hf_dim[ndim - 1u - d];
+        if (t->dim[d] != 0 && t->elements > UINT64_MAX / t->dim[d]) {
+            ds4_die("native tensor element count overflow");
+        }
+        t->elements *= t->dim[d];
+    }
+    t->abs_offset = abs_offset;
+    t->bytes = bytes;
+    t->native_nvfp4 = native_nvfp4;
+    if (bytes > m->max_tensor_bytes) m->max_tensor_bytes = bytes;
+}
+
+static bool native_dense_name(const char *hf, char out[128]) {
+    if (!strcmp(hf, "model.embed_tokens.weight")) {
+        strcpy(out, "token_embd.weight");
+        return true;
+    }
+    if (!strcmp(hf, "model.norm.weight")) {
+        strcpy(out, "output_norm.weight");
+        return true;
+    }
+    if (!strcmp(hf, "lm_head.weight")) {
+        strcpy(out, "output.weight");
+        return true;
+    }
+
+    unsigned il = 0;
+    int n = 0;
+    if (sscanf(hf, "model.layers.%u.%n", &il, &n) != 1 ||
+        il >= DS4_N_LAYER) {
+        return false;
+    }
+    const char *tail = hf + n;
+    const char *mapped = NULL;
+    if (!strcmp(tail, "input_layernorm.weight")) {
+        mapped = "attn_norm.weight";
+    } else if (!strcmp(tail, "post_attention_layernorm.weight")) {
+        mapped = "ffn_norm.weight";
+    } else if (!strcmp(tail, "self_attn.q_proj.weight")) {
+        mapped = "attn_q.weight";
+    } else if (!strcmp(tail, "self_attn.k_proj.weight")) {
+        mapped = "attn_k.weight";
+    } else if (!strcmp(tail, "self_attn.v_proj.weight")) {
+        mapped = "attn_v.weight";
+    } else if (!strcmp(tail, "self_attn.g_proj.weight")) {
+        mapped = "attn_gate.weight";
+    } else if (!strcmp(tail, "self_attn.o_proj.weight")) {
+        mapped = "attn_output.weight";
+    } else if (!strcmp(tail, "self_attn.q_norm.weight")) {
+        mapped = "attn_q_norm.weight";
+    } else if (!strcmp(tail, "self_attn.k_norm.weight")) {
+        mapped = "attn_k_norm.weight";
+    } else if (!strcmp(tail, "mlp.gate_proj.weight")) {
+        mapped = "ffn_gate.weight";
+    } else if (!strcmp(tail, "mlp.up_proj.weight")) {
+        mapped = "ffn_up.weight";
+    } else if (!strcmp(tail, "mlp.down_proj.weight")) {
+        mapped = "ffn_down.weight";
+    } else if (!strcmp(tail, "mlp.gate.weight")) {
+        mapped = "ffn_gate_inp.weight";
+    } else if (!strcmp(tail, "mlp.experts.e_score_correction_bias")) {
+        mapped = "exp_probs_b.bias";
+    } else if (!strcmp(tail, "mlp.shared_expert.gate_proj.weight")) {
+        mapped = "ffn_gate_shexp.weight";
+    } else if (!strcmp(tail, "mlp.shared_expert.up_proj.weight")) {
+        mapped = "ffn_up_shexp.weight";
+    } else if (!strcmp(tail, "mlp.shared_expert.down_proj.weight")) {
+        mapped = "ffn_down_shexp.weight";
+    }
+    if (!mapped) return false;
+    snprintf(out, 128, "blk.%u.%s", il, mapped);
+    return true;
+}
+
+static int native_proj_index(const char *proj) {
+    if (!strcmp(proj, "gate_proj")) return 0;
+    if (!strcmp(proj, "up_proj")) return 1;
+    if (!strcmp(proj, "down_proj")) return 2;
+    return -1;
+}
+
+static void native_dflash_add_tensor(
+        ds4_model *m, const char *mapped, const char *dtype,
+        const uint64_t *shape, uint32_t ndim, uint64_t offset,
+        uint64_t bytes) {
+    if (strcmp(dtype, "BF16")) {
+        ds4_die("native Laguna DFlash tensors must be BF16");
+    }
+    native_tensor_add(m, mapped, DS4_TENSOR_BF16, shape, ndim,
+                      offset, bytes, NULL);
+}
+
+static void native_dflash_record_tensor(
+        ds4_model *m, const char *name, const char *dtype,
+        const uint64_t *shape, uint32_t ndim, uint64_t offset,
+        uint64_t bytes) {
+    unsigned aux = 0;
+    if (sscanf(name, "aux_hidden_norms.%u.weight", &aux) == 1 &&
+        aux < DS4_DFLASH_N_AUX) {
+        if (strcmp(dtype, "BF16") || ndim != 1u ||
+            shape[0] != DS4_N_EMBD ||
+            bytes != (uint64_t)DS4_N_EMBD * sizeof(uint16_t)) {
+            ds4_die("invalid native Laguna DFlash auxiliary norm");
+        }
+        m->native_dflash_aux_offset[aux] = offset;
+        m->native_dflash_aux_mask |= 1u << aux;
+        return;
+    }
+    if (!strcmp(name, "fc.weight")) {
+        native_dflash_add_tensor(
+            m, "fc.weight", dtype, shape, ndim, offset, bytes);
+        return;
+    }
+    if (!strcmp(name, "hidden_norm.weight")) {
+        native_dflash_add_tensor(
+            m, "enc.output_norm.weight", dtype, shape, ndim,
+            offset, bytes);
+        return;
+    }
+    if (!strcmp(name, "norm.weight")) {
+        native_dflash_add_tensor(
+            m, "output_norm.weight", dtype, shape, ndim, offset, bytes);
+        return;
+    }
+
+    unsigned il = 0;
+    int n = 0;
+    if (sscanf(name, "layers.%u.%n", &il, &n) != 1 ||
+        il >= DS4_DFLASH_N_LAYER) {
+        return;
+    }
+    const char *tail = name + n;
+    char mapped[128];
+    const char *suffix = NULL;
+    if (!strcmp(tail, "input_layernorm.weight")) {
+        suffix = "attn_norm.weight";
+    } else if (!strcmp(tail, "post_attention_layernorm.weight")) {
+        suffix = "ffn_norm.weight";
+    } else if (!strcmp(tail, "self_attn.g_proj.weight")) {
+        suffix = "attn_gate.weight";
+    } else if (!strcmp(tail, "self_attn.q_norm.weight")) {
+        suffix = "attn_q_norm.weight";
+    } else if (!strcmp(tail, "self_attn.k_norm.weight")) {
+        suffix = "attn_k_norm.weight";
+    } else if (!strcmp(tail, "self_attn.o_proj.weight")) {
+        suffix = "attn_output.weight";
+    } else if (!strcmp(tail, "mlp.gate_proj.weight")) {
+        suffix = "ffn_gate.weight";
+    } else if (!strcmp(tail, "mlp.up_proj.weight")) {
+        suffix = "ffn_up.weight";
+    } else if (!strcmp(tail, "mlp.down_proj.weight")) {
+        suffix = "ffn_down.weight";
+    }
+    if (suffix) {
+        snprintf(mapped, sizeof(mapped), "blk.%u.%s", il, suffix);
+        native_dflash_add_tensor(
+            m, mapped, dtype, shape, ndim, offset, bytes);
+        return;
+    }
+    if (strcmp(tail, "self_attn.qkv_proj.weight")) return;
+    if (strcmp(dtype, "BF16") || ndim != 2u ||
+        shape[0] !=
+            (uint64_t)(DS4_DFLASH_N_HEAD +
+                       2u * DS4_DFLASH_N_HEAD_KV) *
+                DS4_DFLASH_HEAD_DIM ||
+        shape[1] != DS4_N_EMBD) {
+        ds4_die("invalid native Laguna DFlash fused QKV tensor");
+    }
+    const uint64_t q_out =
+        (uint64_t)DS4_DFLASH_N_HEAD * DS4_DFLASH_HEAD_DIM;
+    const uint64_t kv_out =
+        (uint64_t)DS4_DFLASH_N_HEAD_KV * DS4_DFLASH_HEAD_DIM;
+    const uint64_t q_bytes =
+        q_out * DS4_N_EMBD * sizeof(uint16_t);
+    const uint64_t kv_bytes =
+        kv_out * DS4_N_EMBD * sizeof(uint16_t);
+    if (bytes != q_bytes + 2u * kv_bytes) {
+        ds4_die("invalid native Laguna DFlash fused QKV byte size");
+    }
+    const uint64_t q_shape[2] = {q_out, DS4_N_EMBD};
+    const uint64_t kv_shape[2] = {kv_out, DS4_N_EMBD};
+    snprintf(mapped, sizeof(mapped), "blk.%u.attn_q.weight", il);
+    native_tensor_add(
+        m, mapped, DS4_TENSOR_BF16, q_shape, 2u,
+        offset, q_bytes, NULL);
+    snprintf(mapped, sizeof(mapped), "blk.%u.attn_k.weight", il);
+    native_tensor_add(
+        m, mapped, DS4_TENSOR_BF16, kv_shape, 2u,
+        offset + q_bytes, kv_bytes, NULL);
+    snprintf(mapped, sizeof(mapped), "blk.%u.attn_v.weight", il);
+    native_tensor_add(
+        m, mapped, DS4_TENSOR_BF16, kv_shape, 2u,
+        offset + q_bytes + kv_bytes, kv_bytes, NULL);
+}
+
+static void native_record_tensor(
+        ds4_model *m, const char *name, const char *dtype,
+        const uint64_t *shape, uint32_t ndim, uint64_t offset,
+        uint64_t bytes) {
+    if (m->native_dflash) {
+        native_dflash_record_tensor(
+            m, name, dtype, shape, ndim, offset, bytes);
+        return;
+    }
+
+    unsigned il = 0;
+    unsigned expert = 0;
+    char proj[32] = {0};
+    char field[48] = {0};
+    if (sscanf(name,
+               "model.layers.%u.mlp.experts.%u.%31[^.].%47s",
+               &il, &expert, proj, field) == 4 &&
+        il < DS4_N_LAYER && expert < DS4_N_EXPERT) {
+        const int pi = native_proj_index(proj);
+        if (pi < 0) {
+            ds4_die("unsupported native NVFP4 expert projection");
+        }
+        ds4_native_nvfp4_matrix *g =
+            &m->native_nvfp4[il * 3u + (uint32_t)pi];
+        if (!strcmp(field, "weight_packed")) {
+            if (strcmp(dtype, "U8") || ndim != 2u) {
+                ds4_die("invalid native NVFP4 packed-weight tensor");
+            }
+            g->packed_offset[expert] = offset;
+            if (g->packed_bytes && g->packed_bytes != bytes) {
+                ds4_die("inconsistent native NVFP4 packed expert size");
+            }
+            g->packed_bytes = bytes;
+        } else if (!strcmp(field, "weight_scale")) {
+            if (strcmp(dtype, "F8_E4M3") || ndim != 2u) {
+                ds4_die("invalid native NVFP4 block-scale tensor");
+            }
+            g->scale_offset[expert] = offset;
+            if (g->scale_bytes && g->scale_bytes != bytes) {
+                ds4_die("inconsistent native NVFP4 scale tensor size");
+            }
+            g->scale_bytes = bytes;
+        } else if (!strcmp(field, "weight_global_scale")) {
+            if (strcmp(dtype, "F32") || bytes != sizeof(float)) {
+                ds4_die("invalid native NVFP4 weight global scale");
+            }
+            g->weight_global_scale_offset[expert] = offset;
+        } else if (!strcmp(field, "input_global_scale")) {
+            if (strcmp(dtype, "F32") || bytes != sizeof(float)) {
+                ds4_die("invalid native NVFP4 input global scale");
+            }
+            g->input_global_scale_offset[expert] = offset;
+        }
+        return;
+    }
+
+    char mapped[128];
+    if (!native_dense_name(name, mapped)) return;
+    uint32_t type = UINT32_MAX;
+    if (!strcmp(dtype, "BF16")) {
+        type = DS4_TENSOR_BF16;
+    } else if (!strcmp(dtype, "F32")) {
+        type = DS4_TENSOR_F32;
+    } else if (!strcmp(dtype, "I32")) {
+        type = DS4_TENSOR_I32;
+    }
+    if (type == UINT32_MAX) {
+        fprintf(stderr,
+                "ds4: unsupported native tensor dtype %s for %s\n",
+                dtype, name);
+        exit(1);
+    }
+    native_tensor_add(
+        m, mapped, type, shape, ndim, offset, bytes, NULL);
+}
+
+static bool native_parse_safetensor_header(
+        ds4_model *m, const uint8_t *shard, uint64_t shard_size,
+        uint64_t shard_base) {
+    if (shard_size < 8u) return false;
+    uint64_t header_len = 0;
+    memcpy(&header_len, shard, sizeof(header_len));
+    if (header_len > shard_size - 8u) return false;
+    ds4_json_cursor j = {
+        .p = (const char *)shard + 8u,
+        .end = (const char *)shard + 8u + header_len,
+    };
+    if (!json_take(&j, '{')) return false;
+    json_skip_ws(&j);
+    while (j.p < j.end && *j.p != '}') {
+        char *name = json_string_dup(&j);
+        if (!name || !json_take(&j, ':')) {
+            free(name);
+            return false;
+        }
+        if (!strcmp(name, "__metadata__")) {
+            free(name);
+            if (!json_skip_value(&j)) return false;
+        } else {
+            char *dtype = NULL;
+            uint64_t shape[DS4_MAX_DIMS] = {0};
+            uint32_t ndim = 0;
+            uint64_t data_off[2] = {0};
+            bool have_offsets = false;
+            if (!json_take(&j, '{')) {
+                free(name);
+                return false;
+            }
+            bool entry_ok = true;
+            while (j.p < j.end) {
+                json_skip_ws(&j);
+                if (j.p < j.end && *j.p == '}') {
+                    j.p++;
+                    break;
+                }
+                char *field = json_string_dup(&j);
+                if (!field || !json_take(&j, ':')) {
+                    free(field);
+                    free(name);
+                    free(dtype);
+                    return false;
+                }
+                bool field_ok = true;
+                if (!strcmp(field, "dtype")) {
+                    free(dtype);
+                    dtype = json_string_dup(&j);
+                    field_ok = dtype != NULL;
+                } else if (!strcmp(field, "shape")) {
+                    field_ok = json_take(&j, '[');
+                    json_skip_ws(&j);
+                    while (field_ok && j.p < j.end && *j.p != ']') {
+                        field_ok =
+                            ndim < DS4_MAX_DIMS &&
+                            json_u64(&j, &shape[ndim++]);
+                        if (!field_ok) break;
+                        json_skip_ws(&j);
+                        if (j.p < j.end && *j.p == ']') break;
+                        field_ok = json_take(&j, ',');
+                    }
+                    field_ok = field_ok && json_take(&j, ']');
+                } else if (!strcmp(field, "data_offsets")) {
+                    field_ok =
+                        json_take(&j, '[') &&
+                        json_u64(&j, &data_off[0]) &&
+                        json_take(&j, ',') &&
+                        json_u64(&j, &data_off[1]) &&
+                        json_take(&j, ']');
+                    have_offsets = field_ok;
+                } else {
+                    field_ok = json_skip_value(&j);
+                }
+                free(field);
+                if (!field_ok) {
+                    entry_ok = false;
+                    break;
+                }
+                json_skip_ws(&j);
+                if (j.p < j.end && *j.p == ',') {
+                    j.p++;
+                    continue;
+                }
+            }
+            if (!entry_ok || !dtype || !have_offsets ||
+                data_off[1] < data_off[0] ||
+                data_off[1] > shard_size - 8u - header_len) {
+                free(dtype);
+                free(name);
+                return false;
+            }
+            native_record_tensor(
+                m, name, dtype, shape, ndim,
+                shard_base + 8u + header_len + data_off[0],
+                data_off[1] - data_off[0]);
+            free(dtype);
+            free(name);
+        }
+        json_skip_ws(&j);
+        if (j.p < j.end && *j.p == ',') {
+            j.p++;
+            continue;
+        }
+        if (j.p < j.end && *j.p == '}') break;
+        return false;
+    }
+    return json_take(&j, '}');
+}
+
+static int native_name_cmp(const void *a, const void *b) {
+    const char *const *sa = a;
+    const char *const *sb = b;
+    return strcmp(*sa, *sb);
+}
+
+static bool native_directory_is_dflash(const char *path) {
+    char config_path[PATH_MAX];
+    if (snprintf(config_path, sizeof(config_path), "%s/config.json", path) >=
+        (int)sizeof(config_path)) {
+        ds4_die("native model config path is too long");
+    }
+    int fd = open(config_path, O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 ||
+        st.st_size > 1024 * 1024) {
+        close(fd);
+        return false;
+    }
+    char *text = xmalloc((size_t)st.st_size + 1u);
+    uint64_t done = 0;
+    while (done < (uint64_t)st.st_size) {
+        ssize_t n =
+            read(fd, text + done, (size_t)st.st_size - (size_t)done);
+        if (n <= 0) {
+            free(text);
+            close(fd);
+            return false;
+        }
+        done += (uint64_t)n;
+    }
+    close(fd);
+    text[done] = '\0';
+    const bool is_dflash =
+        strstr(text, "\"DFlashLagunaForCausalLM\"") != NULL &&
+        strstr(text, "\"dflash_config\"") != NULL;
+    free(text);
+    return is_dflash;
+}
+
+static void native_finalize_dflash(ds4_model *m) {
+    if (m->native_dflash_aux_mask !=
+        (1u << DS4_DFLASH_N_AUX) - 1u) {
+        ds4_die(
+            "native Laguna DFlash checkpoint is missing auxiliary norms");
+    }
+    const uint64_t row_bytes =
+        (uint64_t)DS4_N_EMBD * sizeof(uint16_t);
+    for (uint32_t i = 1; i < DS4_DFLASH_N_AUX; i++) {
+        if (m->native_dflash_aux_offset[i] !=
+            m->native_dflash_aux_offset[0] +
+                (uint64_t)i * row_bytes) {
+            ds4_die(
+                "native Laguna DFlash auxiliary norms are not contiguous");
+        }
+    }
+    const uint64_t shape[2] = {
+        DS4_DFLASH_N_AUX, DS4_N_EMBD
+    };
+    native_tensor_add(
+        m, "enc.aux_norm.weight", DS4_TENSOR_BF16, shape, 2u,
+        m->native_dflash_aux_offset[0],
+        (uint64_t)DS4_DFLASH_N_AUX * row_bytes, NULL);
+}
+
+static void native_add_expert_groups(ds4_model *m) {
+    static const char *const stem[3] = {
+        "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"
+    };
+    for (uint32_t il = DS4_N_LEADING_DENSE; il < DS4_N_LAYER; il++) {
+        for (uint32_t pi = 0; pi < 3u; pi++) {
+            ds4_native_nvfp4_matrix *g =
+                &m->native_nvfp4[il * 3u + pi];
+            for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                if (!g->packed_offset[e] || !g->scale_offset[e] ||
+                    !g->weight_global_scale_offset[e] ||
+                    !g->input_global_scale_offset[e]) {
+                    ds4_die(
+                        "native NVFP4 checkpoint is missing an expert tensor");
+                }
+            }
+            const uint64_t logical_shape[3] = {
+                DS4_N_EXPERT,
+                pi == 2u ? DS4_N_EMBD : DS4_N_FF_EXP,
+                pi == 2u ? DS4_N_FF_EXP : DS4_N_EMBD,
+            };
+            char name[96];
+            snprintf(
+                name, sizeof(name), "blk.%u.%s.weight", il, stem[pi]);
+            const uint64_t logical_bytes =
+                (g->packed_bytes + g->scale_bytes) * DS4_N_EXPERT;
+            native_tensor_add(
+                m, name, DS4_TENSOR_NVFP4, logical_shape, 3u,
+                g->packed_offset[0], logical_bytes, g);
+
+            const uint64_t scale_shape[1] = {DS4_N_EXPERT};
+            snprintf(
+                name, sizeof(name), "blk.%u.%s.scale", il, stem[pi]);
+            native_tensor_add(
+                m, name, DS4_TENSOR_F32, scale_shape, 1u,
+                g->weight_global_scale_offset[0],
+                DS4_N_EXPERT * sizeof(float), g);
+        }
+    }
+}
+
+static void model_open_native_safetensors(
+        ds4_model *m, const char *path) {
+#if defined(__APPLE__) || defined(DS4_NO_GPU) || defined(DS4_ROCM_BUILD)
+    (void)m;
+    (void)path;
+    ds4_die("native Laguna NVFP4 safetensors currently require CUDA");
+#else
+    /*
+     * Tensor-name filtering and synthesized routed-expert dimensions use
+     * the active model shape while shard headers are parsed.
+     */
+    g_ds4_shape = DS4_SHAPE_LAGUNA_S21;
+    m->native_dflash = native_directory_is_dflash(path);
+
+    DIR *dir = opendir(path);
+    if (!dir) ds4_die_errno("cannot open model directory", path);
+    char **names = NULL;
+    uint32_t n_names = 0;
+    uint32_t cap = 0;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        const bool wanted = m->native_dflash ?
+            !strcmp(de->d_name, "model.safetensors") :
+            strncmp(de->d_name, "model-", 6) == 0 &&
+                strstr(de->d_name, ".safetensors") != NULL;
+        if (!wanted) continue;
+        if (n_names == cap) {
+            cap = cap ? cap * 2u : 16u;
+            names = xrealloc(
+                names, (size_t)cap * sizeof(names[0]));
+        }
+        names[n_names++] = ds4_strdup(de->d_name);
+    }
+    closedir(dir);
+    if (n_names == 0) {
+        ds4_die("model directory has no supported safetensors");
+    }
+    qsort(names, n_names, sizeof(names[0]), native_name_cmp);
+
+    const long page_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_l > 0 ? (uint64_t)page_l : 4096u;
+    uint64_t *sizes = xcalloc(n_names, sizeof(sizes[0]));
+    int *fds = xmalloc((size_t)n_names * sizeof(fds[0]));
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < n_names; i++) {
+        char file[PATH_MAX];
+        if (snprintf(
+                file, sizeof(file), "%s/%s", path, names[i]) >=
+            (int)sizeof(file)) {
+            ds4_die("native model shard path is too long");
+        }
+        fds[i] = open(file, O_RDONLY);
+        if (fds[i] < 0) {
+            ds4_die_errno("cannot open safetensor shard", file);
+        }
+        struct stat st;
+        if (fstat(fds[i], &st) != 0 || st.st_size < 8) {
+            ds4_die_errno("cannot stat safetensor shard", file);
+        }
+        sizes[i] = (uint64_t)st.st_size;
+        const uint64_t rounded = align_up(sizes[i], page);
+        if (total > UINT64_MAX - rounded) {
+            ds4_die("native model mapping size overflow");
+        }
+        total += rounded;
+    }
+    if (total > SIZE_MAX) {
+        ds4_die("native model mapping exceeds the addressable size");
+    }
+    void *reserve = mmap(
+        NULL, (size_t)total, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reserve == MAP_FAILED) {
+        ds4_die_errno("cannot reserve native model address space", path);
+    }
+    uint64_t base = 0;
+    for (uint32_t i = 0; i < n_names; i++) {
+        void *got = mmap(
+            (uint8_t *)reserve + base, (size_t)sizes[i],
+            PROT_READ, MAP_PRIVATE | MAP_FIXED, fds[i], 0);
+        if (got == MAP_FAILED) {
+            ds4_die_errno("cannot mmap safetensor shard", names[i]);
+        }
+        base += align_up(sizes[i], page);
+    }
+
+    m->native_safetensors = true;
+    m->native_dir = ds4_strdup(path);
+    m->native_fds = fds;
+    m->native_n_fds = n_names;
+    if (!m->native_dflash) {
+        m->native_nvfp4 = xcalloc(
+            DS4_N_LAYER * 3u, sizeof(m->native_nvfp4[0]));
+    }
+    m->map = reserve;
+    m->size = total;
+    m->tensor_data_pos = 0;
+    m->alignment = page;
+    m->version = 1;
+
+    base = 0;
+    for (uint32_t i = 0; i < n_names; i++) {
+        if (!native_parse_safetensor_header(
+                m, m->map + base, sizes[i], base)) {
+            ds4_die(
+                "invalid safetensors header in native Laguna checkpoint");
+        }
+        base += align_up(sizes[i], page);
+    }
+    if (m->native_dflash) {
+        native_finalize_dflash(m);
+        fprintf(
+            stderr,
+            "ds4: mapped native Laguna NVFP4 DFlash checkpoint: %u file, "
+            "%.2f GiB, %" PRIu64 " logical tensors\n",
+            n_names, (double)total / 1073741824.0, m->n_tensors);
+    } else {
+        native_add_expert_groups(m);
+        fprintf(
+            stderr,
+            "ds4: mapped native Laguna NVFP4 checkpoint: %u shards, "
+            "%.2f GiB, %" PRIu64 " logical tensors\n",
+            n_names, (double)total / 1073741824.0, m->n_tensors);
+    }
+    for (uint32_t i = 0; i < n_names; i++) free(names[i]);
+    free(names);
+    free(sizes);
+#endif
+}
+
 static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
+    if (m->native_safetensors) {
+        for (uint64_t i = 0; i < m->n_tensors; i++) {
+            free((void *)m->tensors[i].name.ptr);
+        }
+        for (uint32_t i = 0; i < m->native_n_fds; i++) {
+            if (m->native_fds[i] >= 0) close(m->native_fds[i]);
+        }
+    }
     free(m->tensors);
+    free(m->native_fds);
+    free(m->native_nvfp4);
+    free(m->native_dir);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -2515,6 +3351,17 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
                        bool prefetch_cpu) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
+
+    struct stat path_st;
+    if (stat(path, &path_st) == -1) {
+        ds4_die_errno("cannot stat model", path);
+    }
+    if (S_ISDIR(path_st.st_mode)) {
+        (void)metal_mapping;
+        (void)prefetch_cpu;
+        model_open_native_safetensors(m, path);
+        return;
+    }
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) ds4_die_errno("cannot open model", path);
@@ -2760,8 +3607,35 @@ static void model_summary(const ds4_model *m) {
     uint64_t tensor_bytes = 0;
     uint64_t params = 0;
 
-    model_get_string(m, "general.name", &name);
-    model_get_string(m, "general.architecture", &arch);
+    if (m->native_dflash) {
+        name = (ds4_str){
+            "Laguna S 2.1 DFlash NVFP4",
+            sizeof("Laguna S 2.1 DFlash NVFP4") - 1u,
+        };
+        arch = (ds4_str){"dflash", 6u};
+        layers = DS4_DFLASH_N_LAYER;
+        ctx_train = DS4_SHAPE_LAGUNA_S21.context_length;
+        n_head = DS4_DFLASH_N_HEAD;
+        n_head_kv = DS4_DFLASH_N_HEAD_KV;
+        head_dim = DS4_DFLASH_HEAD_DIM;
+        n_swa = DS4_DFLASH_SWA;
+    } else if (m->native_safetensors) {
+        name = (ds4_str){
+            "Laguna S 2.1 NVFP4",
+            sizeof("Laguna S 2.1 NVFP4") - 1u,
+        };
+        arch = (ds4_str){"laguna", 6u};
+        layers = DS4_SHAPE_LAGUNA_S21.n_layer;
+        ctx_train = DS4_SHAPE_LAGUNA_S21.context_length;
+        n_head_kv = DS4_SHAPE_LAGUNA_S21.n_head_kv;
+        head_dim = DS4_SHAPE_LAGUNA_S21.n_head_dim;
+        n_swa = DS4_SHAPE_LAGUNA_S21.n_swa;
+        n_expert = DS4_SHAPE_LAGUNA_S21.n_expert;
+        n_expert_used = DS4_SHAPE_LAGUNA_S21.n_expert_used;
+    } else {
+        model_get_string(m, "general.name", &name);
+        model_get_string(m, "general.architecture", &arch);
+    }
     if (!model_get_u32(m, "deepseek4.block_count", &layers)) {
         model_get_u32(m, "glm-dsa.block_count", &layers);
     }
@@ -2807,8 +3681,15 @@ static void model_summary(const ds4_model *m) {
 
     printf("model: %.*s\n", (int)name.len, name.ptr);
     printf("arch:  %.*s\n", (int)arch.len, arch.ptr);
-    printf("gguf:  v%u, %" PRIu64 " metadata keys, %" PRIu64 " tensors\n",
-        m->version, m->n_kv, m->n_tensors);
+    if (m->native_safetensors) {
+        printf("format: native sharded safetensors (%u files, "
+               "%" PRIu64 " logical tensors)\n",
+               m->native_n_fds, m->n_tensors);
+    } else {
+        printf("gguf:  v%u, %" PRIu64 " metadata keys, "
+               "%" PRIu64 " tensors\n",
+               m->version, m->n_kv, m->n_tensors);
+    }
     if (layers) printf("layers: %u\n", layers);
     if (ctx_train) printf("train context: %" PRIu64 "\n", ctx_train);
     if (n_head || n_head_kv || head_dim || n_swa) {
@@ -2824,10 +3705,11 @@ static void model_summary(const ds4_model *m) {
                n_expert, n_expert_used, n_expert_groups, n_group_used);
     }
     model_print_dspark_summary(m);
-    printf("file size: ");
+    printf("%s size: ", m->native_safetensors ? "checkpoint" : "file");
     print_size(m->size);
     printf("\n");
-    printf("tensor bytes described by GGUF: ");
+    printf("%s tensor storage: ",
+           m->native_safetensors ? "logical" : "GGUF-described");
     print_size(tensor_bytes);
     printf("\n");
     printf("logical parameters: %.2f B\n", (double)params / 1000000000.0);
@@ -2881,8 +3763,13 @@ static ds4_support_kind support_model_detect(
     if (!m) return DS4_SUPPORT_NONE;
 
     ds4_str arch = {0};
-    if (model_get_string(m, "general.architecture", &arch) &&
-        ds4_streq(arch, "dflash")) {
+    if ((m->native_dflash ||
+         (model_get_string(m, "general.architecture", &arch) &&
+          ds4_streq(arch, "dflash"))) &&
+        model_find_tensor(m, "fc.weight") &&
+        model_find_tensor(m, "enc.aux_norm.weight") &&
+        model_find_tensor(m, "blk.0.attn_q.weight")) {
+        if (stages_out) *stages_out = DS4_DFLASH_N_LAYER;
         return DS4_SUPPORT_DFLASH;
     }
 
@@ -2962,10 +3849,17 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
                                                    uint32_t span_count,
                                                    uint64_t *prepared_out) {
     uint64_t cap = m->n_tensors;
+    if (m->native_safetensors && m->native_nvfp4) {
+        const uint64_t native_spans =
+            (uint64_t)DS4_N_LAYER * 3u * DS4_N_EXPERT * 2u;
+        if (cap > UINT64_MAX - native_spans) return false;
+        cap += native_spans;
+    }
     if (cap == 0) {
         if (prepared_out) *prepared_out = 0;
         return true;
     }
+    if (cap > SIZE_MAX / sizeof(accelerator_tensor_span)) return false;
 
     accelerator_tensor_span *spans = xmalloc((size_t)cap * sizeof(spans[0]));
     uint64_t nspan = 0;
@@ -2979,6 +3873,12 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     }
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
+        /*
+         * Native routed tensors are logical groups backed by separate
+         * packed-weight and block-scale ranges. Their synthetic byte count is
+         * not one contiguous model span; register the physical ranges below.
+         */
+        if (t->native_nvfp4) continue;
         if (t->bytes == 0) continue;
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
             free(spans);
@@ -2992,6 +3892,42 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
         };
+    }
+    if (m->native_safetensors && m->native_nvfp4) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            for (uint32_t pi = 0; pi < 3u; pi++) {
+                const ds4_native_nvfp4_matrix *g =
+                    &m->native_nvfp4[il * 3u + pi];
+                if (g->packed_bytes == 0 || g->scale_bytes == 0) continue;
+                for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                    const uint64_t packed_off = g->packed_offset[e];
+                    const uint64_t scale_off = g->scale_offset[e];
+                    if (packed_off > m->size ||
+                        g->packed_bytes > m->size - packed_off ||
+                        scale_off > m->size ||
+                        g->scale_bytes > m->size - scale_off) {
+                        free(spans);
+                        return false;
+                    }
+                    if (accelerator_span_filter_contains(
+                            packed_off, g->packed_bytes,
+                            span_offsets, span_sizes, span_count)) {
+                        spans[nspan++] = (accelerator_tensor_span){
+                            .off = packed_off,
+                            .end = packed_off + g->packed_bytes,
+                        };
+                    }
+                    if (accelerator_span_filter_contains(
+                            scale_off, g->scale_bytes,
+                            span_offsets, span_sizes, span_count)) {
+                        spans[nspan++] = (accelerator_tensor_span){
+                            .off = scale_off,
+                            .end = scale_off + g->scale_bytes,
+                        };
+                    }
+                }
+            }
+        }
     }
     if (nspan == 0) {
         free(spans);
@@ -3022,7 +3958,13 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     fflush(stderr);
 
     for (uint64_t i = 0; i < nspan;) {
-        uint64_t off = spans[i].off;
+        /*
+         * Preserve the source address's low alignment bits when CUDA caches a
+         * merged range. Native NVFP4 kernels perform aligned fragment loads
+         * from offsets within the cached range.
+         */
+        const uint64_t preload_align = 256u;
+        uint64_t off = spans[i].off & ~(preload_align - 1u);
         uint64_t end = spans[i].end;
         i++;
         while (i < nspan &&
@@ -3074,6 +4016,7 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
                                          uint32_t span_count) {
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
+        if (t->native_nvfp4) continue;
         if (t->bytes == 0) continue;
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
         if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
@@ -3424,7 +4367,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_Q3_K ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
-           type == DS4_TENSOR_Q6_K;
+           type == DS4_TENSOR_Q6_K ||
+           type == DS4_TENSOR_NVFP4;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -3436,6 +4380,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
+    case DS4_TENSOR_NVFP4:   return 36;
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -3863,14 +4808,20 @@ static bool weights_laguna_layer_has_required(const ds4_layer_weights *l, uint32
     if (il < DS4_N_LEADING_DENSE) {
         return l->ffn_gate && l->ffn_up && l->ffn_down;
     }
-    return l->ffn_gate_inp &&
-           l->ffn_exp_probs_b &&
-           l->ffn_gate_exps &&
-           l->ffn_up_exps &&
-           l->ffn_down_exps &&
-           l->ffn_gate_shexp &&
-           l->ffn_up_shexp &&
-           l->ffn_down_shexp;
+    if (!l->ffn_gate_inp ||
+        !l->ffn_exp_probs_b ||
+        !l->ffn_gate_exps ||
+        !l->ffn_up_exps ||
+        !l->ffn_down_exps ||
+        !l->ffn_gate_shexp ||
+        !l->ffn_up_shexp ||
+        !l->ffn_down_shexp) {
+        return false;
+    }
+    return l->ffn_gate_exps->type != DS4_TENSOR_NVFP4 ||
+           (l->ffn_gate_exps_scale &&
+            l->ffn_up_exps_scale &&
+            l->ffn_down_exps_scale);
 }
 
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
@@ -4048,22 +4999,45 @@ static void weights_validate_laguna_layout(
         ds4_die("invalid layer range in Laguna weight layout validation");
     }
 
-    /* Poolside published two coherent recipes under the same Q4_K_M
-     * filename. The embedding type identifies full models; attention Q is
-     * the equivalent marker for layer-only/distributed weight views. */
+    /*
+     * Poolside published two Q4_K_M recipes plus a mixed NVFP4 checkpoint.
+     * The latter keeps the signal/shared-expert paths dense and quantizes
+     * only routed experts.
+     */
     const ds4_tensor *layout_marker = w->token_embd;
     if (!layout_marker) layout_marker = w->layer[layer_start].attn_q;
     if (!layout_marker) {
         ds4_die("cannot identify Laguna quantization layout");
     }
+    const uint32_t routed_probe =
+        layer_start < DS4_N_LEADING_DENSE ?
+            DS4_N_LEADING_DENSE : layer_start;
+    const bool nvfp4_layout =
+        routed_probe <= layer_end &&
+        w->layer[routed_probe].ffn_gate_exps &&
+        w->layer[routed_probe].ffn_gate_exps->type ==
+            DS4_TENSOR_NVFP4;
+    const bool native_nvfp4 =
+        nvfp4_layout &&
+        w->layer[routed_probe].ffn_gate_exps->native_nvfp4 != NULL;
+    const uint32_t dense_type =
+        native_nvfp4 ? DS4_TENSOR_BF16 : DS4_TENSOR_F16;
+    const uint32_t norm_type =
+        native_nvfp4 ? DS4_TENSOR_BF16 : DS4_TENSOR_F32;
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
+    if (nvfp4_layout) {
+        ds4_die(
+            "Laguna NVFP4 routed experts currently require the CUDA backend");
+    }
+#endif
     const bool signal_q8 = layout_marker->type == DS4_TENSOR_Q8_0;
     const bool legacy_layout =
         (w->token_embd && layout_marker->type == DS4_TENSOR_Q4_K) ||
         (!w->token_embd && layout_marker->type == DS4_TENSOR_F16);
-    if (!signal_q8 && !legacy_layout) {
+    if (!signal_q8 && !legacy_layout && !nvfp4_layout) {
         fprintf(stderr,
                 "ds4: unsupported Laguna quantization layout marker %s; "
-                "expected legacy Q4_K/F16 or Q8_0 signal weights\n",
+                "expected legacy Q4_K/F16, Q8_0, or mixed NVFP4 weights\n",
                 tensor_type_name(layout_marker->type));
         exit(1);
     }
@@ -4071,7 +5045,9 @@ static void weights_validate_laguna_layout(
     if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
     if (w->token_embd) {
         tensor_expect_layout(w->token_embd,
-                             signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
+                             signal_q8 ? DS4_TENSOR_Q8_0 :
+                             nvfp4_layout ? dense_type :
+                                            DS4_TENSOR_Q4_K,
                              2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
@@ -4079,10 +5055,12 @@ static void weights_validate_laguna_layout(
     if (require_output && !have_output) ds4_die("required output head tensors are missing");
     if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
     if (have_output) {
-        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32,
+        tensor_expect_layout(w->output_norm, norm_type,
                              1, DS4_N_EMBD, 0, 0);
         tensor_expect_layout(w->output,
-                             signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q6_K,
+                             signal_q8 ? DS4_TENSOR_Q8_0 :
+                             nvfp4_layout ? dense_type :
+                                            DS4_TENSOR_Q6_K,
                              2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
@@ -4096,10 +5074,10 @@ static void weights_validate_laguna_layout(
         const uint64_t q_dim = (uint64_t)n_head * DS4_N_HEAD_DIM;
         const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
 
-        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32,
+        tensor_expect_layout(l->attn_norm, norm_type,
                              1, DS4_N_EMBD, 0, 0);
         const uint32_t attn_type =
-            signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_F16;
+            signal_q8 ? DS4_TENSOR_Q8_0 : dense_type;
         tensor_expect_layout(l->attn_q, attn_type,
                              2, DS4_N_EMBD, q_dim, 0);
         tensor_expect_layout(l->attn_k, attn_type,
@@ -4108,72 +5086,115 @@ static void weights_validate_laguna_layout(
                              2, DS4_N_EMBD, kv_dim, 0);
         tensor_expect_layout(l->attn_gate, attn_type,
                              2, DS4_N_EMBD, n_head, 0);
-        tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32,
+        tensor_expect_layout(l->attn_q_norm, norm_type,
                              1, DS4_N_HEAD_DIM, 0, 0);
-        tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32,
+        tensor_expect_layout(l->attn_k_norm, norm_type,
                              1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_output, attn_type,
                              2, q_dim, DS4_N_EMBD, 0);
-        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32,
+        tensor_expect_layout(l->ffn_norm, norm_type,
                              1, DS4_N_EMBD, 0, 0);
 
         if (il < DS4_N_LEADING_DENSE) {
             tensor_expect_layout(l->ffn_gate,
-                                 signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
+                                 signal_q8 ? DS4_TENSOR_Q8_0 :
+                                 nvfp4_layout ? dense_type :
+                                                DS4_TENSOR_Q4_K,
                                  2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
             tensor_expect_layout(l->ffn_up,
-                                 signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
+                                 signal_q8 ? DS4_TENSOR_Q8_0 :
+                                 nvfp4_layout ? dense_type :
+                                                DS4_TENSOR_Q4_K,
                                  2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
             tensor_expect_layout(l->ffn_down,
-                                 signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q6_K,
+                                 signal_q8 ? DS4_TENSOR_Q8_0 :
+                                 nvfp4_layout ? dense_type :
+                                                DS4_TENSOR_Q6_K,
                                  2, DS4_N_FF_DENSE, DS4_N_EMBD, 0);
             continue;
         }
 
-        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32,
+        tensor_expect_layout(l->ffn_gate_inp,
+                             nvfp4_layout ? dense_type :
+                                            DS4_TENSOR_F32,
                              2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32,
                              1, DS4_N_EXPERT, 0, 0);
-        /* Mixed files may spend more bits on selected layers, but all three
-         * routed projections within one layer must use a coherent layout. */
         const uint32_t layer_routed_type = l->ffn_gate_exps->type;
-        if (layer_routed_type != DS4_TENSOR_Q4_K &&
-            layer_routed_type != DS4_TENSOR_Q3_K &&
-            layer_routed_type != DS4_TENSOR_Q2_K) {
-            fprintf(stderr,
-                    "ds4: Laguna routed experts for layer %u have unsupported type %s\n",
+        if (nvfp4_layout) {
+            tensor_expect_layout(
+                l->ffn_gate_exps, DS4_TENSOR_NVFP4,
+                3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            tensor_expect_layout(
+                l->ffn_up_exps, DS4_TENSOR_NVFP4,
+                3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            tensor_expect_layout(
+                l->ffn_down_exps, DS4_TENSOR_NVFP4,
+                3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+            tensor_expect_layout(
+                l->ffn_gate_exps_scale, DS4_TENSOR_F32,
+                1, DS4_N_EXPERT, 0, 0);
+            tensor_expect_layout(
+                l->ffn_up_exps_scale, DS4_TENSOR_F32,
+                1, DS4_N_EXPERT, 0, 0);
+            tensor_expect_layout(
+                l->ffn_down_exps_scale, DS4_TENSOR_F32,
+                1, DS4_N_EXPERT, 0, 0);
+        } else {
+            /*
+             * Mixed files may spend more bits on selected layers, but all
+             * three routed projections within one layer must be coherent.
+             */
+            if (layer_routed_type != DS4_TENSOR_Q4_K &&
+                layer_routed_type != DS4_TENSOR_Q3_K &&
+                layer_routed_type != DS4_TENSOR_Q2_K) {
+                fprintf(
+                    stderr,
+                    "ds4: Laguna routed experts for layer %u have "
+                    "unsupported type %s\n",
                     il, tensor_type_name(layer_routed_type));
-            exit(1);
-        }
-        tensor_expect_layout(l->ffn_gate_exps, layer_routed_type,
-                             3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_layout(l->ffn_up_exps, layer_routed_type,
-                             3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        const bool down_supported =
-            l->ffn_down_exps->type == layer_routed_type ||
-            (layer_routed_type == DS4_TENSOR_Q4_K &&
-             !signal_q8 &&
-             l->ffn_down_exps->type == DS4_TENSOR_Q6_K);
-        if (!down_supported) {
-            fprintf(stderr,
-                    "ds4: Laguna routed down tensor for layer %u has type %s, "
-                    "incompatible with %s gate/up experts\n",
+                exit(1);
+            }
+            tensor_expect_layout(
+                l->ffn_gate_exps, layer_routed_type,
+                3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            tensor_expect_layout(
+                l->ffn_up_exps, layer_routed_type,
+                3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            const bool down_supported =
+                l->ffn_down_exps->type == layer_routed_type ||
+                (layer_routed_type == DS4_TENSOR_Q4_K &&
+                 !signal_q8 &&
+                 l->ffn_down_exps->type == DS4_TENSOR_Q6_K);
+            if (!down_supported) {
+                fprintf(
+                    stderr,
+                    "ds4: Laguna routed down tensor for layer %u has "
+                    "type %s, incompatible with %s gate/up experts\n",
                     il,
                     tensor_type_name(l->ffn_down_exps->type),
                     tensor_type_name(layer_routed_type));
-            exit(1);
+                exit(1);
+            }
+            tensor_expect_layout(
+                l->ffn_down_exps, l->ffn_down_exps->type,
+                3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
         }
-        tensor_expect_layout(l->ffn_down_exps, l->ffn_down_exps->type,
-                             3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
         tensor_expect_layout(l->ffn_gate_shexp,
-                             signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
+                             signal_q8 ? DS4_TENSOR_Q8_0 :
+                             nvfp4_layout ? dense_type :
+                                            DS4_TENSOR_Q4_K,
                              2, DS4_N_EMBD, DS4_N_FF_SHARED, 0);
         tensor_expect_layout(l->ffn_up_shexp,
-                             signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K,
+                             signal_q8 ? DS4_TENSOR_Q8_0 :
+                             nvfp4_layout ? dense_type :
+                                            DS4_TENSOR_Q4_K,
                              2, DS4_N_EMBD, DS4_N_FF_SHARED, 0);
         const uint32_t shared_down_type =
-            signal_q8 ? DS4_TENSOR_Q8_0 : l->ffn_down_shexp->type;
-        if (!signal_q8 &&
+            signal_q8 ? DS4_TENSOR_Q8_0 :
+            nvfp4_layout ? dense_type :
+                           l->ffn_down_shexp->type;
+        if (!signal_q8 && !nvfp4_layout &&
             shared_down_type != DS4_TENSOR_Q4_K &&
             shared_down_type != DS4_TENSOR_Q6_K) {
             fprintf(stderr,
@@ -4998,6 +6019,14 @@ static void config_validate_laguna_model(const ds4_model *m) {
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
     memset(g_ds4_head_counts, 0, sizeof(g_ds4_head_counts));
 
+    if (m->native_safetensors) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g_ds4_head_counts[il] =
+                (il % 4u) == 0u ? 48u : 72u;
+        }
+        return;
+    }
+
     const uint32_t n_layer = required_u32(m, "laguna.block_count");
     const uint64_t n_ctx = required_u64_compat(m, "laguna.context_length");
     const uint32_t n_embd = required_u32(m, "laguna.embedding_length");
@@ -5100,6 +6129,10 @@ static void config_validate_laguna_model(const ds4_model *m) {
 }
 
 static void config_validate_model(const ds4_model *m) {
+    if (m->native_safetensors) {
+        config_validate_laguna_model(m);
+        return;
+    }
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch) && ds4_streq(arch, "glm-dsa")) {
         config_validate_glm_dsa_model(m);
@@ -5170,6 +6203,12 @@ static void weights_bind_laguna_layer(ds4_layer_weights *l, const ds4_model *m, 
     l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
     l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
     l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_gate_exps_scale =
+        tensor_by_namef(m, "blk.%u.ffn_gate_exps.scale", il);
+    l->ffn_up_exps_scale =
+        tensor_by_namef(m, "blk.%u.ffn_up_exps.scale", il);
+    l->ffn_down_exps_scale =
+        tensor_by_namef(m, "blk.%u.ffn_down_exps.scale", il);
     l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
     l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
     l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
@@ -5937,6 +6976,7 @@ static void dflash_weights_validate_layout(const ds4_dflash_weights *w) {
         (uint64_t)DS4_SHAPE_LAGUNA_S21.n_head_kv *
         DS4_SHAPE_LAGUNA_S21.n_head_dim;
     const uint32_t matrix_type = w->fc->type;
+    const uint32_t norm_type = w->aux_norm->type;
 
     if (matrix_type != DS4_TENSOR_BF16 &&
         !tensor_type_is_dense_quant(matrix_type)) {
@@ -5945,22 +6985,29 @@ static void dflash_weights_validate_layout(const ds4_dflash_weights *w) {
                 tensor_type_name(matrix_type));
         exit(1);
     }
+    if (norm_type != DS4_TENSOR_F32 &&
+        norm_type != DS4_TENSOR_BF16) {
+        fprintf(stderr,
+                "ds4: DFlash norms have unsupported type %s\n",
+                tensor_type_name(norm_type));
+        exit(1);
+    }
 
-    tensor_expect_layout(w->aux_norm, DS4_TENSOR_F32, 2,
+    tensor_expect_layout(w->aux_norm, norm_type, 2,
                          DS4_SHAPE_LAGUNA_S21.n_embd,
                          DS4_DFLASH_N_AUX, 0);
     tensor_expect_layout(w->fc, matrix_type, 2,
                          (uint64_t)DS4_DFLASH_N_AUX *
                              DS4_SHAPE_LAGUNA_S21.n_embd,
                          DS4_SHAPE_LAGUNA_S21.n_embd, 0);
-    tensor_expect_layout(w->encoder_output_norm, DS4_TENSOR_F32, 1,
+    tensor_expect_layout(w->encoder_output_norm, norm_type, 1,
                          DS4_SHAPE_LAGUNA_S21.n_embd, 0, 0);
-    tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1,
+    tensor_expect_layout(w->output_norm, norm_type, 1,
                          DS4_SHAPE_LAGUNA_S21.n_embd, 0, 0);
 
     for (uint32_t il = 0; il < DS4_DFLASH_N_LAYER; il++) {
         const ds4_dflash_layer_weights *l = &w->layer[il];
-        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1,
+        tensor_expect_layout(l->attn_norm, norm_type, 1,
                              DS4_SHAPE_LAGUNA_S21.n_embd, 0, 0);
         tensor_expect_layout(l->attn_q, matrix_type, 2,
                              DS4_SHAPE_LAGUNA_S21.n_embd, q_dim, 0);
@@ -5971,13 +7018,13 @@ static void dflash_weights_validate_layout(const ds4_dflash_weights *w) {
         tensor_expect_layout(l->attn_gate, matrix_type, 2,
                              DS4_SHAPE_LAGUNA_S21.n_embd,
                              DS4_SHAPE_LAGUNA_S21.n_head, 0);
-        tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1,
+        tensor_expect_layout(l->attn_q_norm, norm_type, 1,
                              DS4_SHAPE_LAGUNA_S21.n_head_dim, 0, 0);
-        tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1,
+        tensor_expect_layout(l->attn_k_norm, norm_type, 1,
                              DS4_SHAPE_LAGUNA_S21.n_head_dim, 0, 0);
         tensor_expect_layout(l->attn_output, matrix_type, 2,
                              q_dim, DS4_SHAPE_LAGUNA_S21.n_embd, 0);
-        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1,
+        tensor_expect_layout(l->ffn_norm, norm_type, 1,
                              DS4_SHAPE_LAGUNA_S21.n_embd, 0, 0);
         tensor_expect_layout(l->ffn_gate, matrix_type, 2,
                              DS4_SHAPE_LAGUNA_S21.n_embd,
@@ -6022,6 +7069,18 @@ static void dflash_weights_bind(ds4_dflash_weights *w,
         l->ffn_up = required_tensorf(m, "blk.%u.ffn_up.weight", il);
         l->ffn_down = required_tensorf(
             m, "blk.%u.ffn_down.weight", il);
+    }
+
+    if (m->native_dflash) {
+        static const uint32_t target_layers[DS4_DFLASH_N_AUX] = {
+            2u, 11u, 20u, 30u, 39u, 48u,
+        };
+        memcpy(
+            w->target_layers, target_layers, sizeof(target_layers));
+        w->block_size = DS4_DFLASH_BLOCK_SIZE;
+        w->mask_token_id = DS4_DFLASH_MASK_TOKEN;
+        dflash_weights_validate_layout(w);
+        return;
     }
 
     config_expect_u32("DFlash block_count",
@@ -6087,7 +7146,9 @@ static void dflash_weights_bind(ds4_dflash_weights *w,
         ds4_die("DFlash tokenizer.ggml.mask_token_id is missing");
     }
     w->mask_token_id = (uint32_t)mask_token;
-    config_expect_u32("DFlash mask token", w->mask_token_id, 12);
+    config_expect_u32(
+        "DFlash mask token", w->mask_token_id,
+        DS4_DFLASH_MASK_TOKEN);
 
     static const char *const target_keys[] = {
         "dflash.target_layers",
@@ -6541,6 +7602,9 @@ struct ds4_vocab {
     int dsml_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
+    bool native_owned_strings;
+    char **owned_merges;
+    uint64_t n_owned_merges;
 };
 
 /* Engine-side tensor-parallel state.  The transport context is owned by the
@@ -7441,8 +8505,217 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
 
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 
+static char *native_read_text_file(
+        const char *dir, const char *name, uint64_t *len_out) {
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/%s", dir, name) >=
+        (int)sizeof(path)) {
+        ds4_die("native tokenizer path is too long");
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) ds4_die_errno("cannot open native tokenizer", path);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 ||
+        (uint64_t)st.st_size >= SIZE_MAX) {
+        ds4_die_errno("cannot stat native tokenizer", path);
+    }
+    char *text = xmalloc((size_t)st.st_size + 1u);
+    uint64_t done = 0;
+    while (done < (uint64_t)st.st_size) {
+        ssize_t n = read(
+            fd, text + done, (size_t)st.st_size - (size_t)done);
+        if (n <= 0) {
+            ds4_die_errno("cannot read native tokenizer", path);
+        }
+        done += (uint64_t)n;
+    }
+    close(fd);
+    text[done] = '\0';
+    if (len_out) *len_out = done;
+    return text;
+}
+
+static const char *native_json_find_member(
+        const char *text, const char *member) {
+    char needle[96];
+    if (snprintf(needle, sizeof(needle), "\"%s\"", member) >=
+        (int)sizeof(needle)) {
+        return NULL;
+    }
+    const char *p = strstr(text, needle);
+    if (!p) return NULL;
+    p += strlen(needle);
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p++ != ':') return NULL;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return p;
+}
+
+static void vocab_load_native(
+        ds4_vocab *vocab, const ds4_model *model) {
+    uint64_t json_len = 0;
+    char *json = native_read_text_file(
+        model->native_dir, "tokenizer.json", &json_len);
+    const char *vocab_pos = native_json_find_member(json, "vocab");
+    const char *merges_pos = native_json_find_member(json, "merges");
+    if (!vocab_pos || !merges_pos) {
+        free(json);
+        ds4_die(
+            "native tokenizer.json is missing BPE vocab or merges");
+    }
+
+    vocab->n_vocab = (int)DS4_N_VOCAB;
+    vocab->token = xcalloc(
+        (size_t)vocab->n_vocab, sizeof(vocab->token[0]));
+    table_init(&vocab->token_to_id, DS4_N_VOCAB);
+    ds4_json_cursor j = {
+        .p = vocab_pos,
+        .end = json + json_len,
+    };
+    if (!json_take(&j, '{')) {
+        ds4_die("invalid native tokenizer vocab");
+    }
+    uint64_t loaded = 0;
+    for (;;) {
+        json_skip_ws(&j);
+        if (j.p >= j.end) {
+            ds4_die("truncated native tokenizer vocab");
+        }
+        if (*j.p == '}') {
+            j.p++;
+            break;
+        }
+        char *token = json_string_dup(&j);
+        uint64_t id = 0;
+        if (!token || !json_take(&j, ':') || !json_u64(&j, &id) ||
+            id >= (uint64_t)vocab->n_vocab ||
+            vocab->token[id].ptr) {
+            free(token);
+            ds4_die("invalid native tokenizer vocab entry");
+        }
+        vocab->token[id].ptr = token;
+        vocab->token[id].len = strlen(token);
+        table_put(
+            &vocab->token_to_id, vocab->token[id], (int)id);
+        loaded++;
+        json_skip_ws(&j);
+        if (j.p < j.end && *j.p == ',') {
+            j.p++;
+            continue;
+        }
+        if (j.p >= j.end || *j.p != '}') {
+            ds4_die("invalid native tokenizer vocab object");
+        }
+    }
+    if (loaded != DS4_N_VOCAB) {
+        ds4_die(
+            "native tokenizer vocab size does not match Laguna");
+    }
+
+    j.p = merges_pos;
+    if (!json_take(&j, '[')) {
+        ds4_die("invalid native tokenizer merges");
+    }
+    uint64_t merge_cap = 131072u;
+    vocab->owned_merges = xcalloc(
+        (size_t)merge_cap, sizeof(vocab->owned_merges[0]));
+    table_init(&vocab->merge_rank, merge_cap);
+    for (;;) {
+        json_skip_ws(&j);
+        if (j.p >= j.end) {
+            ds4_die("truncated native tokenizer merges");
+        }
+        if (*j.p == ']') {
+            j.p++;
+            break;
+        }
+        if (!json_take(&j, '[')) {
+            ds4_die("invalid native tokenizer merge entry");
+        }
+        char *left = json_string_dup(&j);
+        if (!left || !json_take(&j, ',')) {
+            free(left);
+            ds4_die("invalid native tokenizer merge entry");
+        }
+        char *right = json_string_dup(&j);
+        if (!right || !json_take(&j, ']')) {
+            free(left);
+            free(right);
+            ds4_die("invalid native tokenizer merge entry");
+        }
+        const size_t left_len = strlen(left);
+        const size_t right_len = strlen(right);
+        if (left_len > SIZE_MAX - right_len - 2u) {
+            ds4_die("native tokenizer merge is too long");
+        }
+        char *merge = xmalloc(left_len + 1u + right_len + 1u);
+        memcpy(merge, left, left_len);
+        merge[left_len] = ' ';
+        memcpy(merge + left_len + 1u, right, right_len + 1u);
+        free(left);
+        free(right);
+        if (vocab->n_owned_merges == merge_cap) {
+            if (merge_cap > SIZE_MAX / 2u /
+                    sizeof(vocab->owned_merges[0])) {
+                ds4_die("native tokenizer merge table is too large");
+            }
+            merge_cap *= 2u;
+            vocab->owned_merges = xrealloc(
+                vocab->owned_merges,
+                (size_t)merge_cap *
+                    sizeof(vocab->owned_merges[0]));
+        }
+        vocab->owned_merges[vocab->n_owned_merges] = merge;
+        ds4_str key = {
+            .ptr = merge,
+            .len = strlen(merge),
+        };
+        table_put(
+            &vocab->merge_rank, key,
+            (int)vocab->n_owned_merges);
+        vocab->n_owned_merges++;
+        json_skip_ws(&j);
+        if (j.p < j.end && *j.p == ',') {
+            j.p++;
+            continue;
+        }
+        if (j.p >= j.end || *j.p != ']') {
+            ds4_die("invalid native tokenizer merge array");
+        }
+    }
+    free(json);
+
+    vocab->native_owned_strings = true;
+    vocab->bos_id = 2;
+    vocab->eos_id = 2;
+    vocab->eot_id = vocab_lookup(vocab, "</assistant>");
+    vocab->system_id = -1;
+    vocab->user_id = -1;
+    vocab->assistant_id = vocab_lookup(vocab, "<assistant>");
+    vocab->observation_id = -1;
+    vocab->sop_id = -1;
+    vocab->think_start_id = vocab_lookup(vocab, "<think>");
+    vocab->think_end_id = vocab_lookup(vocab, "</think>");
+    vocab->tool_call_start_id =
+        vocab_lookup(vocab, "<tool_call>");
+    vocab->tool_call_end_id =
+        vocab_lookup(vocab, "</tool_call>");
+    vocab->tool_response_start_id = -1;
+    vocab->tool_response_end_id = -1;
+    vocab->arg_key_start_id = -1;
+    vocab->arg_key_end_id = -1;
+    vocab->arg_value_start_id = -1;
+    vocab->arg_value_end_id = -1;
+    vocab->dsml_id = -1;
+}
+
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
+
+    if (model->native_safetensors) {
+        vocab_load_native(vocab, model);
+        return;
+    }
 
     ds4_array_ref tokens;
     ds4_array_ref merges;
@@ -7550,6 +8823,15 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
 }
 
 static void vocab_free(ds4_vocab *vocab) {
+    if (vocab->native_owned_strings) {
+        for (int i = 0; i < vocab->n_vocab; i++) {
+            free((void *)vocab->token[i].ptr);
+        }
+        for (uint64_t i = 0; i < vocab->n_owned_merges; i++) {
+            free(vocab->owned_merges[i]);
+        }
+    }
+    free(vocab->owned_merges);
     free(vocab->token);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
@@ -18192,12 +19474,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 0;
         }
         if (e->backend != DS4_BACKEND_METAL &&
+            !e->model.native_safetensors &&
             (!e->weights.layer[0].attn_q ||
              e->weights.layer[0].attn_q->type != DS4_TENSOR_Q8_0)) {
             fprintf(stderr,
                     "ds4: %s Laguna inference requires the current Q8_0 "
-                    "signal-weight layout; the legacy F16/Q4_K/Q6_K recipe "
-                    "is Metal-only\n",
+                    "signal-weight layout or the native NVFP4 checkpoint; "
+                    "the legacy F16/Q4_K/Q6_K recipe is Metal-only\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
@@ -18397,9 +19680,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
     if (opt->inspect_only) {
-        if (opt->mtp_path && opt->mtp_path[0] &&
+        const char *inspect_support_path =
+            (opt->dflash_path && opt->dflash_path[0]) ?
+                opt->dflash_path : opt->mtp_path;
+        if (inspect_support_path && inspect_support_path[0] &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-            model_open(&e->mtp_model, opt->mtp_path, false, false);
+            model_open(
+                &e->mtp_model, inspect_support_path, false, false);
             ds4_dspark_summary dspark = {0};
             e->support_kind =
                 support_model_detect(&e->mtp_model, &e->support_stages, &dspark);
@@ -18521,7 +19808,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 return 1;
             }
             dflash_weights_bind(&e->dflash_weights, &e->mtp_model);
-            if (e->dflash_weights.fc->type == DS4_TENSOR_BF16) {
+            if (opt->dflash_draft_tokens <= 0 &&
+                e->mtp_model.native_dflash) {
+                e->dflash_draft_tokens =
+                    DS4_DFLASH_NVFP4_DEFAULT_DRAFT;
+            }
+            if (e->dflash_weights.fc->type == DS4_TENSOR_BF16 &&
+                !e->mtp_model.native_dflash) {
                 e->dflash_f16_map = dflash_prepare_f16_map(&e->mtp_model);
                 if (!e->dflash_f16_map) {
                     ds4_engine_close(e);
@@ -18946,7 +20239,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const void *support_model_map =
             (e->dflash_ready && e->dflash_f16_map) ?
                 e->dflash_f16_map : e->mtp_model.map;
+        /*
+         * CUDA has one primary model mapping. Replacing it with the support
+         * checkpoint unregisters the target mapping and releases its prepared
+         * ranges/caches. CUDA support launchers resolve auxiliary weights via
+         * the per-map range/FD cache, so keep the target as the primary map.
+         * Metal can register the support mapping independently.
+         */
         if (support_model_runtime_ready &&
+            e->backend != DS4_BACKEND_CUDA &&
             !ds4_gpu_set_model_map_range(support_model_map,
                                            e->mtp_model.size,
                                            e->mtp_model.tensor_data_pos,
@@ -18993,7 +20294,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (void)ds4_gpu_set_model_fd_for_map(
                 e->dflash_ready ? -1 : e->mtp_model.fd,
                 support_model_map);
-            if (!e->dflash_ready &&
+            /*
+             * Converted GGUF DFlash runs from an anonymous F16 shadow whose
+             * layout is described by mtp_model but whose mapping is different,
+             * so it cannot use this descriptor-driven preload. Native DFlash
+             * stays in its mapped BF16 safetensors storage and should receive
+             * the same eager physical-span preparation as every other runtime
+             * support model.
+             */
+            if ((!e->dflash_ready || !e->dflash_f16_map) &&
                 !accelerator_cache_model_tensors(e->backend, &e->mtp_model,
                                                   NULL, NULL, 0)) {
                 fprintf(stderr, "ds4: %s failed to prepare optional support model cache\n",
@@ -27468,6 +28777,12 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
 }
 
 #ifndef DS4_NO_GPU
+static bool ds4_dflash_adaptive_enabled(void) {
+    const char *env = getenv("DS4_DFLASH_ADAPTIVE");
+    return !env || !env[0] ||
+           (strcmp(env, "0") != 0 && strcasecmp(env, "false") != 0);
+}
+
 static int ds4_session_eval_dflash_speculative_argmax(
         ds4_session *s,
         int          first_token,
@@ -27478,6 +28793,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
         char        *err,
         size_t       errlen) {
     ds4_engine *e = s->engine;
+    const bool adaptive = ds4_dflash_adaptive_enabled();
     if (!ds4_session_dflash_enabled(s) || !s->dflash_synced ||
         e->dflash_draft_tokens <= 0 || first_token == eos_token ||
         max_tokens <= 1 || accepted_cap <= 1) {
@@ -27513,7 +28829,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
         accepted[0] = first_token;
         return 1;
     }
-    if (s->dflash_cycles_since_baseline >= 64u) {
+    if (adaptive && s->dflash_cycles_since_baseline >= 64u) {
         /* Long memory-bandwidth-bound runs can settle at a different clock
          * than their first few tokens. Periodically spend one ordinary target
          * token to refresh the break-even estimate under current conditions. */
@@ -27533,7 +28849,8 @@ static int ds4_session_eval_dflash_speculative_argmax(
         requested_draft = DS4_DFLASH_BLOCK_SIZE - 1u;
     }
     if (s->dflash_active_draft == 0u) {
-        s->dflash_active_draft = requested_draft < 3u ? requested_draft : 3u;
+        s->dflash_active_draft = adaptive && requested_draft > 3u ?
+            3u : requested_draft;
     }
     uint32_t n_draft = requested_draft;
     if (n_draft > s->dflash_active_draft) {
@@ -27784,7 +29101,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
         cumulative_tokens != 0u ?
         (s->dflash_draft_ms + s->dflash_verify_ms) /
             (double)cumulative_tokens : 0.0;
-    if (!s->dflash_guard_decided &&
+    if (adaptive && !s->dflash_guard_decided &&
         s->dflash_window_cycles >= 5u &&
         s->dflash_window_tokens != 0u) {
         const double spec_ms_per_token =
@@ -27888,7 +29205,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
         s->dflash_window_tokens = 0;
         s->dflash_window_cycles = 0;
         s->dflash_stage_full_accepts = 0;
-    } else if (s->dflash_guard_decided &&
+    } else if (adaptive && s->dflash_guard_decided &&
                s->dflash_window_cycles >= 8u &&
                s->dflash_window_tokens != 0u) {
         const double spec_ms_per_token =
