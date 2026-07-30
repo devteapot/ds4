@@ -127,11 +127,14 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *dflash_path;
     ds4_backend backend;
     int n_threads;
     int context_size;
     uint32_t prefill_chunk;
     int mtp_draft_tokens;
+    int dflash_draft_tokens;
+    float dflash_p_min;
     float mtp_margin;
     float dspark_confidence_threshold;
     const char *directional_steering_file;
@@ -150,6 +153,7 @@ typedef struct {
     bool glm_mtp_timing;
     bool dspark;
     bool dspark_strict;
+    bool dflash_p_min_set;
     bool dspark_confidence_threshold_set;
     bool cuda_tensor_parallel;
     bool ssd_streaming;
@@ -247,6 +251,10 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
+bool ds4_engine_is_laguna(ds4_engine *e);
+const char *ds4_engine_default_system_prompt(ds4_engine *e);
+void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
+                                  int *top_k, float *top_p, float *min_p);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
@@ -284,7 +292,6 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
-bool ds4_engine_is_glm_dsa(ds4_engine *e);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
@@ -307,6 +314,7 @@ void ds4_encode_chat_prompt(
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
+void ds4_chat_append_assistant_end(ds4_engine *e, ds4_tokens *tokens);
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
@@ -338,6 +346,10 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * safe boundaries where the live checkpoint is either unchanged or represents a
  * valid token prefix, and returns DS4_SESSION_SYNC_INTERRUPTED when it stops. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
+/* Enable optional speculative support-model state for the next sync/decode
+ * sequence. Frontends disable it for sampling modes that cannot use a greedy
+ * verifier, avoiding support-model work on every ordinary decode token. */
+void ds4_session_set_speculative_enabled(ds4_session *s, bool enabled);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */

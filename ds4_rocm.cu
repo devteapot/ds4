@@ -70,6 +70,13 @@ typedef struct {
 } cuda_block_q2_K;
 
 typedef struct {
+    uint8_t hmask[CUDA_QK_K / 8];
+    uint8_t qs[CUDA_QK_K / 4];
+    uint8_t scales[12];
+    uint16_t d;
+} cuda_block_q3_K;
+
+typedef struct {
     uint16_t d;
     uint16_t dmin;
     uint8_t scales[12];
@@ -87,6 +94,8 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+static_assert(sizeof(cuda_block_q3_K) == 110, "Q3_K block layout mismatch");
+
 #include "ds4_iq2_tables_cuda.inc"
 
 #include "rocm/ds4_rocm_runtime.cuh"
@@ -98,6 +107,10 @@ typedef struct {
 #include "rocm/ds4_rocm_norm_rope.cuh"
 
 #include "models/deepseek/rocm/fp8_kv.cuh"
+
+#include "models/laguna/gpu/laguna.cuh"
+
+#include "models/laguna/gpu/dflash.cuh"
 
 #include "models/deepseek/rocm/attention.cuh"
 

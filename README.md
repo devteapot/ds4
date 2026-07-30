@@ -3,10 +3,11 @@
 </p>
 
 **DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**. It also supports **GLM 5.2** and, on very high-memory
-machines, **DeepSeek V4 PRO**. It is self-contained and deliberately narrow,
-not a general GGUF runner. Model loading, prompt rendering, tool calls, KV
-state, the HTTP server, and the coding agent are built and tested together.
+**DeepSeek V4 Flash**. It also supports **GLM 5.2**, **Laguna S 2.1**, and, on
+very high-memory machines, **DeepSeek V4 PRO**. It is self-contained and
+deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
+tool calls, KV state, the HTTP server, and the coding agent are built and tested
+together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
 
 Supported backends:
@@ -88,24 +89,30 @@ next sections.
 
 ## Model Weights
 
-This implementation only works with the DeepSeek V4 and GLM 5.2 GGUFs listed
-below. It is not a general GGUF loader, and arbitrary GGUF files will not have
-the tensor layout, quantization mix, metadata, or optional MTP state expected by
-the engine. The 2 bit quantizations provided here are verified to be actually
-high quality: they behave well, work under coding agents, call tools in a reliable way.
+This implementation only works with the DeepSeek V4, GLM 5.2, and Laguna S 2.1
+models listed below. Most are GGUFs; CUDA also supports Poolside's pinned,
+official Laguna S 2.1 NVFP4 safetensors checkpoint directly. It is not a
+general GGUF or safetensors loader: arbitrary models will not have the tensor
+layout, quantization mix, metadata, or optional speculative-decoding state
+expected by the engine. The 2 bit DeepSeek and GLM quantizations provided here
+are verified to be actually high quality: they behave well, work under coding
+agents, and call tools reliably.
 
 The 2 bit quants use a very asymmetrical quantization: only the routed MoE
 experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
-Download one main model. **Prefer the imatrix versions.**
+Download one main model. **For GGUF, prefer the imatrix versions.**
 
 ```sh
 ./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
 ./download_model.sh q2-q4-imatrix  # 96/128 GB RAM machines, q2 with last 6 layers q4
 ./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
+./download_model.sh laguna-q4  # >= 96 GB unified memory, official Poolside Q4_K_M
+./download_model.sh laguna-q2-q3  # 64 GB class, mixed routed Q2_K/Q3_K
+./download_model.sh laguna-nvfp4  # >= 96 GB, official native CUDA NVFP4
 ```
 
 For the full PRO Q4 distributed run, download one half on each machine:
@@ -115,11 +122,11 @@ For the full PRO Q4 distributed run, download one half on each machine:
 ./download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
 ```
 
-The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
-stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected main model.
-The `pro-q4-layers00-30`, `pro-q4-layers31-output`, and `pro-q4-split` targets
-download distributed PRO Q4 pieces and do not update `./ds4flash.gguf`.
+The script stores downloads under `./gguf/`. Smaller DeepSeek files resume with
+`curl -C -`; large files and pinned native-checkpoint directories use the
+official Hugging Face downloader. Single-file main-model targets update
+`./ds4flash.gguf`. The distributed PRO targets and native Laguna NVFP4
+directory targets do not.
 Authentication is optional for public downloads, but `--token TOKEN`,
 `HF_TOKEN`, or the local Hugging Face token cache are used when present.
 
@@ -169,6 +176,170 @@ and timing counters:
 GLM inference uses the Metal, CUDA, or ROCm graph backend. Directional steering,
 `--power` below 100, an explicit `--prefill-chunk`, and the external `--mtp`
 file are not supported for GLM yet.
+
+Laguna S 2.1 support targets Poolside's official imatrix-quantized Q4_K_M GGUF.
+The current 63.56 GiB recipe uses Q4_K routed experts and Q8_0 signal-path
+weights. It runs with full residency on Metal, CUDA, or ROCm. DwarfStar also accepts
+Poolside's earlier 70.01 GiB recipe with F16 attention and mixed Q4_K/Q6_K
+experts on Metal. These files fit comfortably on a 96 or 128 GiB machine.
+
+For lower-memory systems, `laguna-q2-q3` downloads a 44.95 GiB mixed quant. It
+retains the official file's dense weights, uses Q2_K routed experts in layers
+1 through 20, and Q3_K routed experts in layers 21 through 47. This is the
+smaller Laguna layout and is intended for full residency on 64 GB class
+systems. The current Q8_0-signal Q4_K_M and mixed Q2_K/Q3_K layouts run on
+Metal, CUDA, and ROCm. Linux validation covers NVIDIA GB10 in DGX Spark and the
+Ryzen AI Max+ 395 / Radeon 8060S (`gfx1151`) in Strix Halo.
+
+CLI, agent, and server use Laguna's native chat, interleaved reasoning, and
+tagged tool-call formats:
+
+```sh
+./download_model.sh laguna-q4
+./ds4 -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768 -p "Explain this repository"
+./ds4-agent -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
+./ds4-server -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
+```
+
+Poolside's standalone DFlash model can accelerate greedy Laguna decoding on
+Metal, CUDA, and ROCm without changing the generated tokens. The download target uses
+a 1.04 GiB Q8_0 quant of Poolside's support model: it drafts faster and uses
+half the memory of BF16, while the full Laguna model still verifies every
+accepted token. Download it separately and pass it alongside any supported
+Laguna GGUF:
+
+```sh
+./download_model.sh laguna-dflash
+./ds4 -m gguf/laguna-s-2.1-Q4_K_M.gguf \
+  --dflash gguf/laguna-s-2.1-DFlash-Q8_0.gguf --temp 0
+./ds4-agent -m gguf/laguna-s-2.1-Q4_K_M.gguf \
+  --dflash gguf/laguna-s-2.1-DFlash-Q8_0.gguf
+./ds4-server -m gguf/laguna-s-2.1-Q4_K_M.gguf \
+  --dflash gguf/laguna-s-2.1-DFlash-Q8_0.gguf
+```
+
+The default explores up to 15 draft positions on CUDA and up to three on Metal
+and ROCm. It stops before
+verification when a proposal's probability is below 0.4. Use
+`--dflash-draft N` to tune the 1 through 15 range and
+`--dflash-p-min P` to tune the confidence cutoff; set the latter to `0` to
+keep a fixed verifier width. A nonzero cutoff is faster, but varying the
+verifier batch width can resolve nearly tied greedy logits differently because
+floating-point reductions are not batch-invariant. Use `0` when fixed-width
+reproducibility matters. DwarfStar automatically falls back to ordinary
+Laguna decoding when sampling is stochastic or when speculation is slower for
+the current turn. Set `DS4_DFLASH_TIMING=1` to print per-cycle draft and
+verify timings. For controlled benchmarks, `DS4_DFLASH_ADAPTIVE=0` keeps the
+requested draft depth fixed instead of running the adaptive depth guard.
+
+### Native Laguna NVFP4 on CUDA
+
+CUDA can load Poolside's official `Laguna-S-2.1-NVFP4` checkpoint directly
+from its pinned sharded safetensors directory. Routed expert weights and their
+scales stay in the checkpoint's native NVFP4 layout; there is no GGUF
+conversion, tensor translation, or repacking:
+
+```sh
+./download_model.sh laguna-nvfp4
+make cuda-spark       # GB10 / sm_121 Blackwell family target
+./ds4 --cuda -m gguf/Laguna-S-2.1-NVFP4 -c 32768 \
+  -p "Explain this repository"
+```
+
+The Spark build isolates hardware-specific code generation: the canonical
+GGUF Q4/DFlash CUDA translation unit keeps the upstream toolchain-default
+target, while the native-checkpoint translation unit alone emits
+`compute_121f`/`sm_121`. Prompt-sized routed batches use Blackwell block-scaled
+`m16n8k64` FP4 MMA directly on the checkpoint's E2M1 weights and UE4M3 scales.
+Single-token decode and the eight-row verifier produced by a seven-token
+DFlash draft deliberately use the tuned integer-dot kernel instead: the SM121
+FP4 MMA tile has eight columns, so those narrow shapes leave most of the tile
+idle. The checkpoint's routed experts are NVFP4; attention and the remaining
+dense projections are BF16, with decode projections using the tuned cuBLASLt
+path.
+
+This native path is Blackwell-only and CUDA-only. Use the Laguna GGUF models
+for pre-Blackwell CUDA, Metal, ROCm, SSD streaming, distributed inference, or
+tensor parallelism.
+
+Poolside also publishes a separate BF16 DFlash drafter trained for this NVFP4
+target. Download and load its safetensors directory directly, using the
+native seven-token default for greedy decoding:
+
+```sh
+./download_model.sh laguna-nvfp4-dflash
+./ds4 --cuda -m gguf/Laguna-S-2.1-NVFP4 \
+  --dflash gguf/Laguna-S-2.1-DFlash-NVFP4 \
+  --dflash-draft 7 --temp 0 -p "Explain this repository"
+```
+
+On the development GB10, the final warmed 16-to-2,048-token `ds4.c` protocol
+followed by 256 greedy tokens measured 18.59 token/s raw and 41.13 token/s
+with the official native drafter at fixed depth 7, a 2.21x speedup. Prefill
+was unchanged at about 1,080 token/s. Under the same protocol, current Q4_K_M
+measured 22.97 token/s raw and 22.98 token/s with its BF16 DFlash drafter;
+the `origin/laguna-s2.1` raw reference measured 22.89 token/s. The canonical
+Q4 full-row injection schedule costs about 400 ms per verifier block, so its
+speculative lane is effectively raw speed. See
+[`laguna_s21_dflash_quant_comparison_gb10.csv`](speed-bench/laguna_s21_dflash_quant_comparison_gb10.csv)
+and
+[`laguna_s21_upstream_q4_parity_repeats_gb10.csv`](speed-bench/laguna_s21_upstream_q4_parity_repeats_gb10.csv)
+for the measured rows and warmup annotation. Speculative results are
+prompt-sensitive.
+
+For Strix Halo:
+
+```sh
+./download_model.sh laguna-q2-q3
+make strix-halo
+./ds4 --rocm -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf -c 8192
+./ds4-agent --rocm -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf -c 8192
+./ds4-server --rocm -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf -c 8192
+```
+
+For DGX Spark:
+
+```sh
+./download_model.sh laguna-q2-q3
+make cuda-spark
+./ds4 --cuda -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf -c 8192
+./ds4-agent --cuda -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf -c 8192
+./ds4-server --cuda -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf -c 8192
+```
+
+On the development DGX Spark with that mixed Q2_K/Q3_K GGUF, a 4,096-token
+prefill runs at about 580 tokens/s and generation after that prompt at about
+26.7 tokens/s. Long CUDA prefills compact routed tokens by expert, dequantize
+only active expert matrices, and use variable-size FP16 tensor-core GEMMs with
+FP32 projection outputs. Decode reuses each Laguna KV-cache row across grouped
+query heads and uses denser Q2_K/Q3_K warp layouts; short prefills retain the
+quantized matvec kernels. Set `DS4_CUDA_MOE_NO_TC_PREFILL=1` to select the
+quantized long-prefill fallback. The decode optimizations can be isolated with
+`DS4_CUDA_LAGUNA_NO_GQA_DECODE=1`, `DS4_CUDA_MOE_NO_Q2_HALFWARP=1`, and
+`DS4_CUDA_MOE_NO_Q3_GROUP_DOWN=1`.
+
+On the development Strix Halo with the official Q4_K_M GGUF, a 2,048-token
+prefill runs at about 252 tokens/s and short-context generation at about 25.8
+tokens/s; after an 8,192-token prompt prefill is about 194 tokens/s and
+generation about 24.1 tokens/s. The smaller mixed Q2_K/Q3_K quant is faster
+still. Laguna currently requires full model residency; SSD streaming,
+distributed inference, and tensor parallelism are not implemented.
+
+DFlash speculative decoding works on ROCm. With a fixed verifier width
+(`--dflash-p-min 0`) it is token-exact against ordinary decoding in the
+regression corpus, but on this GPU it is only a win on highly predictable
+text. Each draft position routes to its own ten experts, so the verifier's
+expert traffic grows with the draft length while a Strix Halo decode step is
+already bandwidth-bound; break-even needs roughly 60% of draft tokens accepted.
+DwarfStar measures throughput for the first cycles of every turn and drops back
+to ordinary decoding when speculation is not paying, so leaving `--dflash`
+enabled is safe.
+
+The shipped GGUF is configured for a 262144-token context. Laguna defaults to
+temperature 0.7, top-k 20, top-p 0.95, and min-p 0.05; explicit sampling
+options always take precedence. Use `--nothink` or the
+`laguna-s-2.1-chat` server alias for direct replies, and preserve reasoning
+content between tool calls when building a client.
 
 Then build:
 

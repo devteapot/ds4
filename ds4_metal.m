@@ -43,6 +43,7 @@
 #include "metal/elementwise.inc"
 #include "metal/moe_dispatch.inc"
 #include "models/glm/metal/host/kernels.inc"
+#include "models/laguna/metal/host/kernels.inc"
 #include "models/deepseek/metal/host/moe.inc"
 #include "models/deepseek/metal/host/hc.inc"
 #include "metal/compat.inc"

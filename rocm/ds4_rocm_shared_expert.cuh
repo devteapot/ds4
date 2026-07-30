@@ -33,16 +33,15 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         !cuda_tensor_has_bytes(up, out_bytes) || !cuda_tensor_has_bytes(mid, out_bytes)) {
         return 0;
     }
-    if (in_dim == 4096u && (in_dim & 31u) == 0u &&
+    if ((in_dim & 31u) == 0u &&
         cuda_model_range_fits(model_size, gate_offset, weight_bytes) &&
-        cuda_model_range_fits(model_size, up_offset, weight_bytes) &&
-        !cuda_runtime_config()->disable_shared_gate_up_fused_w32) {
+        cuda_model_range_fits(model_size, up_offset, weight_bytes)) {
         const char *wg = cuda_model_range_ptr(model_map, gate_offset, weight_bytes, "shared_gate_q8");
         const char *wu = cuda_model_range_ptr(model_map, up_offset, weight_bytes, "shared_up_q8");
         if (!wg || !wu) return 0;
         const int store_gate_up = (g_quality_mode || cuda_runtime_config()->graph_dump) ? 1 : 0;
-        const unsigned rows_per_block = 32u;
-        shared_gate_up_swiglu_q8_0_rows_w32_kernel<<<
+        const unsigned rows_per_block = 8u;
+        shared_gate_up_swiglu_q8_0_blocklane_rows_kernel<<<
                 (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
                 rows_per_block * 32u>>>(
                 (float *)gate->ptr,
@@ -54,6 +53,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                 (uint32_t)blocks,
                 out_dim,
                 row_bytes,
+                1u,
                 store_gate_up,
                 clamp);
         return cuda_ok(cudaGetLastError(), "shared gate/up fused q8 launch");
@@ -66,6 +66,8 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
 }
 
+/* DFlash verifier shared expert: one weight sweep for a block of rows, with
+ * each row bit-identical to the single-row decode kernel. */
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -79,10 +81,45 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok,
         float                   clamp) {
-    (void)gate; (void)up; (void)mid; (void)model_map; (void)model_size;
-    (void)gate_offset; (void)up_offset; (void)in_dim; (void)out_dim;
-    (void)x; (void)n_tok; (void)clamp;
-    return 0;
+    if (!mid || !model_map || !x || in_dim == 0u || out_dim == 0u ||
+        (in_dim & 31u) != 0u || n_tok == 0u ||
+        n_tok > DS4_ROCM_VERIFY_MAX_ROWS ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        return 0;
+    }
+    const uint64_t blocks = in_dim / 32u;
+    uint64_t row_bytes = 0, weight_bytes = 0;
+    if (!cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !cuda_model_range_fits(model_size, gate_offset, weight_bytes) ||
+        !cuda_model_range_fits(model_size, up_offset, weight_bytes) ||
+        !cuda_tensor_has_bytes(x, n_tok * in_dim * sizeof(float)) ||
+        !cuda_tensor_has_bytes(mid, n_tok * out_dim * sizeof(float))) {
+        return 0;
+    }
+    const char *wg = cuda_model_range_ptr(model_map, gate_offset,
+                                          weight_bytes, "shared_gate_q8");
+    const char *wu = cuda_model_range_ptr(model_map, up_offset,
+                                          weight_bytes, "shared_up_q8");
+    if (!wg || !wu) return 0;
+    const unsigned rows_per_block = 8u;
+    shared_gate_up_swiglu_q8_0_blocklane_rows_kernel<<<
+            (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
+            rows_per_block * 32u>>>(
+            gate ? (float *)gate->ptr : NULL,
+            up ? (float *)up->ptr : NULL,
+            (float *)mid->ptr,
+            reinterpret_cast<const unsigned char *>(wg),
+            reinterpret_cast<const unsigned char *>(wu),
+            (const float *)x->ptr,
+            (uint32_t)blocks,
+            out_dim,
+            row_bytes,
+            (uint32_t)n_tok,
+            0,
+            clamp);
+    return cuda_ok(cudaGetLastError(),
+                   "shared gate/up rows exact launch");
 }
 
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(

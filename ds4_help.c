@@ -146,7 +146,8 @@ static const char *tool_summary(ds4_help_tool tool) {
 static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
-    opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+    opt(fp, c, "-m, --model PATH",
+        "GGUF file or native checkpoint directory. Default: ds4flash.gguf");
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
@@ -173,12 +174,19 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. DeepSeek auto-seeds by default; GLM demand-fills unless N is explicit.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
-    opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
+    opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO 8192; Laguna 16384; others 4096.");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
         }
-        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT ||
+            tool == DS4_HELP_SERVER || tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--dflash FILE", "Laguna DFlash support model (GGUF or native checkpoint directory) for greedy speculative decoding.");
+            opt(fp, c, "--dflash-draft N", "Maximum adaptive DFlash draft positions, 1..15. Defaults: native NVFP4 7, other CUDA 15, Metal/ROCm 3");
+            opt(fp, c, "--dflash-p-min P", "Stop before proposals below probability P, 0..1. Default: 0.4; 0 keeps fixed verifier width");
+        }
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT ||
+            tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
@@ -200,10 +208,11 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     title(fp, c, "Prompt And Sampling");
     opt(fp, c, "-n, --tokens N", "Maximum generated tokens.");
     opt(fp, c, "--temp F", "Sampling temperature. 0 is greedy/deterministic.");
+    opt(fp, c, "--top-k N", "Sample only from the N highest-scoring tokens. 0 disables.");
     opt(fp, c, "--top-p F", "Nucleus sampling probability.");
     opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
     opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");
-    para(fp, c, "GLM CLI and agent runs default to temperature 1.0, top-p 0.95, and min-p 0 unless those options are set explicitly.");
+    para(fp, c, "GLM defaults to temperature 1.0, top-p 0.95, and min-p 0. Laguna defaults to temperature 0.7, top-k 20, top-p 0.95, and min-p 0.05. Explicit options always win.");
     opt(fp, c, "--think", "Use normal thinking mode.");
     opt(fp, c, "--think-max", "Use Think Max when context is large enough.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
@@ -333,7 +342,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
-    para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
+    para(fp, c, "Model aliases are available for DeepSeek V4, GLM-5.2, and Laguna-S-2.1; every alias serves the loaded GGUF.");
     fputc('\n', fp);
 }
 
@@ -367,6 +376,11 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--prompt-file FILE", "Raw benchmark text; token sequence is sliced at each frontier.");
     opt(fp, c, "--chat-prompt-file FILE", "Render FILE as one no-thinking chat user message.");
     opt(fp, c, "-sys, --system TEXT", "System prompt used only with --chat-prompt-file.");
+    fputc('\n', fp);
+    title(fp, c, "Benchmark Speculation");
+    opt(fp, c, "--dflash FILE", "Laguna DFlash support model (GGUF or native checkpoint directory).");
+    opt(fp, c, "--dflash-draft N", "Maximum DFlash draft positions, 1..15. Defaults: native NVFP4 7, other CUDA 15, Metal/ROCm 3.");
+    opt(fp, c, "--dflash-p-min P", "Proposal confidence cutoff, 0..1. Default: 0.4; use 0 for fixed verifier width.");
     fputc('\n', fp);
     title(fp, c, "Benchmark Sweep");
     opt(fp, c, "--ctx-start N", "First measured frontier. Default: 2048");
@@ -540,7 +554,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     else if (tool == DS4_HELP_AGENT && streq(topic, "tools")) {
         title(fp, c, "Agent Tool System");
         para(fp, c, "The agent can read, search, write, edit, run bash, and browse through Chrome-backed web tools.");
-        para(fp, c, "DeepSeek-family models emit DSML tool calls; GLM models use native <tool_call> syntax. Both are rendered live in the terminal.");
+        para(fp, c, "DeepSeek-family models emit DSML tool calls; GLM and Laguna models use native <tool_call> syntax. Both are rendered live in the terminal.");
         para(fp, c, "Edit uses exact old/new replacement; [upto] can bridge a unique head and tail for large anchored edits.");
         fputc('\n', fp);
     } else if (tool == DS4_HELP_BENCH && streq(topic, "benchmark")) print_bench_specific(fp, c);

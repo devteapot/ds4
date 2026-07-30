@@ -1,0 +1,6 @@
+implementation,target,drafter,draft_cap,runs,protocol,ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,steady_gen_tps,speedup_vs_target_raw
+origin/laguna-s2.1@448d569,Q4_K_M,none,0,3,median-warmed-16-to-2048,2048,2032,628.73,256,22.89,23.04,-
+current,Q4_K_M,none,0,3,median-warmed-16-to-2048,2048,2032,624.94,256,22.97,23.11,1.00
+current,Q4_K_M,Laguna-S-2.1-DFlash-BF16,15,3,median-warmed-16-to-2048,2048,2032,627.07,256,22.98,23.00,1.00
+current,NVFP4,none,0,1,warmed-16-to-2048,2048,2032,1080.04,256,18.59,18.69,1.00
+current,NVFP4,Laguna-S-2.1-DFlash-NVFP4,7,1,warmed-16-to-2048,2048,2032,1080.32,256,41.13,41.42,2.21

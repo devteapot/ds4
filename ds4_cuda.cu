@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
 
@@ -54,6 +55,13 @@ typedef struct {
 } cuda_block_q2_K;
 
 typedef struct {
+    uint8_t hmask[CUDA_QK_K / 8];
+    uint8_t qs[CUDA_QK_K / 4];
+    uint8_t scales[12];
+    uint16_t d;
+} cuda_block_q3_K;
+
+typedef struct {
     uint16_t d;
     uint16_t dmin;
     uint8_t scales[12];
@@ -71,8 +79,54 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+typedef struct {
+    uint8_t qs[32];
+    uint8_t d[4];
+} cuda_block_nvfp4;
+
+static_assert(sizeof(cuda_block_q3_K) == 110, "Q3_K block layout mismatch");
+static_assert(sizeof(cuda_block_nvfp4) == 36u,
+              "NVFP4 compatibility block layout mismatch");
+
 #include "ds4_gpu_mgpu.h"
 #include "ds4_iq2_tables_cuda.inc"
+
+/* ds4_cuda.cu historically does not include ds4_gpu.h. Keep the descriptor
+ * layout used by the shared graph available to the CUDA compatibility hook. */
+typedef struct {
+    const uint64_t *packed_offsets;
+    const uint64_t *scale_offsets;
+    const uint64_t *weight_global_scale_offsets;
+    const uint64_t *input_global_scale_offsets;
+    uint64_t packed_bytes;
+    uint64_t scale_bytes;
+} ds4_gpu_nvfp4_matrix_desc;
+
+typedef struct {
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_scale_offset;
+    uint64_t up_scale_offset;
+    uint64_t down_scale_offset;
+    uint32_t gate_type;
+    uint32_t up_type;
+    uint32_t down_type;
+    uint64_t gate_expert_bytes;
+    uint64_t gate_row_bytes;
+    uint64_t up_expert_bytes;
+    uint64_t up_row_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t down_row_bytes;
+    ds4_gpu_nvfp4_matrix_desc gate_nvfp4;
+    ds4_gpu_nvfp4_matrix_desc up_nvfp4;
+    ds4_gpu_nvfp4_matrix_desc down_nvfp4;
+} ds4_gpu_laguna_moe_desc;
+
+static_assert(sizeof(ds4_gpu_nvfp4_matrix_desc) == 48u,
+              "NVFP4 matrix descriptor ABI mismatch");
+static_assert(sizeof(ds4_gpu_laguna_moe_desc) == 256u,
+              "Laguna MoE descriptor ABI mismatch");
 
 typedef struct {
     ds4_gpu_attention_decode_row row[DS4_GPU_ATTENTION_DECODE_BATCH_MAX];
@@ -86,6 +140,7 @@ static const char *g_model_device_base;
 static uint64_t g_model_registered_size;
 static int g_model_registered;
 static thread_local bool g_glm_mtp_verify_mode;
+static thread_local bool g_laguna_dflash_verify_rows;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
@@ -231,6 +286,34 @@ static int cuda_q4_mma_ok(void) {
 
 static int cuda_q4_mma_tile16_shmem_ok(int which_down);
 
+static void cuda_native_nvfp4_cache_release_all(void);
+extern "C" int ds4_cuda_laguna_native_nvfp4_routed_moe_tensor(
+        ds4_gpu_tensor                *out,
+        ds4_gpu_tensor                *mid,
+        const void                    *model_map,
+        uint64_t                       model_size,
+        const ds4_gpu_laguna_moe_desc *routed,
+        uint32_t                       expert_in_dim,
+        uint32_t                       expert_mid_dim,
+        uint32_t                       out_dim,
+        const ds4_gpu_tensor          *selected,
+        const ds4_gpu_tensor          *weights,
+        uint32_t                       n_total_expert,
+        uint32_t                       n_expert,
+        const ds4_gpu_tensor          *x,
+        uint32_t                       n_tokens);
+extern "C" void
+ds4_cuda_laguna_native_nvfp4_cache_release_all(void);
+
+static int g_cuda_laguna_bf16_lt_enabled;
+static int cuda_laguna_bf16_lt_matmul(
+        float *out,
+        const __nv_bfloat16 *weights,
+        const __nv_bfloat16 *input,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        int logical_tier);
+static void cuda_laguna_bf16_lt_cleanup(void);
 
 static void routed_moe_decode_graph_destroy_one(int logical_tier);
 
@@ -239,6 +322,69 @@ static void routed_moe_decode_graph_destroy_one(int logical_tier);
 #include "models/deepseek/cuda/control.inc"
 #include "cuda/common_dispatch.inc"
 #include "models/deepseek/cuda/moe.inc"
+
+extern "C" int ds4_cuda_nvfp4_prepare_sorted_tiles16(
+        uint32_t *counts,
+        uint32_t *offsets,
+        uint32_t *cursors,
+        uint32_t *sorted_pairs,
+        uint32_t *tile_offsets,
+        uint32_t *tile_total,
+        uint32_t *tile_experts,
+        uint32_t *tile_starts,
+        const int32_t *selected,
+        uint32_t pair_count,
+        uint32_t n_total_expert) {
+    if (!counts || !offsets || !cursors || !sorted_pairs ||
+        !tile_offsets || !tile_total || !tile_experts ||
+        !tile_starts || !selected || pair_count == 0u ||
+        n_total_expert == 0u) {
+        return 0;
+    }
+    if (!cuda_ok(cudaMemsetAsync(
+                     counts, 0,
+                     (size_t)n_total_expert * sizeof(counts[0])),
+                 "Laguna native NVFP4 sorted counts clear")) {
+        return 0;
+    }
+    moe_count_sorted_pairs_kernel<<<
+        (pair_count + 255u) / 256u, 256>>>(
+            counts, selected, pair_count, n_total_expert);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Laguna native NVFP4 sorted count launch")) {
+        return 0;
+    }
+    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(
+        offsets, cursors, counts, n_total_expert);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Laguna native NVFP4 sorted prefix launch")) {
+        return 0;
+    }
+    moe_scatter_sorted_pairs_kernel<<<
+        (pair_count + 255u) / 256u, 256>>>(
+            sorted_pairs, cursors, selected,
+            pair_count, n_total_expert);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Laguna native NVFP4 sorted scatter launch")) {
+        return 0;
+    }
+    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(
+        tile_offsets, tile_total, counts, 16u,
+        n_total_expert);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Laguna native NVFP4 sorted tile-offset launch")) {
+        return 0;
+    }
+    moe_build_expert_tiles_kernel<<<
+        (n_total_expert + 255u) / 256u, 256>>>(
+            tile_experts, tile_starts, tile_offsets,
+            counts, 16u, n_total_expert);
+    return cuda_ok(cudaGetLastError(),
+                   "Laguna native NVFP4 sorted tile launch");
+}
+
 #include "models/deepseek/cuda/hc.inc"
 #include "cuda/runtime_services.inc"
 #include "models/glm/cuda/kernels.inc"
+#include "models/laguna/cuda/kernels.inc"
+#include "cuda/compat.inc"

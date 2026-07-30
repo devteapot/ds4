@@ -111,6 +111,46 @@ __global__ static void quantize_q8_0_f32_kernel(
     }
 }
 
+/* Laguna's Q/K/V/gate projections are unusually sensitive to activation
+ * quantization. Keep four independent scales inside each Q8_0 weight block:
+ * this retains the packed int8 dot-product path while reducing the range over
+ * which one activation outlier controls the quantization step. */
+__global__ static void quantize_q8_0_f32_groups8_kernel(
+        int8_t *xq,
+        float *xscale,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t blocks) {
+    const uint64_t b = blockIdx.x;
+    const uint64_t row = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    if (b >= blocks || lane >= 32u) return;
+    const float *xr = x + row * in_dim;
+    int8_t *xqr = xq + row * blocks * 32u;
+    float *xscaler = xscale + row * blocks * 4u;
+    const uint64_t i = b * 32u + lane;
+    const uint32_t group = lane >> 3u;
+    __shared__ float abs_values[32];
+    __shared__ float scales[4];
+    abs_values[lane] = i < in_dim ? fabsf(xr[i]) : 0.0f;
+    __syncthreads();
+    if ((lane & 7u) == 0u) {
+        float amax = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            amax = fmaxf(amax, abs_values[lane + j]);
+        }
+        scales[group] = amax / 127.0f;
+        xscaler[b * 4u + group] = scales[group];
+    }
+    __syncthreads();
+    const float d = scales[group];
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    int v = i < in_dim ? (int)lrintf(xr[i] * id) : 0;
+    v = v > 127 ? 127 : (v < -128 ? -128 : v);
+    xqr[b * 32u + lane] = (int8_t)v;
+}
+
 __global__ static void matmul_q8_0_preq_kernel(
         float *out,
         const unsigned char *w,
@@ -184,7 +224,9 @@ __global__ static void matmul_q8_0_preq_rows_w32_kernel(
         uint64_t blocks,
         uint32_t rows_per_block,
         int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
+    const uint64_t row =
+        (uint64_t)blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
+    const uint64_t tok = blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
     const unsigned char *wr = w + row * blocks * 34u;
@@ -194,12 +236,140 @@ __global__ static void matmul_q8_0_preq_rows_w32_kernel(
         const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
         const __half *scale_h = (const __half *)(wr + b * 34u);
         const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
-        const int8_t *xqb = xq + b * 32u;
+        const int8_t *xqb = xq + (tok * blocks + b) * 32u;
         const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+        acc += __half2float(*scale_h) * xscale[tok * blocks + b] *
+               (float)dot;
     }
     acc = warp_sum_f32(acc);
-    if (lane == 0u) out[row] = acc;
+    if (lane == 0u) out[tok * out_dim + row] = acc;
+}
+
+__device__ static float q8_0_scale_scalar(const unsigned char *blk);
+
+__global__ static void matmul_q8_0_pair_preq_groups8_warp8_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t blocks) {
+    const uint64_t row =
+        (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out0_dim && row >= out1_dim) return;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const unsigned char *wr0 =
+        row < out0_dim ? w0 + row * blocks * 34u : NULL;
+    const unsigned char *wr1 =
+        row < out1_dim ? w1 + row * blocks * 34u : NULL;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const int8_t *xqb = xq + (tok * blocks + b) * 32u;
+        const float *xs = xscale + (tok * blocks + b) * 4u;
+        if (wr0) {
+            const unsigned char *blk = wr0 + b * 34u;
+            const int8_t *qs = (const int8_t *)(blk + 2u);
+            float sum = 0.0f;
+#pragma unroll
+            for (uint32_t group = 0; group < 4u; group++) {
+                const uint32_t j = group * 8u;
+                int dot = __dp4a(load_i8x4_i32_unaligned(qs + j),
+                                 load_i8x4_i32_aligned(xqb + j), 0);
+                dot = __dp4a(load_i8x4_i32_unaligned(qs + j + 4u),
+                             load_i8x4_i32_aligned(xqb + j + 4u), dot);
+                sum += xs[group] * (float)dot;
+            }
+            acc0 += __half2float(*(const __half *)blk) * sum;
+        }
+        if (wr1) {
+            const unsigned char *blk = wr1 + b * 34u;
+            const int8_t *qs = (const int8_t *)(blk + 2u);
+            float sum = 0.0f;
+#pragma unroll
+            for (uint32_t group = 0; group < 4u; group++) {
+                const uint32_t j = group * 8u;
+                int dot = __dp4a(load_i8x4_i32_unaligned(qs + j),
+                                 load_i8x4_i32_aligned(xqb + j), 0);
+                dot = __dp4a(load_i8x4_i32_unaligned(qs + j + 4u),
+                             load_i8x4_i32_aligned(xqb + j + 4u), dot);
+                sum += xs[group] * (float)dot;
+            }
+            acc1 += __half2float(*(const __half *)blk) * sum;
+        }
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0u) {
+        if (row < out0_dim) out0[tok * out0_dim + row] = acc0;
+        if (row < out1_dim) out1[tok * out1_dim + row] = acc1;
+    }
+}
+
+__global__ static void shared_gate_up_swiglu_q8_0_blocklane_rows_kernel(
+        float *gate,
+        float *up,
+        float *mid,
+        const unsigned char *wg,
+        const unsigned char *wu,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out_dim,
+        uint64_t row_bytes,
+        uint32_t n_rows,
+        int store_gate_up,
+        float clamp) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *row_g = wg + row * row_bytes;
+    const unsigned char *row_u = wu + row * row_bytes;
+    const uint32_t in_dim = n_blocks << 5u;
+    float acc_g[DS4_ROCM_VERIFY_MAX_ROWS] = {};
+    float acc_u[DS4_ROCM_VERIFY_MAX_ROWS] = {};
+    for (uint32_t b = lane; b < n_blocks; b += 32u) {
+        const unsigned char *bg = row_g + (uint64_t)b * 34u;
+        const unsigned char *bu = row_u + (uint64_t)b * 34u;
+        const int8_t *qg = (const int8_t *)(bg + 2u);
+        const int8_t *qu = (const int8_t *)(bu + 2u);
+        const float dg = q8_0_scale_scalar(bg);
+        const float du = q8_0_scale_scalar(bu);
+        for (uint32_t t = 0; t < n_rows; t++) {
+            const float *xb = x + (uint64_t)t * in_dim + ((uint64_t)b << 5u);
+            float sum_g = 0.0f;
+            float sum_u = 0.0f;
+#pragma unroll
+            for (uint32_t k = 0; k < 32u; k++) {
+                const float xv = xb[k];
+                sum_g += (float)qg[k] * xv;
+                sum_u += (float)qu[k] * xv;
+            }
+            acc_g[t] += dg * sum_g;
+            acc_u[t] += du * sum_u;
+        }
+    }
+    for (uint32_t t = 0; t < n_rows; t++) {
+        const float g = warp_sum_f32(acc_g[t]);
+        const float u = warp_sum_f32(acc_u[t]);
+        if (lane == 0u) {
+            const uint64_t off = (uint64_t)t * out_dim + row;
+            if (store_gate_up) {
+                gate[off] = g;
+                up[off] = u;
+            }
+            float sg = g;
+            float su = u;
+            if (clamp > 1.0e-6f) {
+                sg = fminf(sg, clamp);
+                su = fminf(fmaxf(su, -clamp), clamp);
+            }
+            mid[off] = (sg / (1.0f + expf(-sg))) * su;
+        }
+    }
 }
 
 __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
@@ -942,56 +1112,6 @@ __global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel(
     if (lane == 0u) {
         if (row < out0_dim) out0[row] = acc0;
         if (row < out1_dim) out1[row] = acc1;
-    }
-}
-
-__global__ static void shared_gate_up_swiglu_q8_0_rows_w32_kernel(
-        float *gate,
-        float *up,
-        float *mid,
-        const unsigned char *wg,
-        const unsigned char *wu,
-        const float *x,
-        uint32_t n_blocks,
-        uint64_t out_dim,
-        uint64_t row_bytes,
-        int store_gate_up,
-        float clamp) {
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5u;
-    const uint32_t rows_per_block = blockDim.x >> 5u;
-    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
-    if (row >= out_dim) return;
-    const unsigned char *row_g = wg + row * row_bytes;
-    const unsigned char *row_u = wu + row * row_bytes;
-    float acc_g = 0.0f;
-    float acc_u = 0.0f;
-    for (uint32_t b = 0; b < n_blocks; b++) {
-        const unsigned char *bg = row_g + (uint64_t)b * 34u;
-        const unsigned char *bu = row_u + (uint64_t)b * 34u;
-        const float dg = q8_0_scale_broadcast_w32(bg);
-        const float du = q8_0_scale_broadcast_w32(bu);
-        const int8_t qg = ((const int8_t *)(bg + 2u))[lane];
-        const int8_t qu = ((const int8_t *)(bu + 2u))[lane];
-        const float xv = x[((uint64_t)b << 5) + lane];
-        acc_g += dg * (float)qg * xv;
-        acc_u += du * (float)qu * xv;
-    }
-    const float g = warp_sum_f32(acc_g);
-    const float u = warp_sum_f32(acc_u);
-    if (lane == 0u) {
-        if (store_gate_up) {
-            gate[row] = g;
-            up[row] = u;
-        }
-        float sg = g;
-        float su = u;
-        if (clamp > 1.0e-6f) {
-            sg = fminf(sg, clamp);
-            su = fminf(fmaxf(su, -clamp), clamp);
-        }
-        mid[row] = (sg / (1.0f + expf(-sg))) * su;
     }
 }
 

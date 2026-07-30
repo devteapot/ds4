@@ -293,6 +293,11 @@ static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *wha
     return p;
 }
 
+extern "C" void *ds4_cuda_nvfp4_tmp_alloc_on(
+        int logical_tier, uint64_t bytes, const char *what) {
+    return cuda_tmp_alloc_on(logical_tier, bytes, what);
+}
+
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
     return n_comp <= DS4_CUDA_ATTENTION_SCORE_CAP - DS4_CUDA_ATTENTION_RAW_SCORE_CAP;
 }
@@ -304,7 +309,10 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+    if (model_map == g_model_host_base &&
+        (g_model_device_owned || g_model_registered)) {
+        return cuda_model_ptr(model_map, offset);
+    }
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
@@ -532,9 +540,22 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
     return NULL;
 }
 
+extern "C" const char *ds4_cuda_nvfp4_resolve_weight_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier,
+        const char *label) {
+    return cuda_resolve_weight_ptr(
+        model_map, offset, bytes, logical_tier, label);
+}
+
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered) return 1;
+    if (model_map == g_model_host_base &&
+        (g_model_device_owned || g_model_registered)) {
+        return 1;
+    }
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -1790,6 +1811,9 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
     cuda_xdev_env_refresh();
     cuda_decode_dispatch_env_refresh();
+    g_cuda_laguna_bf16_lt_enabled =
+        getenv("DS4_CUDA_LAGUNA_NO_BF16_LT") == NULL &&
+        getenv("DS4_CUDA_DFLASH_NO_BF16_CUBLAS") == NULL;
     g_current_logical_tier = -1;
 
     /* g_n_gpus is published incrementally so ds4_gpu_cleanup() can unwind
@@ -1808,10 +1832,15 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
          * calls hit the right context. */
         g_n_gpus = i + 1;
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
-        cudaDeviceProp prop;
+        cudaDeviceProp prop = {};
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
+            c->sm_major = prop.major;
+            c->sm_minor = prop.minor;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
+        } else {
+            c->sm_major = 0;
+            c->sm_minor = 0;
         }
         /* Per-device stream. */
         cudaStream_t s = NULL;
@@ -1826,6 +1855,17 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         cublasHandle_t h = NULL;
         if (!cublas_ok(cublasCreate(&h), "init cublas")) return 0;
         c->cublas = (void *)h;
+        cublasLtHandle_t lth = NULL;
+        const cublasStatus_t lt_status = cublasLtCreate(&lth);
+        if (lt_status == CUBLAS_STATUS_SUCCESS) {
+            c->cublaslt = (void *)lth;
+        } else {
+            c->cublaslt = NULL;
+            fprintf(stderr,
+                    "ds4: cuBLASLt unavailable on device %d "
+                    "(status=%d); using cuBLAS fallbacks\n",
+                    c->device_id, (int)lt_status);
+        }
         const cublasMath_t math_mode =
             (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
                 ? CUBLAS_DEFAULT_MATH
@@ -1988,6 +2028,9 @@ extern "C" int ds4_gpu_init(void) {
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     g_current_logical_tier = -1;
+    cuda_native_nvfp4_cache_release_all();
+    ds4_cuda_laguna_native_nvfp4_cache_release_all();
+    cuda_laguna_bf16_lt_cleanup();
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
      * slabs, per-pair bounce buffers. */
@@ -2009,6 +2052,12 @@ extern "C" void ds4_gpu_cleanup(void) {
             c->cublas = NULL;
             c->cublas_ready = 0;
         }
+        if (c->cublaslt) {
+            (void)cublasLtDestroy((cublasLtHandle_t)c->cublaslt);
+            c->cublaslt = NULL;
+        }
+        c->sm_major = 0;
+        c->sm_minor = 0;
         if (c->scratch) {
             (void)cudaFree(c->scratch);
             c->scratch = NULL;
@@ -2877,6 +2926,11 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+extern "C" int ds4_gpu_submit_commands(void) { return 1; }
+extern "C" int ds4_gpu_wait_submitted_commands(void) {
+    return cuda_ok(cudaStreamSynchronize(0), "wait submitted commands");
+}
+extern "C" int ds4_gpu_discard_commands(void) { return 1; }
 extern "C" int ds4_gpu_end_commands(void) {
     if (g_cuda_end_stream_sync) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");
@@ -2891,6 +2945,8 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
+    cuda_native_nvfp4_cache_release_all();
+    ds4_cuda_laguna_native_nvfp4_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
@@ -2988,6 +3044,8 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
+    cuda_native_nvfp4_cache_release_all();
+    ds4_cuda_laguna_native_nvfp4_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
@@ -3602,4 +3660,8 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
         }
         if (prev >= 0) (void)cudaSetDevice(prev);
     }
+}
+
+extern "C" void ds4_gpu_set_tensor_matmul_suppressed(bool suppressed) {
+    (void)suppressed;
 }

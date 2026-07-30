@@ -20069,6 +20069,9 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
                                                                   ssd_streaming);
             return m;
         }
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+            return laguna_graph_context_memory_estimate(ctx);
+        }
         m.prefill_cap = metal_graph_prefill_cap_for_prompt((int)ctx,
                                                            prefill_chunk);
         m.raw_cap = metal_graph_raw_cap_for_context((int)ctx, m.prefill_cap);

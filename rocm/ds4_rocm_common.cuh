@@ -84,6 +84,11 @@ __global__ static void embed_tokens_hc_kernel(
 
 __device__ static float warp_sum_f32(float v);
 
+/* Longest row block the row-batched decode kernels carry in registers.  It
+ * matches DS4_DFLASH_BLOCK_SIZE: the DFlash verifier is the only caller that
+ * hands them more than one row. */
+enum { DS4_ROCM_VERIFY_MAX_ROWS = 16u };
+
 __global__ static void matmul_f16_kernel(
         float *out,
         const __half *w,
@@ -110,6 +115,57 @@ __global__ static void matmul_f16_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+}
+
+/* Skinny F16 GEMM for the DFlash draft model: one wave per output row with an
+ * accumulator per input row, so a block of draft positions costs one sweep of
+ * the draft weights.  hipBLAS is the wrong tool at n=2..16 -- its per-call
+ * setup dominates, and the draft graph issues dozens of these per cycle. */
+__global__ static void matmul_f16_rows_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_rows) {
+    const uint64_t row = (uint64_t)blockIdx.x * 2u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const __half *wrow = w + row * (uint64_t)in_dim;
+    float acc[DS4_ROCM_VERIFY_MAX_ROWS] = {};
+    /* Eight halves per lane per step: the draft graph is entirely weight-load
+     * bound at these row counts, and 4-byte loads left it at a quarter of DRAM
+     * speed. */
+    const uint32_t n8 = in_dim >> 3u;
+    for (uint32_t i = lane; i < n8; i += 32u) {
+        const float4 packed = ((const float4 *)wrow)[i];
+        const __half2 *wh = (const __half2 *)&packed;
+        float wv[8];
+#pragma unroll
+        for (uint32_t j = 0; j < 4u; j++) {
+            wv[j * 2u] = __low2float(wh[j]);
+            wv[j * 2u + 1u] = __high2float(wh[j]);
+        }
+        for (uint32_t t = 0; t < n_rows; t++) {
+            const float *xb = x + (uint64_t)t * in_dim + (uint64_t)i * 8u;
+            const float4 x0 = ((const float4 *)xb)[0];
+            const float4 x1 = ((const float4 *)xb)[1];
+            acc[t] += wv[0] * x0.x + wv[1] * x0.y +
+                      wv[2] * x0.z + wv[3] * x0.w +
+                      wv[4] * x1.x + wv[5] * x1.y +
+                      wv[6] * x1.z + wv[7] * x1.w;
+        }
+    }
+    for (uint32_t i = (n8 << 3u) + lane; i < in_dim; i += 32u) {
+        const float wv = __half2float(wrow[i]);
+        for (uint32_t t = 0; t < n_rows; t++) {
+            acc[t] += wv * x[(uint64_t)t * in_dim + i];
+        }
+    }
+    for (uint32_t t = 0; t < n_rows; t++) {
+        const float sum = warp_sum_f32(acc[t]);
+        if (lane == 0u) out[(uint64_t)t * out_dim + row] = sum;
+    }
 }
 
 __global__ static void matmul_f16_ordered_chunks_kernel(

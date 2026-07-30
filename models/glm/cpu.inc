@@ -404,6 +404,7 @@ static bool glm_graph_gate_pair_type_supported(uint32_t gate_type, uint32_t up_t
     return gate_type == up_type &&
            (gate_type == DS4_TENSOR_IQ2_XXS ||
             gate_type == DS4_TENSOR_Q2_K ||
+            gate_type == DS4_TENSOR_Q3_K ||
             gate_type == DS4_TENSOR_Q4_K ||
             gate_type == DS4_TENSOR_Q5_K);
 }
@@ -411,6 +412,7 @@ static bool glm_graph_gate_pair_type_supported(uint32_t gate_type, uint32_t up_t
 static bool glm_graph_down_type_supported(uint32_t down_type) {
     return down_type == DS4_TENSOR_IQ2_XXS ||
            down_type == DS4_TENSOR_Q2_K ||
+           down_type == DS4_TENSOR_Q3_K ||
            down_type == DS4_TENSOR_Q4_K ||
            down_type == DS4_TENSOR_Q5_K ||
            down_type == DS4_TENSOR_Q6_K;
@@ -422,6 +424,9 @@ static float glm_routed_moe_dot_f32(uint32_t type, int n, const uint8_t *row, co
     }
     if (type == DS4_TENSOR_Q2_K) {
         return ds4_vec_dot_q2_K_f32(n, (const block_q2_K *)row, x);
+    }
+    if (type == DS4_TENSOR_Q3_K) {
+        return ds4_vec_dot_q3_K_f32(n, (const block_q3_K *)row, x);
     }
     if (type == DS4_TENSOR_Q4_K) {
         return ds4_vec_dot_q4_K_f32(n, (const block_q4_K *)row, x);
